@@ -183,11 +183,15 @@ func Validate(f ast.File) error {
 
 func stripComment(line string) string {
 	inQuote := false
-	for i, ch := range line {
-		if ch == '"' {
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\\' && inQuote && i+1 < len(line) {
+			i++ // skip escaped character
+			continue
+		}
+		if line[i] == '"' {
 			inQuote = !inQuote
 		}
-		if ch == '#' && !inQuote {
+		if line[i] == '#' && !inQuote {
 			return strings.TrimSpace(line[:i])
 		}
 	}
@@ -227,10 +231,10 @@ func parseAssignment(line string) (string, ast.Value, error) {
 		if inner == "" {
 			return k, ast.Value{Raw: raw, List: []string{}}, nil
 		}
-		parts := strings.Split(inner, ",")
+		parts := splitListItems(inner)
 		list := make([]string, 0, len(parts))
 		for _, p := range parts {
-			item := strings.TrimSpace(strings.Trim(p, `"`))
+			item := strings.Trim(strings.TrimSpace(p), `"`)
 			if item != "" {
 				list = append(list, item)
 			}
@@ -238,6 +242,35 @@ func parseAssignment(line string) (string, ast.Value, error) {
 		return k, ast.Value{Raw: raw, List: list}, nil
 	}
 	return k, ast.Value{Raw: strings.Trim(raw, `"`)}, nil
+}
+
+// splitListItems splits a comma-separated string, respecting quoted segments
+// and backslash escapes inside quotes. e.g. `"a,b", c` → ["a,b", "c"].
+func splitListItems(s string) []string {
+	var items []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\\' && inQuote && i+1 < len(s) {
+			cur.WriteByte(s[i+1])
+			i++
+			continue
+		}
+		if ch == '"' {
+			inQuote = !inQuote
+			cur.WriteByte(ch)
+			continue
+		}
+		if ch == ',' && !inQuote {
+			items = append(items, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(ch)
+	}
+	items = append(items, cur.String())
+	return items
 }
 
 func profileRefs(b *ast.Block) []string {

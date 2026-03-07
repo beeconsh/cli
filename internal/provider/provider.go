@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	azpolicy "github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -78,10 +79,16 @@ func connectAzure(ctx context.Context, region string) (*ConnectionResult, error)
 	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, err := azidentity.NewClientSecretCredential(tenantID, clientID, secret, nil)
+	cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, secret, nil)
 	if err != nil {
 		return nil, fmt.Errorf("azure credential init: %w", err)
 	}
-	_ = cctx
+	// Validate the credential by requesting a token.
+	_, err = cred.GetToken(cctx, azpolicy.TokenRequestOptions{
+		Scopes: []string{"https://management.azure.com/.default"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("azure credential validation: %w", err)
+	}
 	return &ConnectionResult{Provider: "azure", Region: region, Identity: clientID}, nil
 }

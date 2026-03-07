@@ -3,8 +3,10 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -36,6 +38,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	smithy "github.com/aws/smithy-go"
+	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
 
@@ -1303,10 +1307,20 @@ func detectAWSTarget(req ApplyRequest) string {
 			return "ec2"
 		}
 	}
-	// fallback heuristics from fields.
-	for _, v := range req.Intent {
-		s := strings.ToLower(fmt.Sprint(v))
-		for target := range AWSSupportMatrix {
+	// fallback heuristics from fields — sorted for deterministic results.
+	intentKeys := make([]string, 0, len(req.Intent))
+	for k := range req.Intent {
+		intentKeys = append(intentKeys, k)
+	}
+	sort.Strings(intentKeys)
+	targets := make([]string, 0, len(AWSSupportMatrix))
+	for t := range AWSSupportMatrix {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+	for _, k := range intentKeys {
+		s := strings.ToLower(fmt.Sprint(req.Intent[k]))
+		for _, target := range targets {
 			if strings.Contains(s, strings.ReplaceAll(target, "_", "")) || strings.Contains(s, target) {
 				return target
 			}
@@ -1423,15 +1437,6 @@ func detectRecordTarget(rec *state.ResourceRecord) string {
 	return "generic"
 }
 
-var simulatedSensitiveKeys = map[string]bool{
-	"password":       true,
-	"secret_value":   true,
-	"token":          true,
-	"admin_password": true,
-	"secret":         true,
-	"secret_key":     true,
-}
-
 func simulatedApply(req ApplyRequest, target string) *ApplyResult {
 	providerID := req.RecordProviderID()
 	if providerID == "" {
@@ -1445,11 +1450,7 @@ func simulatedApply(req ApplyRequest, target string) *ApplyResult {
 		"simulated":   true,
 	}
 	for k, v := range req.Intent {
-		base := k
-		if idx := strings.LastIndex(k, "."); idx >= 0 {
-			base = k[idx+1:]
-		}
-		if simulatedSensitiveKeys[base] {
+		if security.IsSensitiveKey(k) {
 			continue
 		}
 		live[k] = v
@@ -1555,8 +1556,17 @@ func isNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFoundException", "ResourceNotFoundException", "NoSuchEntity",
+			"NoSuchBucket", "DBInstanceNotFoundFault", "CacheClusterNotFound",
+			"ClusterNotFoundException":
+			return true
+		}
+	}
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "notfound") || strings.Contains(s, "not found") || strings.Contains(s, "404")
+	return strings.Contains(s, "not found") || strings.Contains(s, "404")
 }
 
 func cloudFrontDistributionConfigFromIntent(intentMap map[string]interface{}, callerRefBase, callerRefSuffix string) (*cloudfronttypes.DistributionConfig, error) {

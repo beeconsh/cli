@@ -11,6 +11,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -109,6 +110,7 @@ type ApprovalRequest struct {
 	ResolvedAt  *time.Time     `json:"resolved_at,omitempty"`
 	ExpiresAt   time.Time      `json:"expires_at"`
 	BeaconPath  string         `json:"beacon_path"`
+	IntentHash  string         `json:"intent_hash,omitempty"`
 	CostDelta   string         `json:"cost_delta,omitempty"`
 	BlastRadius string         `json:"blast_radius,omitempty"`
 }
@@ -144,19 +146,116 @@ type State struct {
 }
 
 type Store struct {
-	rootDir string
-	path    string
-	mu      sync.Mutex
+	rootDir  string
+	path     string
+	lockPath string
+	mu       sync.Mutex
 }
 
 func NewStore(rootDir string) *Store {
 	stateDir := filepath.Join(rootDir, ".beecon")
-	return &Store{rootDir: rootDir, path: filepath.Join(stateDir, "state.json")}
+	return &Store{
+		rootDir:  rootDir,
+		path:     filepath.Join(stateDir, "state.json"),
+		lockPath: filepath.Join(stateDir, "state.lock"),
+	}
 }
 
 func (s *Store) Load() (*State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	f, err := s.acquireFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseFileLock(f)
+	return s.loadLocked()
+}
+
+func (s *Store) Save(st *State) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := s.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer releaseFileLock(f)
+	return s.saveLocked(st)
+}
+
+// StateTransaction holds the mutex and file lock for the duration of a
+// read-modify-write cycle.
+type StateTransaction struct {
+	State    *State
+	store    *Store
+	lockFile *os.File
+	done     bool
+}
+
+// LoadForUpdate acquires the store mutex and file lock, then loads state.
+// The caller must call either Commit or Rollback to release both locks.
+func (s *Store) LoadForUpdate() (*StateTransaction, error) {
+	s.mu.Lock()
+	f, err := s.acquireFileLock()
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	st, err := s.loadLocked()
+	if err != nil {
+		releaseFileLock(f)
+		s.mu.Unlock()
+		return nil, err
+	}
+	return &StateTransaction{State: st, store: s, lockFile: f}, nil
+}
+
+// Commit saves the state and releases the file lock and mutex.
+func (tx *StateTransaction) Commit() error {
+	if tx.done {
+		return nil
+	}
+	tx.done = true
+	err := tx.store.saveLocked(tx.State)
+	releaseFileLock(tx.lockFile)
+	tx.store.mu.Unlock()
+	return err
+}
+
+// Rollback releases the file lock and mutex without saving.
+func (tx *StateTransaction) Rollback() {
+	if tx.done {
+		return
+	}
+	tx.done = true
+	releaseFileLock(tx.lockFile)
+	tx.store.mu.Unlock()
+}
+
+func (s *Store) acquireFileLock() (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(s.lockPath), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("acquire file lock: %w", err)
+	}
+	return f, nil
+}
+
+func releaseFileLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	f.Close()
+}
+
+func (s *Store) loadLocked() (*State, error) {
 	if _, err := os.Stat(s.path); errors.Is(err, os.ErrNotExist) {
 		return newState(), nil
 	}
@@ -186,9 +285,7 @@ func (s *Store) Load() (*State, error) {
 	return &st, nil
 }
 
-func (s *Store) Save(st *State) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Store) saveLocked(st *State) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
@@ -229,13 +326,26 @@ func HashMap(m map[string]interface{}) string {
 	sort.Strings(keys)
 	var s string
 	for _, k := range keys {
-		b, err := json.Marshal(m[k])
+		v := normalizeValue(m[k])
+		b, err := json.Marshal(v)
 		if err != nil {
-			s += fmt.Sprintf("%s=%v;", k, m[k])
+			s += fmt.Sprintf("%s=%v;", k, v)
 		} else {
 			s += fmt.Sprintf("%s=%s;", k, b)
 		}
 	}
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// normalizeValue converts float64 values that are whole numbers to int64
+// so that JSON round-trips (which always decode numbers as float64) don't
+// cause phantom hash diffs.
+func normalizeValue(v interface{}) interface{} {
+	if f, ok := v.(float64); ok {
+		if f == float64(int64(f)) {
+			return int64(f)
+		}
+	}
+	return v
 }

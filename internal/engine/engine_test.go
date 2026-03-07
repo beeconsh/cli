@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,8 +36,9 @@ service api {
 		t.Fatal(err)
 	}
 
+	ctx := context.Background()
 	e := New(dir)
-	applied, err := e.Apply(beacon)
+	applied, err := e.Apply(ctx, beacon)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -47,12 +49,12 @@ service api {
 		t.Fatalf("expected at least one action to execute before approval")
 	}
 
-	_, err = e.Approve(applied.ApprovalRequestID, "tester")
+	_, err = e.Approve(ctx, applied.ApprovalRequestID, "tester")
 	if err != nil {
 		t.Fatalf("approve failed: %v", err)
 	}
 
-	st, err := e.Status()
+	st, err := e.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,7 @@ service api {
 		t.Fatalf("expected run status APPLIED, got %s", st.Runs[applied.RunID].Status)
 	}
 
-	rbID, err := e.Rollback(applied.RunID)
+	rbID, err := e.Rollback(ctx, applied.RunID)
 	if err != nil {
 		t.Fatalf("rollback failed: %v", err)
 	}

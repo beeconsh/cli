@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/terracotta-ai/beecon/internal/ir"
+	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
 
@@ -218,12 +219,20 @@ func diffIntent(old, new map[string]interface{}) map[string]string {
 	changes := map[string]string{}
 	for k, n := range new {
 		if o, ok := old[k]; !ok || fmt.Sprint(o) != fmt.Sprint(n) {
-			changes[k] = fmt.Sprintf("%v -> %v", o, n)
+			if security.IsSensitiveKey(k) {
+				changes[k] = "**REDACTED** -> **REDACTED**"
+			} else {
+				changes[k] = fmt.Sprintf("%v -> %v", o, n)
+			}
 		}
 	}
 	for k, o := range old {
 		if _, ok := new[k]; !ok {
-			changes[k] = fmt.Sprintf("%v -> <deleted>", o)
+			if security.IsSensitiveKey(k) {
+				changes[k] = "**REDACTED** -> <deleted>"
+			} else {
+				changes[k] = fmt.Sprintf("%v -> <deleted>", o)
+			}
 		}
 	}
 	return changes

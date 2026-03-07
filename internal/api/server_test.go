@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -51,7 +52,7 @@ service api {
 		t.Fatalf("validate expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	_, err := e.Apply("infra.beecon")
+	_, err := e.Apply(context.Background(), "infra.beecon")
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
@@ -106,7 +107,7 @@ service api {
 	e := engine.New(dir)
 	s := New(e)
 	h := s.Handler()
-	if _, err := e.Apply("infra.beecon"); err != nil {
+	if _, err := e.Apply(context.Background(), "infra.beecon"); err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
 
@@ -161,7 +162,7 @@ store postgres {
 	}
 
 	e := engine.New(dir)
-	res, err := e.Apply("infra.beecon")
+	res, err := e.Apply(context.Background(), "infra.beecon")
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}

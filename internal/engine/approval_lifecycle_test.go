@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,18 +29,19 @@ store postgres {
 	if err := os.WriteFile(beacon, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	ctx := context.Background()
 	e := New(dir)
-	res, err := e.Apply(beacon)
+	res, err := e.Apply(ctx, beacon)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
 	}
 	if res.ApprovalRequestID == "" {
 		t.Fatalf("expected approval request")
 	}
-	if err := e.Reject(res.ApprovalRequestID, "tester", "no"); err != nil {
+	if err := e.Reject(ctx, res.ApprovalRequestID, "tester", "no"); err != nil {
 		t.Fatalf("reject failed: %v", err)
 	}
-	st, err := e.Status()
+	st, err := e.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,9 +79,7 @@ func TestApprovalExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := &Engine{store: store, root: dir}
-	if err := e.expireApprovals(); err != nil {
-		t.Fatalf("expire failed: %v", err)
-	}
+	e.runExpireApprovals()
 	after, err := store.Load()
 	if err != nil {
 		t.Fatal(err)

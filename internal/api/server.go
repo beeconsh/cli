@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,9 @@ import (
 	"strings"
 
 	"github.com/terracotta-ai/beecon/internal/engine"
+	"github.com/terracotta-ai/beecon/internal/ir"
+	"github.com/terracotta-ai/beecon/internal/security"
+	"github.com/terracotta-ai/beecon/internal/state"
 )
 
 type Server struct {
@@ -43,7 +47,8 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if key != "" {
 			auth := r.Header.Get("Authorization")
-			if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != key {
+			provided := strings.TrimPrefix(auth, "Bearer ")
+			if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing API key"})
 				return
 			}
@@ -52,19 +57,19 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func safePath(root, requested string) (string, error) {
+func safePath(root, requested string) error {
 	abs, err := filepath.Abs(filepath.Join(root, requested))
 	if err != nil {
-		return "", fmt.Errorf("invalid path")
+		return fmt.Errorf("invalid path")
 	}
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		return "", fmt.Errorf("invalid root")
+		return fmt.Errorf("invalid root")
 	}
 	if !strings.HasPrefix(abs, absRoot+string(filepath.Separator)) && abs != absRoot {
-		return "", fmt.Errorf("path escapes project root")
+		return fmt.Errorf("path escapes project root")
 	}
-	return requested, nil
+	return nil
 }
 
 func (s *Server) beacons(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +92,7 @@ func (s *Server) beacons(w http.ResponseWriter, r *http.Request) {
 		if req.Path == "" {
 			req.Path = "infra.beecon"
 		}
-		if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+		if err := safePath(s.engine.Root(), req.Path); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
@@ -116,7 +121,7 @@ func (s *Server) validateBeacon(w http.ResponseWriter, r *http.Request) {
 	if req.Path == "" {
 		req.Path = "infra.beecon"
 	}
-	if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+	if err := safePath(s.engine.Root(), req.Path); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -143,12 +148,12 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 	if req.Path == "" {
 		req.Path = "infra.beecon"
 	}
-	if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+	if err := safePath(s.engine.Root(), req.Path); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	if req.Apply {
-		res, err := s.engine.Apply(req.Path)
+		res, err := s.engine.Apply(r.Context(), req.Path)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -156,11 +161,12 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, res)
 		return
 	}
-	res, err := s.engine.Plan(req.Path)
+	res, err := s.engine.Plan(r.Context(), req.Path)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	scrubActions(res.Plan.Actions)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"domain":  res.Graph.Domain.Name,
 		"nodes":   len(res.Graph.Nodes),
@@ -173,15 +179,25 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	st, err := s.engine.Status()
+	st, err := s.engine.Status(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	for _, rec := range st.Resources {
-		rec.IntentSnapshot = scrubMap(rec.IntentSnapshot)
-		rec.LiveState = scrubMap(rec.LiveState)
+		rec.IntentSnapshot = security.ScrubMap(rec.IntentSnapshot)
+		rec.LiveState = security.ScrubMap(rec.LiveState)
 	}
+	for _, a := range st.Actions {
+		a.Changes = security.ScrubChanges(a.Changes)
+	}
+	for _, r := range st.Runs {
+		r.BeaconPath = filepath.Base(r.BeaconPath)
+	}
+	for _, a := range st.Approvals {
+		a.BeaconPath = filepath.Base(a.BeaconPath)
+	}
+	scrubAuditEvents(st.Audit)
 	writeJSON(w, http.StatusOK, st)
 }
 
@@ -190,10 +206,13 @@ func (s *Server) runs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	runs, err := s.engine.Runs()
+	runs, err := s.engine.Runs(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	for _, run := range runs {
+		run.BeaconPath = filepath.Base(run.BeaconPath)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"runs": runs})
 }
@@ -203,10 +222,13 @@ func (s *Server) approvals(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	approvals, err := s.engine.Approvals()
+	approvals, err := s.engine.Approvals(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	for _, a := range approvals {
+		a.BeaconPath = filepath.Base(a.BeaconPath)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"approvals": approvals})
 }
@@ -220,17 +242,20 @@ func (s *Server) graph(w http.ResponseWriter, r *http.Request) {
 	if path == "" {
 		path = "infra.beecon"
 	}
-	if _, err := safePath(s.engine.Root(), path); err != nil {
+	if err := safePath(s.engine.Root(), path); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	res, err := s.engine.Plan(path)
+	res, err := s.engine.Plan(r.Context(), path)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	scrubNodes(res.Graph.Nodes)
+	scrubActions(res.Plan.Actions)
+	domainSummary := map[string]string{"name": res.Graph.Domain.Name, "cloud": res.Graph.Domain.Cloud}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"domain":  res.Graph.Domain,
+		"domain":  domainSummary,
 		"nodes":   res.Graph.Nodes,
 		"edges":   res.Graph.Edges,
 		"actions": res.Plan.Actions,
@@ -243,11 +268,12 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resource := r.URL.Query().Get("resource")
-	events, err := s.engine.Audit(resource)
+	events, err := s.engine.Audit(r.Context(), resource)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	scrubAuditEvents(events)
 	writeJSON(w, http.StatusOK, events)
 }
 
@@ -261,11 +287,12 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "resource query param required"})
 		return
 	}
-	events, err := s.engine.History(resource)
+	events, err := s.engine.History(r.Context(), resource)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	scrubAuditEvents(events)
 	writeJSON(w, http.StatusOK, events)
 }
 
@@ -284,16 +311,24 @@ func (s *Server) drift(w http.ResponseWriter, r *http.Request) {
 	if req.Path == "" {
 		req.Path = "infra.beecon"
 	}
-	if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+	if err := safePath(s.engine.Root(), req.Path); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	drifted, err := s.engine.Drift(req.Path)
+	drifted, observeErrors, err := s.engine.Drift(r.Context(), req.Path)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"drifted": drifted, "count": len(drifted)})
+	for _, rec := range drifted {
+		rec.IntentSnapshot = security.ScrubMap(rec.IntentSnapshot)
+		rec.LiveState = security.ScrubMap(rec.LiveState)
+	}
+	var warnings []string
+	for _, e := range observeErrors {
+		warnings = append(warnings, e.Error())
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"drifted": drifted, "count": len(drifted), "warnings": warnings})
 }
 
 func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +351,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	if req.Approver == "" {
 		req.Approver = "api-user"
 	}
-	res, err := s.engine.Approve(req.RequestID, req.Approver)
+	res, err := s.engine.Approve(r.Context(), req.RequestID, req.Approver)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -348,7 +383,7 @@ func (s *Server) reject(w http.ResponseWriter, r *http.Request) {
 	if req.Reason == "" {
 		req.Reason = "rejected by api-user"
 	}
-	if err := s.engine.Reject(req.RequestID, req.Approver, req.Reason); err != nil {
+	if err := s.engine.Reject(r.Context(), req.RequestID, req.Approver, req.Reason); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -372,7 +407,7 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider required"})
 		return
 	}
-	if err := s.engine.Connect(req.Provider, req.Region); err != nil {
+	if err := s.engine.Connect(r.Context(), req.Provider, req.Region); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -382,7 +417,7 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) performance(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		st, err := s.engine.Status()
+		st, err := s.engine.Status(r.Context())
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -407,7 +442,7 @@ func (s *Server) performance(w http.ResponseWriter, r *http.Request) {
 		if req.Duration == "" {
 			req.Duration = "5m"
 		}
-		id, err := s.engine.IngestPerformanceBreach(req.ResourceID, req.Metric, req.Observed, req.Threshold, req.Duration)
+		id, err := s.engine.IngestPerformanceBreach(r.Context(), req.ResourceID, req.Metric, req.Observed, req.Threshold, req.Duration)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -418,32 +453,22 @@ func (s *Server) performance(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var apiSensitiveKeys = map[string]bool{
-	"password":       true,
-	"secret_value":   true,
-	"token":          true,
-	"admin_password": true,
-	"secret":         true,
-	"secret_key":     true,
+func scrubNodes(nodes []ir.IntentNode) {
+	for i := range nodes {
+		nodes[i].Intent = security.ScrubStringMap(nodes[i].Intent)
+	}
 }
 
-func scrubMap(m map[string]interface{}) map[string]interface{} {
-	if m == nil {
-		return nil
+func scrubAuditEvents(events []state.AuditEvent) {
+	for i := range events {
+		events[i].Data = security.ScrubMap(events[i].Data)
 	}
-	out := make(map[string]interface{}, len(m))
-	for k, v := range m {
-		base := k
-		if idx := strings.LastIndex(k, "."); idx >= 0 {
-			base = k[idx+1:]
-		}
-		if apiSensitiveKeys[base] {
-			out[k] = "**REDACTED**"
-		} else {
-			out[k] = v
-		}
+}
+
+func scrubActions(actions []*state.PlanAction) {
+	for _, a := range actions {
+		a.Changes = security.ScrubChanges(a.Changes)
 	}
-	return out
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

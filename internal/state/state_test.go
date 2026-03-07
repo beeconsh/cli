@@ -69,3 +69,79 @@ func TestHashMapDeterministic(t *testing.T) {
 		t.Fatalf("hash should be deterministic regardless of map order")
 	}
 }
+
+func TestHashMapFloat64IntEquivalence(t *testing.T) {
+	a := map[string]interface{}{"count": 42}
+	b := map[string]interface{}{"count": float64(42)}
+	if HashMap(a) != HashMap(b) {
+		t.Fatalf("hash should be equal for int and float64 of same whole number")
+	}
+}
+
+func TestLoadForUpdateCommit(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+
+	tx, err := s.LoadForUpdate()
+	if err != nil {
+		t.Fatalf("LoadForUpdate failed: %v", err)
+	}
+	tx.State.Resources["test.svc"] = &ResourceRecord{ResourceID: "test.svc", Managed: true, Status: StatusMatched}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	loaded, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load after commit failed: %v", err)
+	}
+	if loaded.Resources["test.svc"] == nil {
+		t.Fatal("committed resource should be persisted")
+	}
+}
+
+func TestLoadForUpdateRollback(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+
+	tx, err := s.LoadForUpdate()
+	if err != nil {
+		t.Fatalf("LoadForUpdate failed: %v", err)
+	}
+	tx.State.Resources["test.svc"] = &ResourceRecord{ResourceID: "test.svc", Managed: true}
+	tx.Rollback()
+
+	loaded, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load after rollback failed: %v", err)
+	}
+	if loaded.Resources["test.svc"] != nil {
+		t.Fatal("rolled back resource should not be persisted")
+	}
+}
+
+func TestDoubleCommitIsNoop(t *testing.T) {
+	s := NewStore(t.TempDir())
+	tx, err := s.LoadForUpdate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Second commit should be a no-op, not panic
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDoubleRollbackIsNoop(t *testing.T) {
+	s := NewStore(t.TempDir())
+	tx, err := s.LoadForUpdate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Rollback()
+	// Second rollback should be a no-op, not panic
+	tx.Rollback()
+}
