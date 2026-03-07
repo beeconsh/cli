@@ -45,9 +45,10 @@ var initCmd = &cobra.Command{
 }
 
 var validateCmd = &cobra.Command{
-	Use:   "validate [path]",
-	Short: "Validate a beacon file",
-	Args:  cobra.MaximumNArgs(1),
+	Use:         "validate [path]",
+	Short:       "Validate a beacon file",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
 	RunE: func(_ *cobra.Command, args []string) error {
 		path := beaconPathArg(args)
 		if err := eng.Validate(path); err != nil {
@@ -59,9 +60,10 @@ var validateCmd = &cobra.Command{
 }
 
 var planCmd = &cobra.Command{
-	Use:   "plan [path]",
-	Short: "Show the execution plan for a beacon file",
-	Args:  cobra.MaximumNArgs(1),
+	Use:         "plan [path]",
+	Short:       "Show the execution plan for a beacon file",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := beaconPathArg(args)
 		res, err := eng.Plan(cmd.Context(), path)
@@ -76,9 +78,10 @@ var planCmd = &cobra.Command{
 }
 
 var applyCmd = &cobra.Command{
-	Use:   "apply [path]",
-	Short: "Apply changes from a beacon file",
-	Args:  cobra.MaximumNArgs(1),
+	Use:         "apply [path]",
+	Short:       "Apply changes from a beacon file",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := beaconPathArg(args)
 		res, err := eng.Apply(cmd.Context(), path)
@@ -96,9 +99,10 @@ var applyCmd = &cobra.Command{
 }
 
 var statusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Show current infrastructure status",
-	Args:  cobra.NoArgs,
+	Use:         "status",
+	Short:       "Show current infrastructure status",
+	Args:        cobra.NoArgs,
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		st, err := eng.Status(cmd.Context())
 		if err != nil {
@@ -125,9 +129,10 @@ var statusCmd = &cobra.Command{
 }
 
 var beaconsCmd = &cobra.Command{
-	Use:   "beacons",
-	Short: "List discovered beacon files",
-	Args:  cobra.NoArgs,
+	Use:         "beacons",
+	Short:       "List discovered beacon files",
+	Args:        cobra.NoArgs,
+	Annotations: needsEngine,
 	RunE: func(_ *cobra.Command, _ []string) error {
 		paths, err := eng.DiscoverBeacons()
 		if err != nil {
@@ -145,9 +150,10 @@ var beaconsCmd = &cobra.Command{
 }
 
 var driftCmd = &cobra.Command{
-	Use:   "drift [path]",
-	Short: "Detect configuration drift",
-	Args:  cobra.MaximumNArgs(1),
+	Use:         "drift [path]",
+	Short:       "Detect configuration drift",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := beaconPathArg(args)
 		drifted, observeErrors, err := eng.Drift(cmd.Context(), path)
@@ -170,9 +176,10 @@ var driftCmd = &cobra.Command{
 }
 
 var approveCmd = &cobra.Command{
-	Use:   "approve <request-id> [approver]",
-	Short: "Approve a pending approval request",
-	Args:  cobra.RangeArgs(1, 2),
+	Use:         "approve <request-id> [approver]",
+	Short:       "Approve a pending approval request",
+	Args:        cobra.RangeArgs(1, 2),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		approver := "cli-user"
 		if len(args) > 1 {
@@ -189,9 +196,10 @@ var approveCmd = &cobra.Command{
 }
 
 var rejectCmd = &cobra.Command{
-	Use:   "reject <request-id> [approver] [reason]",
-	Short: "Reject a pending approval request",
-	Args:  cobra.RangeArgs(1, 3),
+	Use:         "reject <request-id> [approver] [reason]",
+	Short:       "Reject a pending approval request",
+	Args:        cobra.RangeArgs(1, 3),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		approver := "cli-user"
 		if len(args) > 1 {
@@ -210,9 +218,10 @@ var rejectCmd = &cobra.Command{
 }
 
 var historyCmd = &cobra.Command{
-	Use:   "history <resource-id>",
-	Short: "Show history for a resource",
-	Args:  cobra.ExactArgs(1),
+	Use:         "history <resource-id>",
+	Short:       "Show history for a resource",
+	Args:        cobra.ExactArgs(1),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		events, err := eng.History(cmd.Context(), args[0])
 		if err != nil {
@@ -230,9 +239,10 @@ var historyCmd = &cobra.Command{
 }
 
 var rollbackCmd = &cobra.Command{
-	Use:   "rollback <run-id>",
-	Short: "Rollback a previous run",
-	Args:  cobra.ExactArgs(1),
+	Use:         "rollback <run-id>",
+	Short:       "Rollback a previous run",
+	Args:        cobra.ExactArgs(1),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id, err := eng.Rollback(cmd.Context(), args[0])
 		if err != nil {
@@ -244,9 +254,10 @@ var rollbackCmd = &cobra.Command{
 }
 
 var connectCmd = &cobra.Command{
-	Use:   "connect <provider> [region]",
-	Short: "Connect a cloud provider",
-	Args:  cobra.RangeArgs(1, 2),
+	Use:         "connect <provider> [region]",
+	Short:       "Connect a cloud provider",
+	Args:        cobra.RangeArgs(1, 2),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		region := ""
 		if len(args) > 1 {
@@ -261,9 +272,10 @@ var connectCmd = &cobra.Command{
 }
 
 var performanceCmd = &cobra.Command{
-	Use:   "performance <resource-id> <metric> <observed> <threshold> [duration]",
-	Short: "Report a performance breach",
-	Args:  cobra.RangeArgs(4, 5),
+	Use:         "performance <resource-id> <metric> <observed> <threshold> [duration]",
+	Short:       "Report a performance breach",
+	Args:        cobra.RangeArgs(4, 5),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dur := "5m"
 		if len(args) > 4 {
@@ -283,9 +295,10 @@ var performanceCmd = &cobra.Command{
 }
 
 var serveCmd = &cobra.Command{
-	Use:   "serve [addr]",
-	Short: "Start the API server and Mission Control UI",
-	Args:  cobra.MaximumNArgs(1),
+	Use:         "serve [addr]",
+	Short:       "Start the API server and Mission Control UI",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		addr := "127.0.0.1:8080"
 		if len(args) > 0 {

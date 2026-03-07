@@ -35,11 +35,8 @@ var rootCmd = &cobra.Command{
 	Short:         "Infrastructure-as-code engine for cloud resources",
 	SilenceUsage:  true,
 	SilenceErrors: true,
-	Version:       fmt.Sprintf("%s (%s)", version, commit),
 	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-		// Commands that don't need the engine.
-		switch cmd.Name() {
-		case "version", "init", "beecon":
+		if cmd.Annotations["needs_engine"] != "true" {
 			return nil
 		}
 		cwd, err := os.Getwd()
@@ -51,7 +48,11 @@ var rootCmd = &cobra.Command{
 	},
 }
 
+// needsEngine is the annotation map added to commands that require engine initialization.
+var needsEngine = map[string]string{"needs_engine": "true"}
+
 func init() {
+	rootCmd.Version = fmt.Sprintf("%s (%s)", version, commit)
 	rootCmd.SetVersionTemplate("beecon {{.Version}}\n")
 	rootCmd.AddCommand(
 		versionCmd,
