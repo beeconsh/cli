@@ -219,11 +219,18 @@ Implemented commands:
 
 ### 10.2 GCP
 
-- Validates credential presence and client initialization via Google Cloud Storage SDK
+- Validates credential presence and client initialization
+- Live adapters are implemented for the full current target matrix:
+  - Resource-specific adapters: GCS, Cloud SQL, Cloud Run, Memorystore Redis, Pub/Sub, Secret Manager, VPC/Subnet/Firewall, IAM, Compute Engine, Cloud DNS
+  - Project-scoped generic adapters: Cloud Functions, API Gateway, Cloud CDN, Cloud Monitoring, GKE, Eventarc, Identity Platform
 
 ### 10.3 Azure
 
 - Validates env credentials and identity initialization via Azure Identity SDK
+- Live adapters are implemented for the full current target matrix:
+  - Resource-specific adapters: Blob Storage, Key Vault Secret, VNet/Subnet/NSG, Managed Identity
+  - RBAC + Entra adapters
+  - ARM generic adapters: Container Apps, PostgreSQL Flexible, MySQL Flexible, Azure Cache Redis, Functions, API Management, Service Bus, Event Grid, Front Door, CDN, DNS, Monitor, AKS, VM
 
 ## 11. Testing
 
@@ -242,14 +249,14 @@ Current unit/integration tests cover:
 ## 12. Known Gaps vs Original Target Vision
 
 - Parser is implemented in Go (not Rust + pest)
-- Full live mutation coverage for every AWS target in the support matrix is not complete yet
+- Deep resource-specific mutation parity is not complete for all GCP/Azure targets (some targets currently use generic adapters)
 - Approval timeout handling is enforced on approve, but no background expiry processor
-- Drift now performs live provider observation for implemented AWS targets; fallback remains local for unsupported targets
+- Drift performs live observation across implemented AWS/GCP/Azure adapters, including generic adapter paths
 
 ## 13. Next Implementation Milestones
 
-1. Complete live execution adapters for all AWS matrix targets (ALB/ECS/Lambda/API Gateway/CloudFront/Route53/CloudWatch/EKS/EventBridge/Cognito/EC2 full paths)
-2. Add explicit reject flow and background expiry processing for approvals
-3. Extend live reconciliation breadth and granular drift diffing by resource type
-4. Add API authn/authz and multi-tenant boundaries
-5. Optional Rust parser core swap behind stable AST/IR boundary
+1. Replace GCP/Azure generic adapters with deeper resource-specific per-target implementations
+2. Complete remaining deep AWS adapter coverage
+3. Add explicit reject flow and background expiry processing for approvals
+4. Extend granular drift diffing by resource type
+5. Add API authn/authz and multi-tenant boundaries

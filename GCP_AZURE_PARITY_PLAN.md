@@ -15,7 +15,9 @@ This is the concrete plan to bring GCP/Azure to AWS-level runtime parity in Beec
 ## Current Baseline
 
 - AWS: partial live adapters + drift observe in place
-- GCP/Azure: connect checks only, no live apply/observe
+- GCP/Azure: full matrix now wired with live apply/observe adapter coverage
+  - Mix of resource-specific adapters and generic adapters
+  - Remaining parity work is depth parity (provider-native semantics), not wiring parity
 
 ## Architecture Tasks (Shared)
 

@@ -39,6 +39,24 @@ End-to-end Beecon runtime implementation in `beecon/` with `.beecon` DSL parsing
     - Secrets Manager
     - EC2 VPC/Subnet/Security Group primitives
   - Remaining recognized targets run via dry-run simulation or explicit live-mode validation errors
+- GCP provider execution adapters
+  - Target matrix wired across Tier 1/2/3
+  - Resource-specific live adapters implemented for:
+    - GCS, Cloud SQL, Cloud Run, Memorystore Redis, Pub/Sub, Secret Manager
+    - VPC/Subnet/Firewall, IAM (service accounts), Compute Engine, Cloud DNS
+  - Remaining recognized GCP targets use project-scoped generic adapters with live project verification:
+    - Cloud Functions, API Gateway, Cloud CDN, Cloud Monitoring, GKE, Eventarc, Identity Platform
+- Azure provider execution adapters
+  - Target matrix wired across Tier 1/2/3
+  - Resource-specific live adapters implemented for:
+    - Blob Storage, Key Vault Secret, VNet/Subnet/NSG, Managed Identity
+  - Additional live adapters:
+    - RBAC role assignment adapter
+    - Entra ID identity-scoped adapter
+  - ARM generic-resource adapters implemented for:
+    - Container Apps, PostgreSQL Flexible, MySQL Flexible, Azure Cache Redis
+    - Functions, API Management, Service Bus, Event Grid
+    - Front Door, CDN, DNS, Monitor, AKS, VM
 - API surface
   - `GET/POST /api/beacons`
   - `POST /api/beacon/validate`

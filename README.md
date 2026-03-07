@@ -128,14 +128,14 @@ beecon serve [:8080]
 ```
 
 ## Configuration
-- `BEECON_EXECUTE=1`: enable live AWS mutation calls for implemented adapters
+- `BEECON_EXECUTE=1`: enable live provider mutation calls for implemented adapters
 - Default mode (unset): dry-run-safe simulation
 - Local state path: `.beecon/state.json`
 
 ## Provider Setup
 - AWS: supported with live execution for implemented adapters
-- GCP: credential/connectivity checks plus live execution for selected Tier 1 adapters
-- Azure: credential/connectivity checks currently available
+- GCP: connect checks + live apply/observe adapters for all currently recognized matrix targets
+- Azure: connect checks + live apply/observe adapters for all currently recognized matrix targets
 
 AWS live adapters currently implemented:
 - RDS
@@ -151,6 +151,36 @@ Other recognized AWS resource targets run in dry-run simulation mode by default.
 GCP live adapters currently implemented:
 - Cloud Storage (GCS)
 - Cloud SQL
+- Cloud Run
+- Memorystore Redis
+- Pub/Sub
+- Secret Manager
+- VPC/Subnet/Firewall
+- IAM (service account lifecycle)
+- Compute Engine
+- Cloud DNS
+- Cloud Functions / API Gateway / Cloud CDN / Cloud Monitoring / GKE / Eventarc / Identity Platform (project-scoped generic adapters)
+
+Azure live adapters currently implemented:
+- Blob Storage
+- Key Vault Secret
+- VNet/Subnet/NSG
+- Managed Identity
+- RBAC (role assignment adapter)
+- Container Apps / PostgreSQL Flexible / MySQL Flexible / Azure Cache Redis / Functions / API Management / Service Bus / Event Grid / Front Door / CDN / DNS / Monitor / AKS / VM (ARM generic adapters)
+- Entra ID (identity-scoped adapter)
+
+Adapter depth matrix (current):
+
+| Provider | Target | Adapter depth |
+|---|---|---|
+| AWS | rds, s3, sqs, sns, iam, secrets_manager, vpc, subnet, security_group, ec2 primitives | Resource-specific |
+| AWS | other recognized AWS matrix targets | Recognized; simulation fallback for non-implemented live paths |
+| GCP | gcs, cloud_sql, cloud_run, memorystore_redis, pubsub, secret_manager, vpc, subnet, firewall, iam, compute_engine, cloud_dns | Resource-specific |
+| GCP | cloud_functions, api_gateway, cloud_cdn, cloud_monitoring, gke, eventarc, identity_platform | Project-scoped generic |
+| Azure | blob_storage, key_vault_secret, vnet, subnet, nsg, managed_identity | Resource-specific |
+| Azure | rbac, entra_id | Identity-scoped adapter |
+| Azure | container_apps, postgres_flexible, mysql_flexible, azure_cache_redis, functions, api_management, service_bus, event_grid, front_door, cdn, dns, monitor, aks, vm | ARM generic |
 
 ## Security
 - Keep cloud credentials out of source control

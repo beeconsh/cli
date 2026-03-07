@@ -221,6 +221,7 @@ func TestValidateAzureInput(t *testing.T) {
 		"intent.resource_group": "rg",
 		"intent.location":       "westus2",
 		"intent.account_tier":   "Standard",
+		"intent.account_name":   "acct",
 	}); err != nil {
 		t.Fatalf("unexpected blob_storage validation error: %v", err)
 	}
