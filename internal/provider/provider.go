@@ -66,7 +66,7 @@ func connectGCP(ctx context.Context, region string) (*ConnectionResult, error) {
 		return nil, fmt.Errorf("gcp storage client init: %w", err)
 	}
 	_ = client.Close()
-	return &ConnectionResult{Provider: "gcp", Region: region, Identity: creds}, nil
+	return &ConnectionResult{Provider: "gcp", Region: region, Identity: "gcp-service-account"}, nil
 }
 
 func connectAzure(ctx context.Context, region string) (*ConnectionResult, error) {
@@ -78,7 +78,7 @@ func connectAzure(ctx context.Context, region string) (*ConnectionResult, error)
 	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, err := azidentity.NewDefaultAzureCredential(nil)
+	_, err := azidentity.NewClientSecretCredential(tenantID, clientID, secret, nil)
 	if err != nil {
 		return nil, fmt.Errorf("azure credential init: %w", err)
 	}

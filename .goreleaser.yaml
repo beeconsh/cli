@@ -23,6 +23,7 @@ brews:
       owner: beeconsh
       name: homebrew-beecon
       branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
     homepage: "https://github.com/beeconsh/cli"
     description: "Infrastructure language your agent uses to deploy to the cloud"

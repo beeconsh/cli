@@ -66,6 +66,26 @@ type Profile struct {
 	Children map[string]map[string]string
 }
 
+// Snapshot returns a flat map of the node's intent, performance, env, needs, type, and name.
+func (n IntentNode) Snapshot() map[string]interface{} {
+	m := map[string]interface{}{}
+	for k, v := range n.Intent {
+		m["intent."+k] = v
+	}
+	for k, v := range n.Performance {
+		m["performance."+k] = v
+	}
+	for k, v := range n.Env {
+		m["env."+k] = v
+	}
+	for _, d := range n.Needs {
+		m["needs."+d.Target] = d.Mode
+	}
+	m["type"] = string(n.Type)
+	m["name"] = n.Name
+	return m
+}
+
 func (g *Graph) NodesByID() map[string]IntentNode {
 	out := make(map[string]IntentNode, len(g.Nodes))
 	for _, n := range g.Nodes {
@@ -140,9 +160,11 @@ func Build(f *ast.File, source string) (*Graph, error) {
 
 	for i := range g.Nodes {
 		for _, dep := range g.Nodes[i].Needs {
-			if depID, ok := nameToID[dep.Target]; ok {
-				g.Edges = append(g.Edges, Edge{From: depID, To: g.Nodes[i].ID})
+			depID, ok := nameToID[dep.Target]
+			if !ok {
+				return nil, fmt.Errorf("node %q needs unknown target %q", g.Nodes[i].Name, dep.Target)
 			}
+			g.Edges = append(g.Edges, Edge{From: depID, To: g.Nodes[i].ID})
 		}
 	}
 	return g, nil
@@ -192,6 +214,9 @@ func buildIntentNode(b *ast.Block, source string, profiles map[string]Profile) (
 		}
 	}
 	for k, v := range b.Fields {
+		if k == "apply" {
+			continue
+		}
 		n.Intent[k] = v.Raw
 	}
 	for _, c := range b.Children {
@@ -226,21 +251,6 @@ func profileRefs(b *ast.Block) []string {
 	}
 	if v.IsList() {
 		return append([]string{}, v.List...)
-	}
-	if strings.HasPrefix(v.Raw, "[") && strings.HasSuffix(v.Raw, "]") {
-		inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(v.Raw, "["), "]"))
-		if inner == "" {
-			return nil
-		}
-		parts := strings.Split(inner, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			item := strings.TrimSpace(strings.Trim(p, `"`))
-			if item != "" {
-				out = append(out, item)
-			}
-		}
-		return out
 	}
 	if strings.TrimSpace(v.Raw) == "" {
 		return nil

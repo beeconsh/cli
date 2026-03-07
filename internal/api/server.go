@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/terracotta-ai/beecon/internal/engine"
 )
@@ -32,7 +35,36 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/reject", s.reject)
 	mux.HandleFunc("/api/connect", s.connect)
 	mux.HandleFunc("/api/performance", s.performance)
-	return mux
+	return apiKeyMiddleware(mux)
+}
+
+func apiKeyMiddleware(next http.Handler) http.Handler {
+	key := os.Getenv("BEECON_API_KEY")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if key != "" {
+			auth := r.Header.Get("Authorization")
+			if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != key {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing API key"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func safePath(root, requested string) (string, error) {
+	abs, err := filepath.Abs(filepath.Join(root, requested))
+	if err != nil {
+		return "", fmt.Errorf("invalid path")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("invalid root")
+	}
+	if !strings.HasPrefix(abs, absRoot+string(filepath.Separator)) && abs != absRoot {
+		return "", fmt.Errorf("path escapes project root")
+	}
+	return requested, nil
 }
 
 func (s *Server) beacons(w http.ResponseWriter, r *http.Request) {
@@ -48,9 +80,16 @@ func (s *Server) beacons(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Path string `json:"path"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
 		if req.Path == "" {
 			req.Path = "infra.beecon"
+		}
+		if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
 		}
 		if err := s.engine.Validate(req.Path); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -70,9 +109,16 @@ func (s *Server) validateBeacon(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
 	if req.Path == "" {
 		req.Path = "infra.beecon"
+	}
+	if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 	if err := s.engine.Validate(req.Path); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -90,9 +136,16 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 		Path  string `json:"path"`
 		Apply bool   `json:"apply"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
 	if req.Path == "" {
 		req.Path = "infra.beecon"
+	}
+	if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 	if req.Apply {
 		res, err := s.engine.Apply(req.Path)
@@ -124,6 +177,10 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	for _, rec := range st.Resources {
+		rec.IntentSnapshot = scrubMap(rec.IntentSnapshot)
+		rec.LiveState = scrubMap(rec.LiveState)
 	}
 	writeJSON(w, http.StatusOK, st)
 }
@@ -162,6 +219,10 @@ func (s *Server) graph(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
 		path = "infra.beecon"
+	}
+	if _, err := safePath(s.engine.Root(), path); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 	res, err := s.engine.Plan(path)
 	if err != nil {
@@ -216,9 +277,16 @@ func (s *Server) drift(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
 	if req.Path == "" {
 		req.Path = "infra.beecon"
+	}
+	if _, err := safePath(s.engine.Root(), req.Path); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 	drifted, err := s.engine.Drift(req.Path)
 	if err != nil {
@@ -237,7 +305,10 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		RequestID string `json:"request_id"`
 		Approver  string `json:"approver"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
 	if req.RequestID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request_id required"})
 		return
@@ -263,7 +334,10 @@ func (s *Server) reject(w http.ResponseWriter, r *http.Request) {
 		Approver  string `json:"approver"`
 		Reason    string `json:"reason"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
 	if req.RequestID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request_id required"})
 		return
@@ -290,7 +364,10 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 		Provider string `json:"provider"`
 		Region   string `json:"region"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
 	if req.Provider == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider required"})
 		return
@@ -319,7 +396,10 @@ func (s *Server) performance(w http.ResponseWriter, r *http.Request) {
 			Threshold  string `json:"threshold"`
 			Duration   string `json:"duration"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
 		if req.ResourceID == "" || req.Metric == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "resource_id and metric required"})
 			return
@@ -336,6 +416,34 @@ func (s *Server) performance(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+var apiSensitiveKeys = map[string]bool{
+	"password":       true,
+	"secret_value":   true,
+	"token":          true,
+	"admin_password": true,
+	"secret":         true,
+	"secret_key":     true,
+}
+
+func scrubMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		base := k
+		if idx := strings.LastIndex(k, "."); idx >= 0 {
+			base = k[idx+1:]
+		}
+		if apiSensitiveKeys[base] {
+			out[k] = "**REDACTED**"
+		} else {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

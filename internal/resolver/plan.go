@@ -28,7 +28,7 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 	for _, id := range orderedIDs {
 		intentIDs[id] = true
 		n := nodeByID[id]
-		nodeIntent := nodeSnapshot(n)
+		nodeIntent := n.Snapshot()
 		rec, ok := managed[id]
 		if !ok {
 			actions = append(actions, &state.PlanAction{
@@ -74,8 +74,8 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 	}
 
 	// Preserve dependency order for create/update actions exactly as emitted by the
-	// topological walk. Only DELETE actions are pushed to the end and ordered in
-	// reverse topological position so dependents are removed before dependencies.
+	// topological walk. DELETE actions are pushed to the end and ordered by reverse
+	// type precedence so dependents (services) are removed before dependencies (stores, networks).
 	pos := map[string]int{}
 	for i, id := range orderedIDs {
 		pos[id] = i
@@ -89,7 +89,13 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 		if !di {
 			return pos[actions[i].NodeID] < pos[actions[j].NodeID]
 		}
-		return pos[actions[i].NodeID] > pos[actions[j].NodeID]
+		// For deletes: reverse type precedence (services before stores before networks)
+		pi := deletePrecedence(actions[i].NodeType)
+		pj := deletePrecedence(actions[j].NodeType)
+		if pi != pj {
+			return pi < pj
+		}
+		return actions[i].NodeID < actions[j].NodeID
 	})
 
 	return &Plan{Actions: actions}, nil
@@ -168,6 +174,21 @@ func orderByDependencies(g *ir.Graph) ([]string, map[string][]string, error) {
 	return out, depends, nil
 }
 
+func deletePrecedence(nodeType string) int {
+	switch ir.NodeType(nodeType) {
+	case ir.NodeService:
+		return 1
+	case ir.NodeCompute:
+		return 2
+	case ir.NodeStore:
+		return 3
+	case ir.NodeNetwork:
+		return 4
+	default:
+		return 0
+	}
+}
+
 func precedence(t ir.NodeType) int {
 	switch t {
 	case ir.NodeNetwork:
@@ -191,25 +212,6 @@ func managedByNodeID(st *state.State) map[string]*state.ResourceRecord {
 		}
 	}
 	return out
-}
-
-func nodeSnapshot(n ir.IntentNode) map[string]interface{} {
-	m := map[string]interface{}{}
-	for k, v := range n.Intent {
-		m["intent."+k] = v
-	}
-	for k, v := range n.Performance {
-		m["performance."+k] = v
-	}
-	for k, v := range n.Env {
-		m["env."+k] = v
-	}
-	for _, d := range n.Needs {
-		m["needs."+d.Target] = d.Mode
-	}
-	m["type"] = string(n.Type)
-	m["name"] = n.Name
-	return m
 }
 
 func diffIntent(old, new map[string]interface{}) map[string]string {

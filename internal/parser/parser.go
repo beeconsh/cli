@@ -78,6 +78,9 @@ func Parse(r io.Reader) (*ast.File, error) {
 			if curr.Fields == nil {
 				curr.Fields = map[string]ast.Value{}
 			}
+			if _, exists := curr.Fields[k]; exists {
+				return nil, fmt.Errorf("line %d: duplicate key %q", lineNum, k)
+			}
 			curr.Fields[k] = v
 		}
 	}
@@ -160,6 +163,10 @@ func Validate(f ast.File) error {
 				continue
 			}
 			for dep := range c.Fields {
+				if dep == b.Name {
+					errs = append(errs, fmt.Sprintf("%s.%s has self-dependency", b.Kind, b.Name))
+					continue
+				}
 				if _, ok := nodeNames[dep]; !ok {
 					errs = append(errs, fmt.Sprintf("%s.%s needs unknown dependency %q", b.Kind, b.Name, dep))
 				}
@@ -175,11 +182,16 @@ func Validate(f ast.File) error {
 }
 
 func stripComment(line string) string {
-	idx := strings.Index(line, "#")
-	if idx == -1 {
-		return line
+	inQuote := false
+	for i, ch := range line {
+		if ch == '"' {
+			inQuote = !inQuote
+		}
+		if ch == '#' && !inQuote {
+			return strings.TrimSpace(line[:i])
+		}
 	}
-	return strings.TrimSpace(line[:idx])
+	return line
 }
 
 func parseBlockHeader(line string, topLevel bool) (*ast.Block, error) {

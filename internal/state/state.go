@@ -10,8 +10,11 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+var idCounter uint64
 
 type ResourceStatus string
 
@@ -102,8 +105,8 @@ type ApprovalRequest struct {
 	ActionIDs   []string       `json:"action_ids"`
 	Reason      string         `json:"reason"`
 	Status      ApprovalStatus `json:"status"`
-	ApprovedBy  string         `json:"approved_by,omitempty"`
-	ApprovedAt  *time.Time     `json:"approved_at,omitempty"`
+	ResolvedBy  string         `json:"resolved_by,omitempty"`
+	ResolvedAt  *time.Time     `json:"resolved_at,omitempty"`
 	ExpiresAt   time.Time      `json:"expires_at"`
 	BeaconPath  string         `json:"beacon_path"`
 	CostDelta   string         `json:"cost_delta,omitempty"`
@@ -194,7 +197,11 @@ func (s *Store) Save(st *State) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, b, 0o644)
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }
 
 func newState() *State {
@@ -211,7 +218,7 @@ func newState() *State {
 }
 
 func NewID(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UTC().UnixNano())
+	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UTC().UnixNano(), atomic.AddUint64(&idCounter, 1))
 }
 
 func HashMap(m map[string]interface{}) string {
@@ -222,7 +229,12 @@ func HashMap(m map[string]interface{}) string {
 	sort.Strings(keys)
 	var s string
 	for _, k := range keys {
-		s += fmt.Sprintf("%s=%v;", k, m[k])
+		b, err := json.Marshal(m[k])
+		if err != nil {
+			s += fmt.Sprintf("%s=%v;", k, m[k])
+		} else {
+			s += fmt.Sprintf("%s=%s;", k, b)
+		}
 	}
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])

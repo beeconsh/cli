@@ -90,7 +90,10 @@ func (e *Engine) Plan(beaconPath string) (*PlanResult, error) {
 
 func (e *Engine) Apply(beaconPath string) (*ApplyResult, error) {
 	_ = e.expireApprovals()
-	abs, _ := filepath.Abs(beaconPath)
+	abs, err := filepath.Abs(beaconPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve path %q: %w", beaconPath, err)
+	}
 	g, st, err := e.parseAndBuild(beaconPath)
 	if err != nil {
 		return nil, err
@@ -127,7 +130,9 @@ func (e *Engine) Apply(beaconPath string) (*ApplyResult, error) {
 			run.Status = state.RunFailed
 			run.Error = err.Error()
 			st.Runs[run.ID] = run
-			_ = e.store.Save(st)
+			if saveErr := e.store.Save(st); saveErr != nil {
+				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, saveErr)
+			}
 			return nil, err
 		}
 		executed++
@@ -207,7 +212,9 @@ func (e *Engine) Approve(requestID, approver string) (*ApplyResult, error) {
 		if err := applyAction(context.Background(), e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
 			run.Status = state.RunFailed
 			run.Error = err.Error()
-			_ = e.store.Save(st)
+			if saveErr := e.store.Save(st); saveErr != nil {
+				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, saveErr)
+			}
 			return nil, err
 		}
 		run.ExecutedActions = append(run.ExecutedActions, actionID)
@@ -215,8 +222,8 @@ func (e *Engine) Approve(requestID, approver string) (*ApplyResult, error) {
 	}
 	now := time.Now().UTC()
 	req.Status = state.ApprovalApproved
-	req.ApprovedBy = approver
-	req.ApprovedAt = &now
+	req.ResolvedBy = approver
+	req.ResolvedAt = &now
 	run.Status = state.RunApplied
 	addAudit(st, run.ID, "APPROVAL_APPROVED", "", fmt.Sprintf("approval %s approved by %s", requestID, approver), nil)
 	if err := e.store.Save(st); err != nil {
@@ -240,8 +247,8 @@ func (e *Engine) Reject(requestID, approver, reason string) error {
 	}
 	now := time.Now().UTC()
 	req.Status = state.ApprovalRejected
-	req.ApprovedBy = approver
-	req.ApprovedAt = &now
+	req.ResolvedBy = approver
+	req.ResolvedAt = &now
 	run := st.Runs[req.RunID]
 	if run != nil {
 		run.Status = state.RunFailed
@@ -301,13 +308,16 @@ func (e *Engine) Drift(beaconPath string) ([]*state.ResourceRecord, error) {
 	}
 	nodes := g.NodesByID()
 	var drifted []*state.ResourceRecord
+	changed := false
 	for nodeID, rec := range st.Resources {
 		if !rec.Managed {
 			continue
 		}
 		n, ok := nodes[nodeID]
 		if !ok {
+			rec.Managed = false
 			rec.Status = state.StatusObserved
+			changed = true
 			continue
 		}
 		obs, err := e.exec.Observe(context.Background(), cloudProvider, cloudRegion, rec)
@@ -319,21 +329,26 @@ func (e *Engine) Drift(beaconPath string) ([]*state.ResourceRecord, error) {
 			rec.LiveState = map[string]interface{}{}
 			rec.AgentReasoning = "resource missing from provider live state"
 			drifted = append(drifted, rec)
+			changed = true
 			continue
 		}
 		if obs.LiveState != nil {
 			rec.LiveState = obs.LiveState
+			changed = true
 		}
-		nowHash := state.HashMap(snapshot(n))
+		nowHash := state.HashMap(n.Snapshot())
 		if nowHash != rec.IntentHash {
 			rec.Status = state.StatusDrifted
 			drifted = append(drifted, rec)
+			changed = true
 		} else {
 			rec.Status = state.StatusMatched
 		}
 	}
-	if err := e.store.Save(st); err != nil {
-		return nil, err
+	if changed {
+		if err := e.store.Save(st); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(drifted, func(i, j int) bool { return drifted[i].ResourceID < drifted[j].ResourceID })
 	return drifted, nil
@@ -385,7 +400,9 @@ func (e *Engine) Rollback(runID string) (string, error) {
 			rb.Status = state.RunFailed
 			rb.Error = err.Error()
 			st.Runs[rb.ID] = rb
-			_ = e.store.Save(st)
+			if saveErr := e.store.Save(st); saveErr != nil {
+				return "", fmt.Errorf("%w (also failed to save state: %v)", err, saveErr)
+			}
 			return "", err
 		}
 		rb.ExecutedActions = append(rb.ExecutedActions, a.ID)
@@ -523,7 +540,7 @@ func applyAction(ctx context.Context, exec provider.Executor, cloudProvider, clo
 	}
 	nodeByID := g.NodesByID()
 	n := nodeByID[a.NodeID]
-	snap := snapshot(n)
+	snap := n.Snapshot()
 	hash := state.HashMap(snap)
 	rec := st.Resources[a.NodeID]
 	if a.Operation == "DELETE" && n.ID == "" && rec != nil && rec.IntentSnapshot != nil {
@@ -556,7 +573,7 @@ func applyAction(ctx context.Context, exec provider.Executor, cloudProvider, clo
 		rec.ProviderID = result.ProviderID
 		rec.Managed = true
 		rec.BeaconRef = n.Source
-		rec.IntentSnapshot = snap
+		rec.IntentSnapshot = scrubCredentials(snap)
 		rec.IntentHash = hash
 		if result.LiveState != nil {
 			rec.LiveState = result.LiveState
@@ -622,8 +639,8 @@ func (e *Engine) expireApprovals() error {
 		}
 		if now.After(req.ExpiresAt) {
 			req.Status = state.ApprovalRejected
-			req.ApprovedBy = "system-timeout"
-			req.ApprovedAt = &now
+			req.ResolvedBy = "system-timeout"
+			req.ResolvedAt = &now
 			if run := st.Runs[req.RunID]; run != nil {
 				run.Status = state.RunFailed
 				run.Error = "approval expired"
@@ -693,23 +710,29 @@ func addAudit(st *state.State, runID, typ, resourceID, msg string, data map[stri
 	})
 }
 
-func snapshot(n ir.IntentNode) map[string]interface{} {
-	m := map[string]interface{}{}
-	for k, v := range n.Intent {
-		m["intent."+k] = v
+var sensitiveKeys = map[string]bool{
+	"password":       true,
+	"secret_value":   true,
+	"token":          true,
+	"admin_password": true,
+	"secret":         true,
+	"secret_key":     true,
+}
+
+func scrubCredentials(m map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		base := k
+		if idx := strings.LastIndex(k, "."); idx >= 0 {
+			base = k[idx+1:]
+		}
+		if sensitiveKeys[base] {
+			out[k] = "**REDACTED**"
+		} else {
+			out[k] = v
+		}
 	}
-	for k, v := range n.Performance {
-		m["performance."+k] = v
-	}
-	for k, v := range n.Env {
-		m["env."+k] = v
-	}
-	for _, d := range n.Needs {
-		m["needs."+d.Target] = d.Mode
-	}
-	m["type"] = string(n.Type)
-	m["name"] = n.Name
-	return m
+	return out
 }
 
 func copyMap(in map[string]interface{}) map[string]interface{} {

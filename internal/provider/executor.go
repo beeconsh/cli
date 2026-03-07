@@ -1423,6 +1423,15 @@ func detectRecordTarget(rec *state.ResourceRecord) string {
 	return "generic"
 }
 
+var simulatedSensitiveKeys = map[string]bool{
+	"password":       true,
+	"secret_value":   true,
+	"token":          true,
+	"admin_password": true,
+	"secret":         true,
+	"secret_key":     true,
+}
+
 func simulatedApply(req ApplyRequest, target string) *ApplyResult {
 	providerID := req.RecordProviderID()
 	if providerID == "" {
@@ -1436,6 +1445,13 @@ func simulatedApply(req ApplyRequest, target string) *ApplyResult {
 		"simulated":   true,
 	}
 	for k, v := range req.Intent {
+		base := k
+		if idx := strings.LastIndex(k, "."); idx >= 0 {
+			base = k[idx+1:]
+		}
+		if simulatedSensitiveKeys[base] {
+			continue
+		}
 		live[k] = v
 	}
 	return &ApplyResult{ProviderID: providerID, LiveState: live}
