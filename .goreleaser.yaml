@@ -1,0 +1,39 @@
+version: 2
+
+builds:
+  - main: ./cmd/beecon
+    binary: beecon
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "beecon_{{ .Os }}_{{ .Arch }}"
+
+brews:
+  - repository:
+      owner: beeconsh
+      name: homebrew-beecon
+      branch: main
+    directory: Formula
+    homepage: "https://github.com/beeconsh/cli"
+    description: "Infrastructure language your agent uses to deploy to the cloud"
+    license: "MIT"
+    test: |
+      assert_match "beecon", shell_output("#{bin}/beecon 2>&1", 1)
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
