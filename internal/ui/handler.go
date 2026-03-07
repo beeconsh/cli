@@ -1,16 +1,26 @@
 package ui
 
-import "net/http"
+import (
+	htmlpkg "html"
+	"net/http"
+	"strings"
+)
 
-func Handler() http.Handler {
+// Handler returns an HTTP handler for the Mission Control UI. When apiKey is
+// non-empty, a meta tag and JS auth header are injected so the UI can
+// authenticate API requests.
+func Handler(apiKey string) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", index)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		html := page
+		if apiKey != "" {
+			meta := `<meta name="beecon-api-key" content="` + htmlpkg.EscapeString(apiKey) + `" />`
+			html = strings.Replace(html, "</head>", meta+"\n</head>", 1)
+		}
+		_, _ = w.Write([]byte(html))
+	})
 	return mux
-}
-
-func index(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(page))
 }
 
 const page = `<!doctype html>
@@ -47,7 +57,9 @@ main {display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; padding:10px; 
 <section class="panel"><h2>Audit Rail</h2><div id="audit" class="content"></div></section>
 </main>
 <script>
-async function j(url){const r=await fetch(url); return r.json();}
+const _bk=document.querySelector('meta[name="beecon-api-key"]');
+const _ak=_bk?_bk.content:'';
+async function j(url){const o={};if(_ak)o.headers={'Authorization':'Bearer '+_ak};const r=await fetch(url,o);return r.json();}
 function esc(s){return (s??'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function statusBadge(s){
   const t=(s||'').toUpperCase();
@@ -93,7 +105,10 @@ async function render(){
   }
   auditEl.innerHTML = au.join('') || '<div class="small">No audit events</div>';
 }
-render(); setInterval(render, 5000);
+let _delay=5000,_paused=false;
+document.addEventListener('visibilitychange',()=>{_paused=document.hidden;if(!_paused)poll();});
+function poll(){if(_paused)return;render().then(()=>{_delay=5000;}).catch(()=>{_delay=Math.min(_delay*2,60000);}).finally(()=>{setTimeout(poll,_delay);});}
+poll();
 </script>
 </body>
 </html>`

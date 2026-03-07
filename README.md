@@ -129,6 +129,7 @@ beecon serve [:8080]
 
 ## Configuration
 - `BEECON_EXECUTE=1`: enable live provider mutation calls for implemented adapters
+- `BEECON_API_KEY=<key>`: protect the HTTP API and Mission Control UI with Bearer token auth. When set, all `/api/*` requests require an `Authorization: Bearer <key>` header. The UI receives the key automatically via an injected meta tag
 - Default mode (unset): dry-run-safe simulation
 - Local state path: `.beecon/state.json`
 
@@ -183,8 +184,13 @@ Adapter depth matrix (current):
 | Azure | container_apps, postgres_flexible, mysql_flexible, azure_cache_redis, functions, api_management, service_bus, event_grid, front_door, cdn, dns, monitor, aks, vm | ARM generic |
 
 ## Security
+- **Credential scrubbing**: All API responses, plan diffs, graph views, drift output, and state endpoints are scrubbed of sensitive values (`password`, `secret_value`, `token`, `api_key`, `private_key`, `connection_string`, `client_secret`, and others). The canonical sensitive key registry lives in `internal/security/redact.go`
+- **API authentication**: Set `BEECON_API_KEY` to require Bearer token auth on all API endpoints. Comparison uses constant-time comparison (`crypto/subtle`) to prevent timing attacks
+- **Approval integrity**: When `apply` creates an approval request, it captures a SHA-256 hash of the beacon file. `approve` verifies the file hasn't been modified since — if it has, the approval is rejected and the user must re-run `apply`
+- **Transactional state**: All mutating operations use a transactional state API (`LoadForUpdate`/`Commit`/`Rollback`) to prevent TOCTOU races on `.beecon/state.json`
+- **Context propagation**: All engine operations accept `context.Context` for cancellation. The CLI uses a signal-cancellable context (`SIGINT`/`SIGTERM`)
 - Keep cloud credentials out of source control
-- Add `.beecon/` to your project's `.gitignore` to avoid committing state and credentials.
+- Add `.beecon/` to your project's `.gitignore` to avoid committing state and credentials
 - Use least-privilege IAM/service principals for provider credentials
 - Review plans before apply
 - Use approval gates for sensitive operations

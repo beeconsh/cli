@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,11 +36,12 @@ store postgres {
 		t.Fatal(err)
 	}
 
+	ctx := context.Background()
 	e := New(dir)
-	if _, err := e.Apply(initial); err != nil {
+	if _, err := e.Apply(ctx, initial); err != nil {
 		t.Fatalf("initial apply failed: %v", err)
 	}
-	_, err := e.Apply(updated)
+	_, err := e.Apply(ctx, updated)
 	if err == nil {
 		t.Fatalf("expected forbid policy error")
 	}

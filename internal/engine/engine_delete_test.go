@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -31,14 +32,15 @@ store bucket {
 		t.Fatal(err)
 	}
 
+	ctx := context.Background()
 	e := New(dir)
-	if _, err := e.Apply(initial); err != nil {
+	if _, err := e.Apply(ctx, initial); err != nil {
 		t.Fatalf("initial apply failed: %v", err)
 	}
-	if _, err := e.Apply(updated); err != nil {
+	if _, err := e.Apply(ctx, updated); err != nil {
 		t.Fatalf("delete apply failed: %v", err)
 	}
-	st, err := e.Status()
+	st, err := e.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

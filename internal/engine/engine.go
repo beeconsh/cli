@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -49,7 +51,8 @@ func (e *Engine) DiscoverBeacons() ([]string, error) {
 	return discovery.DiscoverBeacons(e.root)
 }
 
-func (e *Engine) Audit(resourceID string) ([]state.AuditEvent, error) {
+func (e *Engine) Audit(ctx context.Context, resourceID string) ([]state.AuditEvent, error) {
+	e.runExpireApprovals()
 	st, err := e.store.Load()
 	if err != nil {
 		return nil, err
@@ -59,7 +62,7 @@ func (e *Engine) Audit(resourceID string) ([]state.AuditEvent, error) {
 		sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.Before(out[j].Timestamp) })
 		return out, nil
 	}
-	return e.History(resourceID)
+	return e.History(ctx, resourceID)
 }
 
 func (e *Engine) Root() string { return e.root }
@@ -70,12 +73,12 @@ func (e *Engine) EnsureRoot() error {
 }
 
 func (e *Engine) Validate(beaconPath string) error {
-	_, _, err := e.parseAndBuild(beaconPath)
+	_, err := parseAndBuildGraph(beaconPath)
 	return err
 }
 
-func (e *Engine) Plan(beaconPath string) (*PlanResult, error) {
-	_ = e.expireApprovals()
+func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, error) {
+	e.runExpireApprovals()
 	g, st, err := e.parseAndBuild(beaconPath)
 	if err != nil {
 		return nil, err
@@ -88,16 +91,24 @@ func (e *Engine) Plan(beaconPath string) (*PlanResult, error) {
 	return &PlanResult{Graph: g, Plan: p}, nil
 }
 
-func (e *Engine) Apply(beaconPath string) (*ApplyResult, error) {
-	_ = e.expireApprovals()
+func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, error) {
 	abs, err := filepath.Abs(beaconPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve path %q: %w", beaconPath, err)
 	}
-	g, st, err := e.parseAndBuild(beaconPath)
+	g, err := parseAndBuildGraph(beaconPath)
 	if err != nil {
 		return nil, err
 	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
 	p, err := resolver.BuildPlan(g, st)
 	if err != nil {
 		return nil, err
@@ -107,6 +118,13 @@ func (e *Engine) Apply(beaconPath string) (*ApplyResult, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Compute intent hash for approval integrity.
+	content, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, fmt.Errorf("read beacon for hash: %w", err)
+	}
+	intentHash := sha256hex(content)
 
 	run := &state.RunRecord{
 		ID:         state.NewID("run"),
@@ -126,12 +144,12 @@ func (e *Engine) Apply(beaconPath string) (*ApplyResult, error) {
 			pending = append(pending, a)
 			continue
 		}
-		if err := applyAction(context.Background(), e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
+		if err := applyAction(ctx, e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
 			run.Status = state.RunFailed
 			run.Error = err.Error()
 			st.Runs[run.ID] = run
-			if saveErr := e.store.Save(st); saveErr != nil {
-				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, saveErr)
+			if commitErr := tx.Commit(); commitErr != nil {
+				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, commitErr)
 			}
 			return nil, err
 		}
@@ -150,6 +168,7 @@ func (e *Engine) Apply(beaconPath string) (*ApplyResult, error) {
 			Status:      state.ApprovalPending,
 			ExpiresAt:   time.Now().UTC().Add(24 * time.Hour),
 			BeaconPath:  abs,
+			IntentHash:  intentHash,
 			CostDelta:   estimateCostDelta(pending),
 			BlastRadius: fmt.Sprintf("%d actions", len(pending)),
 		}
@@ -168,18 +187,21 @@ func (e *Engine) Apply(beaconPath string) (*ApplyResult, error) {
 	if approvalID != "" {
 		addAudit(st, run.ID, "APPROVAL_REQUIRED", "", fmt.Sprintf("approval %s required", approvalID), map[string]interface{}{"request_id": approvalID})
 	}
-	if err := e.store.Save(st); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &ApplyResult{RunID: run.ID, ApprovalRequestID: approvalID, Executed: executed, Pending: len(pending)}, nil
 }
 
-func (e *Engine) Approve(requestID, approver string) (*ApplyResult, error) {
-	_ = e.expireApprovals()
-	st, err := e.store.Load()
+func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*ApplyResult, error) {
+	tx, err := e.store.LoadForUpdate()
 	if err != nil {
 		return nil, err
 	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
 	req, ok := st.Approvals[requestID]
 	if !ok {
 		return nil, fmt.Errorf("approval request %s not found", requestID)
@@ -190,11 +212,23 @@ func (e *Engine) Approve(requestID, approver string) (*ApplyResult, error) {
 	if time.Now().UTC().After(req.ExpiresAt) {
 		return nil, fmt.Errorf("approval request %s expired at %s", requestID, req.ExpiresAt.Format(time.RFC3339))
 	}
+
+	// Approval integrity: verify the beacon file hasn't changed since Apply.
+	if req.IntentHash != "" {
+		content, readErr := os.ReadFile(req.BeaconPath)
+		if readErr != nil {
+			return nil, fmt.Errorf("read beacon for approval verification: %w", readErr)
+		}
+		if sha256hex(content) != req.IntentHash {
+			return nil, fmt.Errorf("beacon file modified since apply; re-run apply")
+		}
+	}
+
 	run, ok := st.Runs[req.RunID]
 	if !ok {
 		return nil, fmt.Errorf("run %s not found", req.RunID)
 	}
-	g, _, err := e.parseAndBuild(req.BeaconPath)
+	g, err := parseAndBuildGraph(req.BeaconPath)
 	if err != nil {
 		return nil, err
 	}
@@ -209,11 +243,11 @@ func (e *Engine) Approve(requestID, approver string) (*ApplyResult, error) {
 		if !ok {
 			return nil, fmt.Errorf("action %s not found", actionID)
 		}
-		if err := applyAction(context.Background(), e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
+		if err := applyAction(ctx, e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
 			run.Status = state.RunFailed
 			run.Error = err.Error()
-			if saveErr := e.store.Save(st); saveErr != nil {
-				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, saveErr)
+			if commitErr := tx.Commit(); commitErr != nil {
+				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, commitErr)
 			}
 			return nil, err
 		}
@@ -226,18 +260,21 @@ func (e *Engine) Approve(requestID, approver string) (*ApplyResult, error) {
 	req.ResolvedAt = &now
 	run.Status = state.RunApplied
 	addAudit(st, run.ID, "APPROVAL_APPROVED", "", fmt.Sprintf("approval %s approved by %s", requestID, approver), nil)
-	if err := e.store.Save(st); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &ApplyResult{RunID: run.ID, Executed: executed}, nil
 }
 
-func (e *Engine) Reject(requestID, approver, reason string) error {
-	_ = e.expireApprovals()
-	st, err := e.store.Load()
+func (e *Engine) Reject(ctx context.Context, requestID, approver, reason string) error {
+	tx, err := e.store.LoadForUpdate()
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
 	req, ok := st.Approvals[requestID]
 	if !ok {
 		return fmt.Errorf("approval request %s not found", requestID)
@@ -258,16 +295,16 @@ func (e *Engine) Reject(requestID, approver, reason string) error {
 		run.Error = reason
 	}
 	addAudit(st, req.RunID, "APPROVAL_REJECTED", "", fmt.Sprintf("approval %s rejected by %s: %s", requestID, approver, reason), nil)
-	return e.store.Save(st)
+	return tx.Commit()
 }
 
-func (e *Engine) Status() (*state.State, error) {
-	_ = e.expireApprovals()
+func (e *Engine) Status(ctx context.Context) (*state.State, error) {
+	e.runExpireApprovals()
 	return e.store.Load()
 }
 
-func (e *Engine) Runs() ([]*state.RunRecord, error) {
-	_ = e.expireApprovals()
+func (e *Engine) Runs(ctx context.Context) ([]*state.RunRecord, error) {
+	e.runExpireApprovals()
 	st, err := e.store.Load()
 	if err != nil {
 		return nil, err
@@ -281,8 +318,8 @@ func (e *Engine) Runs() ([]*state.RunRecord, error) {
 	return out, nil
 }
 
-func (e *Engine) Approvals() ([]*state.ApprovalRequest, error) {
-	_ = e.expireApprovals()
+func (e *Engine) Approvals(ctx context.Context) ([]*state.ApprovalRequest, error) {
+	e.runExpireApprovals()
 	st, err := e.store.Load()
 	if err != nil {
 		return nil, err
@@ -296,18 +333,27 @@ func (e *Engine) Approvals() ([]*state.ApprovalRequest, error) {
 	return out, nil
 }
 
-func (e *Engine) Drift(beaconPath string) ([]*state.ResourceRecord, error) {
-	_ = e.expireApprovals()
-	g, st, err := e.parseAndBuild(beaconPath)
+func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.ResourceRecord, []error, error) {
+	g, err := parseAndBuildGraph(beaconPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cloudProvider, cloudRegion, err := parseCloud(g)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
 	nodes := g.NodesByID()
 	var drifted []*state.ResourceRecord
+	var observeErrors []error
 	changed := false
 	for nodeID, rec := range st.Resources {
 		if !rec.Managed {
@@ -320,9 +366,10 @@ func (e *Engine) Drift(beaconPath string) ([]*state.ResourceRecord, error) {
 			changed = true
 			continue
 		}
-		obs, err := e.exec.Observe(context.Background(), cloudProvider, cloudRegion, rec)
+		obs, err := e.exec.Observe(ctx, cloudProvider, cloudRegion, rec)
 		if err != nil {
-			return nil, err
+			observeErrors = append(observeErrors, fmt.Errorf("observe %s: %w", nodeID, err))
+			continue
 		}
 		if !obs.Exists {
 			rec.Status = state.StatusDrifted
@@ -346,16 +393,16 @@ func (e *Engine) Drift(beaconPath string) ([]*state.ResourceRecord, error) {
 		}
 	}
 	if changed {
-		if err := e.store.Save(st); err != nil {
-			return nil, err
+		if err := tx.Commit(); err != nil {
+			return nil, observeErrors, err
 		}
 	}
 	sort.Slice(drifted, func(i, j int) bool { return drifted[i].ResourceID < drifted[j].ResourceID })
-	return drifted, nil
+	return drifted, observeErrors, nil
 }
 
-func (e *Engine) History(resourceID string) ([]state.AuditEvent, error) {
-	_ = e.expireApprovals()
+func (e *Engine) History(ctx context.Context, resourceID string) ([]state.AuditEvent, error) {
+	e.runExpireApprovals()
 	st, err := e.store.Load()
 	if err != nil {
 		return nil, err
@@ -370,12 +417,15 @@ func (e *Engine) History(resourceID string) ([]state.AuditEvent, error) {
 	return out, nil
 }
 
-func (e *Engine) Rollback(runID string) (string, error) {
-	_ = e.expireApprovals()
-	st, err := e.store.Load()
+func (e *Engine) Rollback(ctx context.Context, runID string) (string, error) {
+	tx, err := e.store.LoadForUpdate()
 	if err != nil {
 		return "", err
 	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
 	run, ok := st.Runs[runID]
 	if !ok {
 		return "", fmt.Errorf("run %s not found", runID)
@@ -383,6 +433,17 @@ func (e *Engine) Rollback(runID string) (string, error) {
 	if len(run.ExecutedActions) == 0 {
 		return "", errors.New("run has no executed actions to rollback")
 	}
+
+	// Resolve cloud info for rollback cloud calls.
+	var cloudProvider, cloudRegion string
+	if run.BeaconPath != "" {
+		if g, parseErr := parseAndBuildGraph(run.BeaconPath); parseErr == nil {
+			cloudProvider, cloudRegion, _ = parseCloud(g)
+		} else {
+			addAudit(st, runID, "ROLLBACK_PARSE_WARNING", "", fmt.Sprintf("could not re-parse beacon: %v", parseErr), nil)
+		}
+	}
+
 	rb := &state.RunRecord{
 		ID:              state.NewID("run"),
 		CreatedAt:       time.Now().UTC(),
@@ -396,50 +457,57 @@ func (e *Engine) Rollback(runID string) (string, error) {
 			continue
 		}
 		inverse := invertOperation(a.Operation)
-		if err := applyInverse(st, rb.ID, a, inverse); err != nil {
+		if err := e.applyInverse(ctx, cloudProvider, cloudRegion, st, rb.ID, a, inverse); err != nil {
 			rb.Status = state.RunFailed
 			rb.Error = err.Error()
 			st.Runs[rb.ID] = rb
-			if saveErr := e.store.Save(st); saveErr != nil {
-				return "", fmt.Errorf("%w (also failed to save state: %v)", err, saveErr)
+			if commitErr := tx.Commit(); commitErr != nil {
+				return "", fmt.Errorf("%w (also failed to save state: %v)", err, commitErr)
 			}
 			return "", err
 		}
 		rb.ExecutedActions = append(rb.ExecutedActions, a.ID)
 	}
 	st.Runs[rb.ID] = rb
-	if err := e.store.Save(st); err != nil {
+	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return rb.ID, nil
 }
 
-func (e *Engine) Connect(providerName, region string) error {
-	_ = e.expireApprovals()
-	st, err := e.store.Load()
+func (e *Engine) Connect(ctx context.Context, providerName, region string) error {
+	res, err := provider.Connect(ctx, providerName, region)
 	if err != nil {
 		return err
 	}
-	res, err := provider.Connect(context.Background(), providerName, region)
+
+	tx, err := e.store.LoadForUpdate()
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
 	st.Connections[strings.ToLower(providerName)] = state.ProviderConnection{
 		Provider:   strings.ToLower(providerName),
 		Configured: true,
 		Region:     res.Region,
 		UpdatedAt:  time.Now().UTC(),
 	}
-	addAudit(st, "", "PROVIDER_CONNECTED", "", fmt.Sprintf("connected %s (%s) identity=%s", providerName, res.Region, res.Identity), nil)
-	return e.store.Save(st)
+	addAudit(st, "", "PROVIDER_CONNECTED", "", fmt.Sprintf("connected %s (%s) identity=%s", providerName, res.Region, maskIdentity(res.Identity)), nil)
+	return tx.Commit()
 }
 
-func (e *Engine) IngestPerformanceBreach(resourceID, metric, observed, threshold, duration string) (string, error) {
-	_ = e.expireApprovals()
-	st, err := e.store.Load()
+func (e *Engine) IngestPerformanceBreach(ctx context.Context, resourceID, metric, observed, threshold, duration string) (string, error) {
+	tx, err := e.store.LoadForUpdate()
 	if err != nil {
 		return "", err
 	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
 	ev := state.PerformanceEvent{
 		ID:         state.NewID("perf"),
 		Timestamp:  time.Now().UTC(),
@@ -451,23 +519,30 @@ func (e *Engine) IngestPerformanceBreach(resourceID, metric, observed, threshold
 		Handled:    false,
 	}
 	st.PerfEvents = append(st.PerfEvents, ev)
+	if len(st.PerfEvents) > maxPerfEvents {
+		st.PerfEvents = st.PerfEvents[len(st.PerfEvents)-maxPerfEvents:]
+	}
 	addAudit(st, "", "PERFORMANCE_BREACH", resourceID, fmt.Sprintf("%s observed=%s threshold=%s duration=%s", metric, observed, threshold, duration), nil)
 	if rec, ok := st.Resources[resourceID]; ok {
 		rec.Status = state.StatusDrifted
 		rec.AgentReasoning = "performance breach triggers resolver re-evaluation"
 	}
-	if err := e.store.Save(st); err != nil {
+	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return ev.ID, nil
 }
 
-func (e *Engine) parseAndBuild(beaconPath string) (*ir.Graph, *state.State, error) {
+func parseAndBuildGraph(beaconPath string) (*ir.Graph, error) {
 	f, err := parser.ParseFile(beaconPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	g, err := ir.Build(f, beaconPath)
+	return ir.Build(f, beaconPath)
+}
+
+func (e *Engine) parseAndBuild(beaconPath string) (*ir.Graph, *state.State, error) {
+	g, err := parseAndBuildGraph(beaconPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -573,7 +648,7 @@ func applyAction(ctx context.Context, exec provider.Executor, cloudProvider, clo
 		rec.ProviderID = result.ProviderID
 		rec.Managed = true
 		rec.BeaconRef = n.Source
-		rec.IntentSnapshot = scrubCredentials(snap)
+		rec.IntentSnapshot = copyMap(snap)
 		rec.IntentHash = hash
 		if result.LiveState != nil {
 			rec.LiveState = result.LiveState
@@ -626,13 +701,10 @@ func parseCloud(g *ir.Graph) (providerName, region string, err error) {
 	return providerName, region, nil
 }
 
-func (e *Engine) expireApprovals() error {
-	st, err := e.store.Load()
-	if err != nil {
-		return err
-	}
+// expireApprovalsInline is a pure function that mutates state in-place.
+// It does not perform any I/O. Safe to call inside a transaction.
+func expireApprovalsInline(st *state.State) {
 	now := time.Now().UTC()
-	changed := false
 	for _, req := range st.Approvals {
 		if req.Status != state.ApprovalPending {
 			continue
@@ -646,20 +718,49 @@ func (e *Engine) expireApprovals() error {
 				run.Error = "approval expired"
 			}
 			addAudit(st, req.RunID, "APPROVAL_EXPIRED", "", fmt.Sprintf("approval %s expired at %s", req.ID, req.ExpiresAt.Format(time.RFC3339)), nil)
-			changed = true
 		}
 	}
-	if changed {
-		return e.store.Save(st)
-	}
-	return nil
 }
 
-func applyInverse(st *state.State, runID string, a *state.PlanAction, inverse string) error {
+// runExpireApprovals is used by read-only methods. It acquires a transaction
+// internally so expiration is persisted atomically.
+func (e *Engine) runExpireApprovals() {
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return
+	}
+	expireApprovalsInline(tx.State)
+	_ = tx.Commit()
+}
+
+func (e *Engine) applyInverse(ctx context.Context, cloudProvider, cloudRegion string, st *state.State, runID string, a *state.PlanAction, inverse string) error {
+	rec := st.Resources[a.NodeID]
 	switch inverse {
 	case "DELETE":
-		rec := st.Resources[a.NodeID]
-		if rec != nil {
+		// Rollback of CREATE: attempt cloud deletion.
+		if rec != nil && cloudProvider != "" {
+			deleteAction := &state.PlanAction{
+				ID:        state.NewID("act"),
+				NodeID:    a.NodeID,
+				NodeType:  a.NodeType,
+				NodeName:  a.NodeName,
+				Operation: "DELETE",
+			}
+			if _, cloudErr := e.exec.Apply(ctx, provider.ApplyRequest{
+				Provider: cloudProvider,
+				Region:   cloudRegion,
+				Action:   deleteAction,
+				Intent:   copyMap(rec.IntentSnapshot),
+				Record:   rec,
+			}); cloudErr != nil {
+				addAudit(st, runID, "ROLLBACK_CLOUD_ERROR", a.NodeID, cloudErr.Error(), nil)
+			}
+			rec.Managed = false
+			rec.Status = state.StatusObserved
+			rec.LastAppliedRun = runID
+			rec.LastOperation = "ROLLBACK_DELETE"
+			rec.History = append(rec.History, fmt.Sprintf("%s ROLLBACK_DELETE", time.Now().UTC().Format(time.RFC3339)))
+		} else if rec != nil {
 			rec.Managed = false
 			rec.Status = state.StatusObserved
 			rec.LastAppliedRun = runID
@@ -667,9 +768,27 @@ func applyInverse(st *state.State, runID string, a *state.PlanAction, inverse st
 			rec.History = append(rec.History, fmt.Sprintf("%s ROLLBACK_DELETE", time.Now().UTC().Format(time.RFC3339)))
 		}
 	case "RESTORE":
-		rec := st.Resources[a.NodeID]
 		if rec == nil {
 			return fmt.Errorf("cannot restore %s: no prior record", a.NodeID)
+		}
+		// Rollback of DELETE: attempt cloud re-creation using stored snapshot.
+		if cloudProvider != "" && rec.IntentSnapshot != nil {
+			createAction := &state.PlanAction{
+				ID:        state.NewID("act"),
+				NodeID:    a.NodeID,
+				NodeType:  a.NodeType,
+				NodeName:  a.NodeName,
+				Operation: "CREATE",
+			}
+			if _, cloudErr := e.exec.Apply(ctx, provider.ApplyRequest{
+				Provider: cloudProvider,
+				Region:   cloudRegion,
+				Action:   createAction,
+				Intent:   copyMap(rec.IntentSnapshot),
+				Record:   rec,
+			}); cloudErr != nil {
+				addAudit(st, runID, "ROLLBACK_CLOUD_ERROR", a.NodeID, cloudErr.Error(), nil)
+			}
 		}
 		rec.Managed = true
 		rec.Status = state.StatusMatched
@@ -698,6 +817,9 @@ func invertOperation(op string) string {
 	}
 }
 
+const maxAuditEvents = 10000
+const maxPerfEvents = 10000
+
 func addAudit(st *state.State, runID, typ, resourceID, msg string, data map[string]interface{}) {
 	st.Audit = append(st.Audit, state.AuditEvent{
 		ID:         state.NewID("aud"),
@@ -708,31 +830,14 @@ func addAudit(st *state.State, runID, typ, resourceID, msg string, data map[stri
 		Message:    msg,
 		Data:       data,
 	})
-}
-
-var sensitiveKeys = map[string]bool{
-	"password":       true,
-	"secret_value":   true,
-	"token":          true,
-	"admin_password": true,
-	"secret":         true,
-	"secret_key":     true,
-}
-
-func scrubCredentials(m map[string]interface{}) map[string]interface{} {
-	out := make(map[string]interface{}, len(m))
-	for k, v := range m {
-		base := k
-		if idx := strings.LastIndex(k, "."); idx >= 0 {
-			base = k[idx+1:]
-		}
-		if sensitiveKeys[base] {
-			out[k] = "**REDACTED**"
-		} else {
-			out[k] = v
-		}
+	if len(st.Audit) > maxAuditEvents {
+		st.Audit = st.Audit[len(st.Audit)-maxAuditEvents:]
 	}
-	return out
+}
+
+func sha256hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func copyMap(in map[string]interface{}) map[string]interface{} {
@@ -741,6 +846,13 @@ func copyMap(in map[string]interface{}) map[string]interface{} {
 		out[k] = v
 	}
 	return out
+}
+
+func maskIdentity(id string) string {
+	if len(id) <= 4 {
+		return "****"
+	}
+	return "****" + id[len(id)-4:]
 }
 
 func estimateCostDelta(actions []*state.PlanAction) string {

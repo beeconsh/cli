@@ -7,6 +7,8 @@ End-to-end Beecon runtime implementation in `beecon/` with `.beecon` DSL parsing
 - Language layer
   - `.beecon` block parser (`domain`, `service`, `store`, `network`, `compute`, `profile`)
   - semantic validation (single root domain, allowed nesting, dependency references)
+  - escape-aware comment stripping (`\"` inside quoted strings)
+  - quote-aware list splitting (commas inside quoted list items are preserved)
 - IR layer
   - provider-agnostic intent graph (`IntentNode`, dependencies, domain boundary)
 - Resolver layer
@@ -57,20 +59,48 @@ End-to-end Beecon runtime implementation in `beecon/` with `.beecon` DSL parsing
     - Container Apps, PostgreSQL Flexible, MySQL Flexible, Azure Cache Redis
     - Functions, API Management, Service Bus, Event Grid
     - Front Door, CDN, DNS, Monitor, AKS, VM
+- Security layer (`internal/security/`)
+  - Canonical sensitive key registry (`IsSensitiveKey`) — single source of truth for 12+ sensitive key patterns
+  - `ScrubMap(map[string]interface{})` — scrubs values of sensitive keys, returns new map (nil-safe)
+  - `ScrubStringMap(map[string]string)` — for intent node scrubbing
+  - `ScrubChanges(map[string]string)` — for plan action diff scrubbing
+  - Used by engine, API server, resolver, and executor — no duplicate key lists
+- Transactional state API
+  - `Store.LoadForUpdate()` → `*StateTransaction` — acquires mutex, returns state for mutation
+  - `tx.Commit()` — saves state and releases mutex
+  - `tx.Rollback()` — releases mutex without saving (safe to call multiple times)
+  - All mutating engine methods (Apply, Approve, Reject, Drift, Rollback, Connect, IngestPerformanceBreach) use this pattern
+  - Read-only methods (Status, Runs, Approvals, History, Audit) use plain `Load()`
+  - `expireApprovalsInline(st)` — pure function that mutates state in-place within a transaction (no Load/Save)
+  - `HashMap` normalizes `float64` → `int64` for whole numbers to prevent JSON round-trip phantom diffs
+- Approval integrity
+  - `ApprovalRequest.IntentHash` — SHA-256 of beacon file content at `Apply` time
+  - `Approve()` re-reads the file and compares hashes; rejects if modified
+- Audit cap
+  - Maximum 10,000 audit events retained; oldest events are trimmed on write
+- Context propagation
+  - All public engine methods take `context.Context` as first parameter
+  - API handlers pass `r.Context()`
+  - CLI creates signal-cancellable context (`SIGINT`/`SIGTERM`)
 - API surface
   - `GET/POST /api/beacons`
   - `POST /api/beacon/validate`
-  - `POST /api/resolve`
-  - `GET /api/graph`
-  - `GET /api/state`
+  - `POST /api/resolve` (plan actions scrubbed of credentials)
+  - `GET /api/graph` (nodes and actions scrubbed of credentials)
+  - `GET /api/state` (intent snapshots and live state scrubbed)
   - `GET /api/runs`
   - `GET /api/approvals`
   - `GET /api/audit`
   - `GET /api/history`
-  - `POST /api/drift`
+  - `POST /api/drift` (drift output scrubbed of credentials)
   - `POST /api/approve`
+  - `POST /api/reject`
   - `POST /api/connect`
   - `GET/POST /api/performance`
+  - Optional Bearer token auth via `BEECON_API_KEY` (timing-safe comparison)
+- Mission Control UI
+  - Served at `/` via `internal/ui/handler.go`
+  - When `BEECON_API_KEY` is set, API key is injected via `<meta>` tag and JS adds `Authorization` header to all fetch calls
 
 ## CLI
 
@@ -83,6 +113,7 @@ beecon status
 beecon beacons
 beecon drift [infra.beecon]
 beecon approve <request-id> [approver]
+beecon reject <request-id> [approver] [reason]
 beecon history <resource-id>
 beecon rollback <run-id>
 beecon connect <aws|gcp|azure> [region]
@@ -180,7 +211,9 @@ Expected:
 ## Notes
 
 - By default execution is dry-run safe. Set `BEECON_EXECUTE=1` to enable live AWS SDK mutation calls for implemented adapters.
-- Mission Control UI is served at `/` and consumes API data from `/api/*`.
+- Mission Control UI is served at `/` and consumes API data from `/api/*`. Set `BEECON_API_KEY` to require auth.
+- Rollback now issues cloud calls (DELETE for rollback of CREATE, CREATE for rollback of DELETE) when `BEECON_EXECUTE=1`.
+- AWS `isNotFound` detection uses smithy SDK error types (structured code matching) with string fallback.
 
 ## Live AWS Inputs (Current)
 
