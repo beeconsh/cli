@@ -1,0 +1,99 @@
+package ui
+
+import "net/http"
+
+func Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", index)
+	return mux
+}
+
+func index(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(page))
+}
+
+const page = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Beecon Mission Control</title>
+<style>
+:root {
+  --bg:#0f1720; --bg2:#142030; --panel:#101927; --line:#2a3c56;
+  --ok:#3ecf8e; --warn:#f7c948; --bad:#ff5d5d; --txt:#e8eff7; --muted:#9bb0c9;
+}
+body {margin:0; font-family: ui-sans-serif, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at 20% -10%, #1f3250, var(--bg)); color:var(--txt);}
+header {padding:14px 18px; border-bottom:1px solid var(--line); background:rgba(10,15,24,.5); backdrop-filter: blur(6px);} 
+main {display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; padding:10px; min-height: calc(100vh - 56px);} 
+.panel {background:linear-gradient(180deg, rgba(20,30,45,.95), rgba(15,24,36,.95)); border:1px solid var(--line); border-radius:12px; overflow:hidden;}
+.panel h2 {margin:0; padding:10px 12px; font-size:14px; color:var(--muted); border-bottom:1px solid var(--line);} 
+.content {padding:10px 12px; height:calc(100vh - 110px); overflow:auto;}
+.item {padding:8px; border:1px solid #22344d; border-radius:8px; margin-bottom:8px; background:#0f1a29;}
+.small {font-size:12px; color:var(--muted)}
+.node {display:flex; justify-content:space-between; gap:10px;}
+.badge {padding:2px 6px; border-radius:999px; font-size:11px; border:1px solid}
+.b-ok {color:var(--ok); border-color:#2b6f53}
+.b-warn {color:var(--warn); border-color:#7a6a2d}
+.b-bad {color:var(--bad); border-color:#8a3a3a}
+</style>
+</head>
+<body>
+<header><strong>Beecon Mission Control</strong> <span class="small">Intent Feed · Resolution Graph · Audit Rail</span></header>
+<main>
+<section class="panel"><h2>Intent Feed</h2><div id="intent" class="content"></div></section>
+<section class="panel"><h2>Resolution Graph</h2><div id="graph" class="content"></div></section>
+<section class="panel"><h2>Audit Rail</h2><div id="audit" class="content"></div></section>
+</main>
+<script>
+async function j(url){const r=await fetch(url); return r.json();}
+function esc(s){return (s??'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function statusBadge(s){
+  const t=(s||'').toUpperCase();
+  if(t==='APPLIED'||t==='MATCHED') return '<span class="badge b-ok">'+esc(t)+'</span>';
+  if(t==='PENDING_APPROVAL'||t==='DRIFTED') return '<span class="badge b-warn">'+esc(t)+'</span>';
+  return '<span class="badge b-bad">'+esc(t||'UNKNOWN')+'</span>';
+}
+async function render(){
+  const [runs, approvals, graph, audit] = await Promise.all([
+    j('/api/runs').catch(()=>({runs:[]})),
+    j('/api/approvals').catch(()=>({approvals:[]})),
+    j('/api/graph').catch(()=>({nodes:[],edges:[],actions:[]})),
+    j('/api/audit').catch(()=>([])),
+  ]);
+
+  const intent = document.getElementById('intent');
+  const feed = [];
+  for(const r of (runs.runs||[]).slice(0,20)){
+    feed.push('<div class="item"><div class="node"><strong>'+esc(r.id)+'</strong>'+statusBadge(r.status)+'</div><div class="small">'+esc(r.beacon_path)+'</div></div>');
+  }
+  for(const a of (approvals.approvals||[]).slice(0,10)){
+    feed.push('<div class="item"><div class="node"><strong>approval '+esc(a.id)+'</strong>'+statusBadge(a.status)+'</div><div class="small">'+esc(a.reason)+'</div></div>');
+  }
+  intent.innerHTML = feed.join('') || '<div class="small">No runs yet</div>';
+
+  const graphEl = document.getElementById('graph');
+  const g = [];
+  for(const n of (graph.nodes||[])){
+    g.push('<div class="item"><div class="node"><strong>'+esc(n.id)+'</strong><span class="small">'+esc(n.type)+'</span></div></div>');
+  }
+  for(const e of (graph.edges||[])){
+    g.push('<div class="small">'+esc(e.from)+' → '+esc(e.to)+'</div>');
+  }
+  for(const a of (graph.actions||[])){
+    g.push('<div class="item"><div class="node"><strong>'+esc(a.operation)+' '+esc(a.node_id)+'</strong>'+(a.requires_approval?statusBadge('PENDING_APPROVAL'):'')+'</div></div>');
+  }
+  graphEl.innerHTML = g.join('') || '<div class="small">No graph data</div>';
+
+  const auditEl = document.getElementById('audit');
+  const au = [];
+  for(const ev of (Array.isArray(audit)?audit:audit.events||[]).slice(-100).reverse()){
+    au.push('<div class="item"><div><strong>'+esc(ev.type)+'</strong> <span class="small">'+esc(ev.timestamp)+'</span></div><div class="small">'+esc(ev.message)+'</div></div>');
+  }
+  auditEl.innerHTML = au.join('') || '<div class="small">No audit events</div>';
+}
+render(); setInterval(render, 5000);
+</script>
+</body>
+</html>`

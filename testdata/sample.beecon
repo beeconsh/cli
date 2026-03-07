@@ -1,0 +1,34 @@
+domain acme {
+  cloud      = aws(region: us-east-1)
+  owner      = team(platform)
+  compliance = [soc2, hipaa]
+
+  boundary {
+    budget   = 5000/mo
+    auto     = [scale, disk_expand]
+    approve  = [instance_type_change]
+    forbid   = [delete_store]
+  }
+}
+
+network core {
+  topology = vpc
+}
+
+store postgres {
+  engine = postgres
+}
+
+service api {
+  runtime = container(from: ./Dockerfile)
+  expose  = public(port: 443)
+
+  performance {
+    latency = p95 < 200ms
+    uptime  = 99.9%
+  }
+
+  needs {
+    postgres = read_write
+  }
+}

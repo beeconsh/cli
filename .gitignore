@@ -1,0 +1,39 @@
+# Binary
+beecon
+dist/
+
+# State and local config
+.beecon/state.json
+.beecon/config.json
+
+# Cloud credentials (never commit these)
+.env
+*.env
+.aws/
+gcp-credentials.json
+azure-credentials.json
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+go.sum.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+testdata/output/
+coverage.out
+coverage.html
+
+# Build
+tmp/
