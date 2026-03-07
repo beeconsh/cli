@@ -1,4 +1,5 @@
 version: 2
+project_name: beecon
 
 builds:
   - main: ./cmd/beecon
