@@ -35,5 +35,9 @@ testdata/output/
 coverage.out
 coverage.html
 
+# Design/planning docs (generated, not source of truth)
+UPDATED_DESIGN.md
+GCP_AZURE_PARITY_PLAN.md
+
 # Build
 tmp/
