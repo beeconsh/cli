@@ -41,7 +41,7 @@ func ParseBudget(raw string) (*Budget, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid budget amount %q: %w", parts[0], err)
 	}
-	if amount < 0 {
+	if amount <= 0 {
 		return nil, fmt.Errorf("budget amount must be positive, got %v", amount)
 	}
 

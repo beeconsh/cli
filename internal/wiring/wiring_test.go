@@ -483,6 +483,82 @@ service api {
 	}
 }
 
+func TestWireGraphSGRulesScopedByEdge(t *testing.T) {
+	// Manually construct a graph with two SG nodes and edges connecting
+	// only one SG to the api service. SG rules should be scoped to sg1 only.
+	g := &ir.Graph{
+		Domain: &ir.DomainNode{Name: "acme", Cloud: "aws(region: us-east-1)", Owner: "team(platform)"},
+		Nodes: []ir.IntentNode{
+			{
+				ID:     "network.sg1",
+				Name:   "sg1",
+				Type:   ir.NodeNetwork,
+				Intent: map[string]string{"topology": "security_group", "vpc_id": "vpc-111"},
+				Env:    map[string]string{},
+			},
+			{
+				ID:     "network.sg2",
+				Name:   "sg2",
+				Type:   ir.NodeNetwork,
+				Intent: map[string]string{"topology": "security_group", "vpc_id": "vpc-222"},
+				Env:    map[string]string{},
+			},
+			{
+				ID:     "store.db",
+				Name:   "db",
+				Type:   ir.NodeStore,
+				Intent: map[string]string{"engine": "postgres"},
+				Env:    map[string]string{},
+				Needs:  []ir.Dependency{},
+			},
+			{
+				ID:   "service.api",
+				Name: "api",
+				Type: ir.NodeService,
+				Intent: map[string]string{"runtime": "container(from: ./Dockerfile)"},
+				Env:    map[string]string{},
+				Needs:  []ir.Dependency{{Target: "db", Mode: "read_write"}},
+			},
+		},
+		Edges: []ir.Edge{
+			// api depends on sg1 (edge from sg1 to api)
+			{From: "network.sg1", To: "service.api"},
+			// api depends on db
+			{From: "store.db", To: "service.api"},
+		},
+		Profiles: map[string]ir.Profile{},
+	}
+
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	if len(result.InferredSGRules) == 0 {
+		t.Fatal("expected inferred SG rules")
+	}
+
+	// sg1 is connected to api via edge, so rules should be injected into sg1
+	var sg1, sg2 *ir.IntentNode
+	for i := range g.Nodes {
+		switch g.Nodes[i].Name {
+		case "sg1":
+			sg1 = &g.Nodes[i]
+		case "sg2":
+			sg2 = &g.Nodes[i]
+		}
+	}
+	if sg1 == nil || sg2 == nil {
+		t.Fatal("missing sg nodes")
+	}
+	if sg1.Intent["ingress"] == "" {
+		t.Error("expected ingress on sg1 (connected via edge to api)")
+	}
+	if sg2.Intent["ingress"] != "" {
+		t.Errorf("expected no ingress on sg2 (not connected), got %q", sg2.Intent["ingress"])
+	}
+}
+
 func TestWireGraphNoDependencies(t *testing.T) {
 	g := buildGraph(t, `domain acme {
   cloud = aws(region: us-east-1)

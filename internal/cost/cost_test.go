@@ -70,6 +70,13 @@ func TestParseBudgetInvalid(t *testing.T) {
 	}
 }
 
+func TestParseBudgetRejectsZero(t *testing.T) {
+	_, err := ParseBudget("$0/mo")
+	if err == nil {
+		t.Error("expected error for zero budget")
+	}
+}
+
 func TestBudgetMonthlyAmount(t *testing.T) {
 	b := &Budget{Amount: 12000, Period: "yr"}
 	if b.MonthlyAmount() != 1000 {

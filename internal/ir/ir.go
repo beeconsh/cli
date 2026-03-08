@@ -187,6 +187,50 @@ func Build(f *ast.File, source string, activeProfile ...string) (*Graph, error) 
 			g.Edges = append(g.Edges, Edge{From: depID, To: g.Nodes[i].ID})
 		}
 	}
+
+	// Warn if --profile was specified but no profile block or field variant
+	// references the active profile. This catches typos early.
+	if ap != "" {
+		profileUsed := false
+		// Check if any profile block has a dot-variant for the active profile
+		// (e.g., profile "standard.production" when ap == "production")
+		for name := range g.Profiles {
+			if strings.HasSuffix(name, "."+ap) {
+				profileUsed = true
+				break
+			}
+		}
+		// Also check if any AST block field has a dot-variant for the active profile
+		// (e.g., instance_type.production = m5.large)
+		if !profileUsed {
+			for _, block := range f.Blocks {
+				for k := range block.Fields {
+					if strings.HasSuffix(k, "."+ap) {
+						profileUsed = true
+						break
+					}
+				}
+				if profileUsed {
+					break
+				}
+				for _, child := range block.Children {
+					for k := range child.Fields {
+						if strings.HasSuffix(k, "."+ap) {
+							profileUsed = true
+							break
+						}
+					}
+					if profileUsed {
+						break
+					}
+				}
+			}
+		}
+		if !profileUsed {
+			return nil, fmt.Errorf("profile %q not found in any block; available profiles can be declared with field.profilename syntax", ap)
+		}
+	}
+
 	return g, nil
 }
 

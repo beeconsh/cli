@@ -3,6 +3,7 @@ package parser
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/terracotta-ai/beecon/internal/ast"
@@ -118,6 +119,16 @@ service api {
 	}
 	if list[1] != "c" {
 		t.Fatalf("expected second item 'c', got %q", list[1])
+	}
+}
+
+func TestParserRejectsDotInName(t *testing.T) {
+	input := `service my.api {
+  runtime = container
+}`
+	_, err := Parse(strings.NewReader(input))
+	if err == nil {
+		t.Error("expected error for dot in name, got nil")
 	}
 }
 
