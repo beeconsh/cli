@@ -367,14 +367,19 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 	if !ok {
 		return nil, fmt.Errorf("run %s not found", req.RunID)
 	}
+	if run.Status != state.RunPendingApproval {
+		return nil, fmt.Errorf("run %s has status %s, expected PENDING_APPROVAL", req.RunID, run.Status)
+	}
 	g, err := parseAndBuildGraph(req.BeaconPath, req.ActiveProfile)
 	if err != nil {
 		return nil, err
 	}
 	// Enrich graph with compliance defaults and wiring (same pipeline as Apply).
-	if _, _, enrichErr := enrichGraph(g); enrichErr != nil {
+	compReport, wiringResult, enrichErr := enrichGraph(g)
+	if enrichErr != nil {
 		return nil, fmt.Errorf("enrich graph for approval: %w", enrichErr)
 	}
+	_ = compReport // used only for mutation side-effects
 	cloudProvider, cloudRegion, err := parseCloud(g)
 	if err != nil {
 		return nil, err
@@ -398,6 +403,16 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 		run.ExecutedActions = append(run.ExecutedActions, actionID)
 		executed++
 		outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionExecuted})
+		// Store wiring metadata (same as Apply path)
+		if rec := st.Resources[a.NodeID]; rec != nil {
+			if wm := wiring.BuildMetadata(a.NodeID, wiringResult); wm != nil {
+				rec.Wiring = &state.WiringMetadata{
+					InferredEnvVars: wm.InferredEnvVars,
+					InferredPolicy:  wm.InferredPolicy,
+					InferredSGRules: wm.InferredSGRules,
+				}
+			}
+		}
 	}
 	now := time.Now().UTC()
 	req.Status = state.ApprovalApproved
@@ -436,6 +451,14 @@ func (e *Engine) Reject(ctx context.Context, requestID, approver, reason string)
 	req.Status = state.ApprovalRejected
 	req.ResolvedBy = approver
 	req.ResolvedAt = &now
+	// Clear ApprovalBlocked on resources affected by this rejection
+	for _, actionID := range req.ActionIDs {
+		if a, ok := st.Actions[actionID]; ok {
+			if rec := st.Resources[a.NodeID]; rec != nil {
+				rec.ApprovalBlocked = false
+			}
+		}
+	}
 	run := st.Runs[req.RunID]
 	if run != nil {
 		run.Status = state.RunFailed
@@ -504,12 +527,11 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 	}
 	defer tx.Rollback()
 	st := tx.State
-	expireApprovalsInline(st)
+	changed := expireApprovalsInline(st)
 
 	nodes := g.NodesByID()
 	var drifted []*state.ResourceRecord
 	var observeErrors []error
-	changed := false
 	for nodeID, rec := range st.Resources {
 		if !rec.Managed {
 			continue
@@ -610,7 +632,18 @@ func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, 
 // Import imports an existing cloud resource into beecon state by observing it.
 // Returns the resource ID of the imported resource.
 func (e *Engine) Import(ctx context.Context, providerName, resourceType, providerID, region string) (string, error) {
-	nodeID := fmt.Sprintf("%s.%s", resourceType, providerID)
+	// Extract a short name from the provider ID for the node ID.
+	// AWS ARNs use colons and slashes; use the last segment as the name.
+	shortName := providerID
+	if idx := strings.LastIndex(shortName, "/"); idx >= 0 {
+		shortName = shortName[idx+1:]
+	} else if idx := strings.LastIndex(shortName, ":"); idx >= 0 {
+		shortName = shortName[idx+1:]
+	}
+	if shortName == "" {
+		shortName = providerID
+	}
+	nodeID := fmt.Sprintf("%s.%s", resourceType, shortName)
 	rec := &state.ResourceRecord{
 		ResourceID: nodeID,
 		NodeType:   strings.ToUpper(resourceType),
@@ -651,6 +684,7 @@ func (e *Engine) Import(ctx context.Context, providerName, resourceType, provide
 	rec.LastSeen = time.Now().UTC()
 	rec.IntentSnapshot = map[string]interface{}{}
 	rec.IntentHash = state.HashMap(rec.IntentSnapshot)
+	rec.LastOperation = "IMPORT"
 	rec.History = []string{fmt.Sprintf("%s IMPORTED", time.Now().UTC().Format(time.RFC3339))}
 
 	st.Resources[nodeID] = rec
@@ -695,6 +729,9 @@ func (e *Engine) Rollback(ctx context.Context, runID string) (string, error) {
 	if len(run.ExecutedActions) == 0 {
 		return "", errors.New("run has no executed actions to rollback")
 	}
+	if run.Status != state.RunApplied && run.Status != state.RunFailed {
+		return "", fmt.Errorf("cannot rollback run %s: status is %s (must be APPLIED or FAILED)", runID, run.Status)
+	}
 
 	// Resolve cloud info for rollback cloud calls.
 	var cloudProvider, cloudRegion string
@@ -712,6 +749,7 @@ func (e *Engine) Rollback(ctx context.Context, runID string) (string, error) {
 		BeaconPath:      run.BeaconPath,
 		Status:          state.RunRolledBack,
 		RollbackOfRunID: runID,
+		ActiveProfile:   run.ActiveProfile,
 	}
 	for i := len(run.ExecutedActions) - 1; i >= 0; i-- {
 		a := st.Actions[run.ExecutedActions[i]]
@@ -730,6 +768,7 @@ func (e *Engine) Rollback(ctx context.Context, runID string) (string, error) {
 		}
 		rb.ExecutedActions = append(rb.ExecutedActions, a.ID)
 	}
+	run.Status = state.RunRolledBack
 	st.Runs[rb.ID] = rb
 	if err := tx.Commit(); err != nil {
 		return "", err
@@ -988,13 +1027,16 @@ func parseCloud(g *ir.Graph) (providerName, region string, err error) {
 
 // expireApprovalsInline is a pure function that mutates state in-place.
 // It does not perform any I/O. Safe to call inside a transaction.
-func expireApprovalsInline(st *state.State) {
+// Returns true if any approvals were expired (state was mutated).
+func expireApprovalsInline(st *state.State) bool {
 	now := time.Now().UTC()
+	mutated := false
 	for _, req := range st.Approvals {
 		if req.Status != state.ApprovalPending {
 			continue
 		}
 		if now.After(req.ExpiresAt) {
+			mutated = true
 			req.Status = state.ApprovalRejected
 			req.ResolvedBy = "system-timeout"
 			req.ResolvedAt = &now
@@ -1002,9 +1044,18 @@ func expireApprovalsInline(st *state.State) {
 				run.Status = state.RunFailed
 				run.Error = "approval expired"
 			}
+			// Clear ApprovalBlocked on resources affected by expiration
+			for _, actionID := range req.ActionIDs {
+				if a, ok := st.Actions[actionID]; ok {
+					if rec := st.Resources[a.NodeID]; rec != nil {
+						rec.ApprovalBlocked = false
+					}
+				}
+			}
 			addAudit(st, req.RunID, "APPROVAL_EXPIRED", "", fmt.Sprintf("approval %s expired at %s", req.ID, req.ExpiresAt.Format(time.RFC3339)), nil)
 		}
 	}
+	return mutated
 }
 
 // runExpireApprovals is used by read-only methods. It acquires a transaction
@@ -1014,8 +1065,11 @@ func (e *Engine) runExpireApprovals() {
 	if err != nil {
 		return
 	}
-	expireApprovalsInline(tx.State)
-	_ = tx.Commit()
+	if expireApprovalsInline(tx.State) {
+		_ = tx.Commit()
+	} else {
+		tx.Rollback()
+	}
 }
 
 func (e *Engine) applyInverse(ctx context.Context, cloudProvider, cloudRegion string, st *state.State, runID string, a *state.PlanAction, inverse string) error {
