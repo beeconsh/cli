@@ -163,3 +163,20 @@ func TestLoadRejectsFutureVersion(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestStateDirectoryPermissions(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	st := newState()
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, ".beecon"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	perm := info.Mode().Perm()
+	if perm&0o077 != 0 {
+		t.Errorf(".beecon directory has permissions %o, want 0700 (no group/other access)", perm)
+	}
+}

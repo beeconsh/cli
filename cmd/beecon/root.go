@@ -55,6 +55,9 @@ var rootCmd = &cobra.Command{
 		if debugFlag {
 			logging.Enable()
 		}
+		if formatFlag != "text" && formatFlag != "json" {
+			return fmt.Errorf("unsupported format %q (supported: text, json)", formatFlag)
+		}
 		if cmd.Annotations["needs_engine"] != "true" {
 			return nil
 		}
@@ -96,7 +99,7 @@ func init() {
 	applyCmd.Flags().BoolVar(&yesFlag, "yes", false, "auto-approve pending actions")
 
 	// Filter flag on status command
-	statusCmd.Flags().StringVar(&statusFilter, "filter", "", "filter by status (DRIFTED,MATCHED,PENDING_APPROVAL,OBSERVED)")
+	statusCmd.Flags().StringVar(&statusFilter, "filter", "", "filter by status (DRIFTED,MATCHED,OBSERVED)")
 
 	// Interval flag on watch command
 	watchCmd.Flags().StringVar(&watchInterval, "interval", "5m", "drift check interval (e.g. 30s, 5m, 1h)")
