@@ -46,6 +46,10 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 		newHash := state.HashMap(nodeIntent)
 		if newHash != rec.IntentHash || rec.Status == state.StatusDrifted {
 			changes := diffIntent(rec.IntentSnapshot, nodeIntent)
+			if len(changes) == 0 && rec.Status == state.StatusDrifted {
+				// Performance breach set DRIFTED without changing intent — skip phantom UPDATE
+				continue
+			}
 			actions = append(actions, &state.PlanAction{
 				ID:        state.NewID("act"),
 				NodeID:    id,

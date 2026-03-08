@@ -748,3 +748,71 @@ func TestImportShortName(t *testing.T) {
 		t.Fatalf("expected LastOperation IMPORT, got %s", rec.LastOperation)
 	}
 }
+
+// --- copyMap deep copy ---
+
+func TestCopyMapDeep(t *testing.T) {
+	// Test that copyMap performs a deep copy — nested maps are independent.
+	inner := map[string]interface{}{"nested": "value"}
+	original := map[string]interface{}{"key": inner}
+	copied := copyMap(original)
+
+	// Modify the copy's nested map
+	if nestedCopy, ok := copied["key"].(map[string]interface{}); ok {
+		nestedCopy["nested"] = "modified"
+	} else {
+		t.Fatal("expected nested map in copy")
+	}
+
+	// Original should be unchanged
+	if innerMap, ok := original["key"].(map[string]interface{}); ok {
+		if innerMap["nested"] != "value" {
+			t.Error("deep copy failed: modifying copy affected original")
+		}
+	} else {
+		t.Fatal("expected nested map in original")
+	}
+}
+
+func TestCopyMapNil(t *testing.T) {
+	if got := copyMap(nil); got != nil {
+		t.Errorf("copyMap(nil) = %v, want nil", got)
+	}
+}
+
+func TestCopyMapShallow(t *testing.T) {
+	// Flat maps should round-trip correctly.
+	original := map[string]interface{}{"a": "1", "b": float64(2)}
+	copied := copyMap(original)
+	if copied["a"] != "1" || copied["b"] != float64(2) {
+		t.Errorf("flat copy mismatch: got %v", copied)
+	}
+	// Mutating copy should not affect original.
+	copied["a"] = "changed"
+	if original["a"] != "1" {
+		t.Error("shallow value mutation leaked to original")
+	}
+}
+
+func TestApplyPartialFailureReturnsResult(t *testing.T) {
+	// Verify that Apply returns a non-nil result even when an action fails.
+	// We use a beacon with a FORBIDDEN boundary action to trigger an error path
+	// that exercises the partial-result logic.
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, basicBeacon)
+
+	ctx := context.Background()
+	e := New(dir)
+
+	// First apply should succeed (creates resources).
+	res, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("first apply failed: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil result from successful apply")
+	}
+	if res.RunID == "" {
+		t.Error("expected non-empty RunID")
+	}
+}

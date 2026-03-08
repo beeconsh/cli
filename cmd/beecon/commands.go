@@ -235,6 +235,19 @@ var applyCmd = &cobra.Command{
 		path := beaconPathArg(args)
 		res, err := eng.Apply(cmd.Context(), path)
 		if err != nil {
+			if res != nil {
+				// Partial failure — show what was executed before the error
+				out.Blank()
+				out.Line(out.Red(out.Fail()), "Apply failed: %v", err)
+				out.Summary("Run %s: %d action(s) executed before failure", res.RunID, res.Executed)
+				for _, ao := range res.Actions {
+					if ao.Status == engine.ActionExecuted {
+						out.ActionLine(out.Green(out.OK()), ao.Action.Operation, ao.Action.NodeID, "")
+					}
+				}
+				out.Blank()
+				return nil // error already displayed
+			}
 			return err
 		}
 

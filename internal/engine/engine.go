@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -254,7 +255,12 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 			if commitErr := tx.Commit(); commitErr != nil {
 				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, commitErr)
 			}
-			return nil, err
+			return &ApplyResult{
+				RunID:     run.ID,
+				Executed:  executed,
+				Actions:   outcomes,
+				Simulated: e.exec.IsDryRun(),
+			}, err
 		}
 		executed++
 		run.ExecutedActions = append(run.ExecutedActions, a.ID)
@@ -1135,6 +1141,8 @@ func (e *Engine) applyInverse(ctx context.Context, cloudProvider, cloudRegion st
 		rec.LastOperation = "ROLLBACK_RESTORE"
 		rec.History = append(rec.History, fmt.Sprintf("%s ROLLBACK_RESTORE", time.Now().UTC().Format(time.RFC3339)))
 	case "NOOP":
+		addAudit(st, runID, "ROLLBACK_SKIPPED", a.NodeID,
+			fmt.Sprintf("rollback of %s %s skipped (UPDATE cannot be automatically reversed)", a.Operation, a.NodeID), nil)
 		return nil
 	default:
 		return fmt.Errorf("unsupported inverse operation %s", inverse)
@@ -1180,9 +1188,24 @@ func sha256hex(data []byte) string {
 }
 
 func copyMap(in map[string]interface{}) map[string]interface{} {
-	out := make(map[string]interface{}, len(in))
-	for k, v := range in {
-		out[k] = v
+	if in == nil {
+		return nil
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		// Fallback to shallow copy if marshal fails (shouldn't happen with map[string]interface{})
+		out := make(map[string]interface{}, len(in))
+		for k, v := range in {
+			out[k] = v
+		}
+		return out
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(b, &out); err != nil {
+		out = make(map[string]interface{}, len(in))
+		for k, v := range in {
+			out[k] = v
+		}
 	}
 	return out
 }

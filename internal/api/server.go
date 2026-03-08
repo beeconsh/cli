@@ -156,6 +156,15 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 	if req.Apply {
 		res, err := s.engine.Apply(r.Context(), req.Path)
 		if err != nil {
+			if res != nil {
+				scrubOutcomes(res.Actions)
+				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+					"error":    err.Error(),
+					"run_id":   res.RunID,
+					"executed": res.Executed,
+				})
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
@@ -354,6 +363,16 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.engine.Apply(r.Context(), req.BeaconPath)
 	if err != nil {
+		if res != nil {
+			scrubOutcomes(res.Actions)
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+				"error":    err.Error(),
+				"run_id":   res.RunID,
+				"executed": res.Executed,
+				"actions":  res.Actions,
+			})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
