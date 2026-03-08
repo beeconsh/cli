@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/terracotta-ai/beecon/internal/logging"
+
 	"github.com/terracotta-ai/beecon/internal/cloud"
 	"github.com/terracotta-ai/beecon/internal/compliance"
 	"github.com/terracotta-ai/beecon/internal/cost"
@@ -33,13 +35,13 @@ type Engine struct {
 }
 
 type PlanResult struct {
-	Graph            *ir.Graph
-	Plan             *resolver.Plan
-	CloudProvider    string
-	CloudRegion      string
-	ComplianceReport *compliance.ComplianceReport
-	CostReport       *cost.CostReport
-	WiringResult     *wiring.WiringResult
+	Graph            *ir.Graph                    `json:"graph,omitempty"`
+	Plan             *resolver.Plan               `json:"plan"`
+	CloudProvider    string                       `json:"cloud_provider"`
+	CloudRegion      string                       `json:"cloud_region"`
+	ComplianceReport *compliance.ComplianceReport `json:"compliance_report,omitempty"`
+	CostReport       *cost.CostReport             `json:"cost_report,omitempty"`
+	WiringResult     *wiring.WiringResult          `json:"wiring_result,omitempty"`
 }
 
 type ActionStatus int
@@ -119,11 +121,13 @@ func (e *Engine) EnsureRoot() error {
 }
 
 func (e *Engine) Validate(beaconPath string) error {
+	logging.Logger.Debug("validate", "path", beaconPath, "profile", e.ActiveProfile)
 	_, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
 	return err
 }
 
 func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, error) {
+	logging.Logger.Debug("plan:start", "path", beaconPath, "profile", e.ActiveProfile)
 	e.runExpireApprovals()
 	g, st, err := e.parseAndBuild(beaconPath)
 	if err != nil {
@@ -154,6 +158,7 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 	}
 	costReport := cost.Evaluate(p, g, st, budget)
 
+	logging.Logger.Debug("plan:complete", "actions", len(p.Actions), "provider", cloudProvider, "region", cloudRegion)
 	return &PlanResult{
 		Graph:            g,
 		Plan:             p,
@@ -166,6 +171,7 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 }
 
 func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, error) {
+	logging.Logger.Debug("apply:start", "path", beaconPath, "force", e.Force, "simulated", e.exec.IsDryRun())
 	abs, err := filepath.Abs(beaconPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve path %q: %w", beaconPath, err)
@@ -314,6 +320,7 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	logging.Logger.Debug("apply:complete", "run", run.ID, "executed", executed, "pending", len(pending))
 	return &ApplyResult{
 		RunID:             run.ID,
 		ApprovalRequestID: approvalID,
@@ -325,6 +332,7 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 }
 
 func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*ApplyResult, error) {
+	logging.Logger.Debug("approve:start", "request", requestID, "approver", approver)
 	tx, err := e.store.LoadForUpdate()
 	if err != nil {
 		return nil, err
@@ -476,6 +484,7 @@ func (e *Engine) Approvals(ctx context.Context) ([]*state.ApprovalRequest, error
 }
 
 func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.ResourceRecord, []error, error) {
+	logging.Logger.Debug("drift:start", "path", beaconPath)
 	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
 	if err != nil {
 		return nil, nil, err
@@ -521,6 +530,7 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 			rec.Status = state.StatusDrifted
 			rec.LiveState = map[string]interface{}{}
 			rec.AgentReasoning = "resource missing from provider live state"
+			trackDrift(rec)
 			drifted = append(drifted, rec)
 			changed = true
 			continue
@@ -532,10 +542,12 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 		nowHash := state.HashMap(n.Snapshot())
 		if nowHash != rec.IntentHash {
 			rec.Status = state.StatusDrifted
+			trackDrift(rec)
 			drifted = append(drifted, rec)
 			changed = true
 		} else {
 			rec.Status = state.StatusMatched
+			clearDrift(rec)
 		}
 	}
 	if changed {
@@ -545,6 +557,54 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 	}
 	sort.Slice(drifted, func(i, j int) bool { return drifted[i].ResourceID < drifted[j].ResourceID })
 	return drifted, observeErrors, nil
+}
+
+// Refresh observes all managed resources and updates LiveState + LastSeen
+// without comparing hashes or changing Status. Returns the count of refreshed
+// resources and any observe errors.
+func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, error) {
+	logging.Logger.Debug("refresh:start", "path", beaconPath)
+	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
+	if err != nil {
+		return 0, nil, err
+	}
+	cloudProvider, cloudRegion, err := parseCloud(g)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+	st := tx.State
+
+	refreshed := 0
+	var observeErrors []error
+	for _, rec := range st.Resources {
+		if !rec.Managed {
+			continue
+		}
+		obs, err := e.exec.Observe(ctx, cloudProvider, cloudRegion, rec)
+		if err != nil {
+			observeErrors = append(observeErrors, fmt.Errorf("observe %s: %w", rec.ResourceID, err))
+			continue
+		}
+		if obs.LiveState != nil {
+			rec.LiveState = obs.LiveState
+		}
+		rec.LastSeen = time.Now().UTC()
+		refreshed++
+	}
+
+	if refreshed > 0 {
+		if err := tx.Commit(); err != nil {
+			return refreshed, observeErrors, err
+		}
+	}
+	logging.Logger.Debug("refresh:complete", "refreshed", refreshed, "errors", len(observeErrors))
+	return refreshed, observeErrors, nil
 }
 
 func (e *Engine) History(ctx context.Context, resourceID string) ([]state.AuditEvent, error) {
@@ -645,6 +705,61 @@ func (e *Engine) Connect(ctx context.Context, providerName, region string) error
 	return tx.Commit()
 }
 
+// Import imports an existing cloud resource into beecon state by observing it.
+// Returns the resource ID of the imported resource.
+func (e *Engine) Import(ctx context.Context, providerName, resourceType, providerID, region string) (string, error) {
+	logging.Logger.Debug("import:start", "provider", providerName, "type", resourceType, "id", providerID)
+
+	// Build a synthetic ResourceRecord for observation
+	nodeID := fmt.Sprintf("%s.%s", resourceType, providerID)
+	rec := &state.ResourceRecord{
+		ResourceID: nodeID,
+		NodeType:   strings.ToUpper(resourceType),
+		NodeName:   providerID,
+		Provider:   strings.ToLower(providerName),
+		ProviderID: providerID,
+		Managed:    false,
+	}
+
+	obs, err := e.exec.Observe(ctx, strings.ToLower(providerName), region, rec)
+	if err != nil {
+		return "", fmt.Errorf("observe %s: %w", providerID, err)
+	}
+	if !obs.Exists {
+		return "", fmt.Errorf("resource %s not found in %s/%s", providerID, providerName, region)
+	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	st := tx.State
+
+	rec.ProviderID = obs.ProviderID
+	if rec.ProviderID == "" {
+		rec.ProviderID = providerID
+	}
+	rec.ProviderRegion = region
+	rec.LiveState = obs.LiveState
+	rec.Managed = true
+	rec.Status = state.StatusObserved
+	rec.LastSeen = time.Now().UTC()
+	rec.IntentSnapshot = map[string]interface{}{}
+	rec.IntentHash = state.HashMap(rec.IntentSnapshot)
+	rec.History = []string{fmt.Sprintf("%s IMPORTED", time.Now().UTC().Format(time.RFC3339))}
+
+	st.Resources[nodeID] = rec
+	addAudit(st, "", "RESOURCE_IMPORTED", nodeID,
+		fmt.Sprintf("imported %s from %s/%s (provider_id=%s)", nodeID, providerName, region, rec.ProviderID), nil)
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	logging.Logger.Debug("import:complete", "resource", nodeID)
+	return nodeID, nil
+}
+
 func (e *Engine) IngestPerformanceBreach(ctx context.Context, resourceID, metric, observed, threshold, duration string) (string, error) {
 	tx, err := e.store.LoadForUpdate()
 	if err != nil {
@@ -712,10 +827,12 @@ func (e *Engine) parseAndBuild(beaconPath string) (*ir.Graph, *state.State, erro
 	if err != nil {
 		return nil, nil, err
 	}
+	logging.Logger.Debug("parse:complete", "nodes", len(g.Nodes), "edges", len(g.Edges))
 	st, err := e.store.Load()
 	if err != nil {
 		return nil, nil, err
 	}
+	logging.Logger.Debug("state:loaded", "resources", len(st.Resources), "runs", len(st.Runs))
 	return g, st, nil
 }
 
@@ -1012,6 +1129,21 @@ func copyMap(in map[string]interface{}) map[string]interface{} {
 		out[k] = v
 	}
 	return out
+}
+
+// trackDrift sets DriftFirstDetected on first detection and increments DriftCount.
+func trackDrift(rec *state.ResourceRecord) {
+	if rec.DriftFirstDetected == nil {
+		now := time.Now().UTC()
+		rec.DriftFirstDetected = &now
+	}
+	rec.DriftCount++
+}
+
+// clearDrift resets drift tracking when a resource is no longer drifted.
+func clearDrift(rec *state.ResourceRecord) {
+	rec.DriftFirstDetected = nil
+	rec.DriftCount = 0
 }
 
 func maskIdentity(id string) string {

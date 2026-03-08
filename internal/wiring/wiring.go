@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/terracotta-ai/beecon/internal/classify"
 	"github.com/terracotta-ai/beecon/internal/ir"
@@ -104,6 +105,36 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 			result.InferredPolicies[node.ID] = string(policyJSON)
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("node %q: IAM policy uses Resource \"*\"; scope to specific ARNs in production", node.Name))
+		}
+	}
+
+	// Inject inferred SG rules into security_group NETWORK nodes.
+	// At wiring time we don't know which SG protects which resource, so rules
+	// are injected into all security_group nodes. This matches the IAM policy
+	// pattern of using Resource:"*" — scope in production.
+	if len(result.InferredSGRules) > 0 {
+		var sgNodes []*ir.IntentNode
+		for i := range g.Nodes {
+			if g.Nodes[i].Type == ir.NodeNetwork && g.Nodes[i].Intent["topology"] == "security_group" {
+				sgNodes = append(sgNodes, &g.Nodes[i])
+			}
+		}
+		if len(sgNodes) > 0 {
+			var parts []string
+			for _, r := range result.InferredSGRules {
+				parts = append(parts, fmt.Sprintf("%s:%d:0.0.0.0/0", r.Protocol, r.Port))
+			}
+			inferred := strings.Join(parts, ",")
+			for _, sgNode := range sgNodes {
+				existing := sgNode.Intent["ingress"]
+				if existing != "" {
+					sgNode.Intent["ingress"] = existing + "," + inferred
+				} else {
+					sgNode.Intent["ingress"] = inferred
+				}
+			}
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("injected %d inferred SG ingress rule(s) using 0.0.0.0/0; scope to specific CIDRs in production", len(result.InferredSGRules)))
 		}
 	}
 
