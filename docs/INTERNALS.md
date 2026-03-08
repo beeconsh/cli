@@ -1,244 +1,402 @@
-# Beecon
+# Beecon Internals
 
-End-to-end Beecon runtime implementation in `beecon/` with `.beecon` DSL parsing, intent graph planning, state/audit persistence, approve gates, rollback, performance breach ingestion, multi-cloud connect checks, and an HTTP API.
+Implementation reference for contributors. Covers architecture, control flow, state design, and provider integration.
 
-## Implemented
+## Architecture
 
-- Language layer
-  - `.beecon` block parser (`domain`, `service`, `store`, `network`, `compute`, `profile`)
-  - semantic validation (single root domain, allowed nesting, dependency references)
-  - escape-aware comment stripping (`\"` inside quoted strings)
-  - quote-aware list splitting (commas inside quoted list items are preserved)
-- IR layer
-  - provider-agnostic intent graph (`IntentNode`, dependencies, domain boundary)
-- Resolver layer
-  - plan generation from intent vs state diff (`CREATE`, `UPDATE`, `DELETE`)
-  - topological ordering with type precedence (`network -> store -> compute -> service`)
-  - boundary evaluation (`auto`, `approve`, `forbid`)
-- State + audit layer
-  - persistent store in `.beecon/state.json`
-  - resource state records, run records, action records, approval requests, audit events
-- Execution layer
-  - `apply` with partial execution + approval pause
-  - `approve <id>` to resume gated actions
-  - `rollback <run-id>` reverse execution of completed run actions
-- Witness layer (runtime telemetry)
-  - performance breach ingestion and candidate response generation
-- Discovery
-  - repo scan for `.beecon` files
-- Multi-cloud connection checks
-  - AWS: live identity check via AWS SDK v2 STS `GetCallerIdentity`
-  - GCP: Google Cloud Storage client init check (`GOOGLE_APPLICATION_CREDENTIALS`)
-  - Azure: Azure Identity credential init check (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`)
-- AWS provider execution adapters
-  - Tier 1/2/3 target registry is wired (ECS, RDS, Aurora Serverless, ElastiCache, S3, ALB, VPC/Subnet/SG, IAM/Secrets Manager, Lambda, API Gateway, SQS/SNS, CloudFront, Route53, CloudWatch, EKS, EventBridge, Cognito, EC2)
-  - Production-grade multi-step lifecycle adapters:
-    - ECS: cluster → task definition → Fargate service (CREATE/UPDATE/DELETE with partial-result recovery)
-    - ALB: load balancer → target group → listener with cascade delete + state evolution fallback
-    - Lambda: VPC placement, layers, env vars
-    - RDS: enhanced monitoring, CloudWatch log exports, read replica intent, Aurora Serverless
-    - ElastiCache: AZ mode, auth token rotation, snapshot retention
-  - Cross-cutting post-apply concerns:
-    - CloudWatch alarms (`alarm_on` intent) with resource-scoped Dimensions per target type
-    - CloudWatch Logs retention (`log_retention` intent) for Lambda/ECS log groups
-  - Input validation: ECS cpu/memory Fargate ranges, ALB port ranges, RDS monitoring intervals + role_arn requirement, ElastiCache AZ mode, alarm_on syntax
-  - Extracted helpers: `buildECSTaskDef` (DRY for CREATE/UPDATE), `lambdaVpcConfig`, `alarmDimensionsForTarget`
-  - Partial `ApplyResult` returned on multi-step failure (orphaned resource recovery)
-  - Additional live SDK adapters:
-    - S3, SQS, SNS, IAM (role), Secrets Manager, EC2 VPC/Subnet/Security Group primitives
-  - Remaining recognized targets run via dry-run simulation or explicit live-mode validation errors
-- GCP provider execution adapters
-  - Target matrix wired across Tier 1/2/3
-  - Resource-specific live adapters implemented for:
-    - GCS, Cloud SQL, Cloud Run, Memorystore Redis, Pub/Sub, Secret Manager
-    - VPC/Subnet/Firewall, IAM (service accounts), Compute Engine, Cloud DNS
-  - Remaining recognized GCP targets use project-scoped generic adapters with live project verification:
-    - Cloud Functions, API Gateway, Cloud CDN, Cloud Monitoring, GKE, Eventarc, Identity Platform
-- Azure provider execution adapters
-  - Target matrix wired across Tier 1/2/3
-  - Resource-specific live adapters implemented for:
-    - Blob Storage, Key Vault Secret, VNet/Subnet/NSG, Managed Identity
-  - Additional live adapters:
-    - RBAC role assignment adapter
-    - Entra ID identity-scoped adapter
-  - ARM generic-resource adapters implemented for:
-    - Container Apps, PostgreSQL Flexible, MySQL Flexible, Azure Cache Redis
-    - Functions, API Management, Service Bus, Event Grid
-    - Front Door, CDN, DNS, Monitor, AKS, VM
-- Security layer (`internal/security/`)
-  - Canonical sensitive key registry (`IsSensitiveKey`) — single source of truth for 16 sensitive key patterns (password, secret_value, token, api_key, private_key, connection_string, database_url, dsn, etc.)
-  - `ScrubMap(map[string]interface{})` — scrubs values of sensitive keys, returns new map (nil-safe)
-  - `ScrubStringMap(map[string]string)` — for intent node scrubbing
-  - `ScrubChanges(map[string]string)` — for plan action diff scrubbing
-  - Used by engine, API server, resolver, and executor — no duplicate key lists
-- Transactional state API
-  - `Store.LoadForUpdate()` → `*StateTransaction` — acquires mutex, returns state for mutation
-  - `tx.Commit()` — saves state and releases mutex
-  - `tx.Rollback()` — releases mutex without saving (safe to call multiple times)
-  - All mutating engine methods (Apply, Approve, Reject, Drift, Rollback, Connect, IngestPerformanceBreach) use this pattern
-  - Read-only methods (Status, Runs, Approvals, History, Audit) use plain `Load()`
-  - `expireApprovalsInline(st)` — pure function that mutates state in-place within a transaction (no Load/Save)
-  - `HashMap` normalizes `float64` → `int64` for whole numbers to prevent JSON round-trip phantom diffs
-- Approval integrity
-  - `ApprovalRequest.IntentHash` — SHA-256 of beacon file content at `Apply` time
-  - `Approve()` re-reads the file and compares hashes; rejects if modified
-- Audit cap
-  - Maximum 10,000 audit events retained; oldest events are trimmed on write
-- Context propagation
-  - All public engine methods take `context.Context` as first parameter
-  - API handlers pass `r.Context()`
-  - CLI creates signal-cancellable context (`SIGINT`/`SIGTERM`)
-- API surface
-  - `GET/POST /api/beacons`
-  - `POST /api/beacon/validate`
-  - `POST /api/resolve` (plan actions scrubbed of credentials)
-  - `GET /api/graph` (nodes and actions scrubbed of credentials)
-  - `GET /api/state` (intent snapshots and live state scrubbed)
-  - `GET /api/runs`
-  - `GET /api/approvals`
-  - `GET /api/audit`
-  - `GET /api/history`
-  - `POST /api/drift` (drift output scrubbed of credentials)
-  - `POST /api/approve`
-  - `POST /api/reject`
-  - `POST /api/connect`
-  - `GET/POST /api/performance`
-  - Optional Bearer token auth via `BEECON_API_KEY` (timing-safe comparison)
-- Mission Control UI
-  - Served at `/` via `internal/ui/handler.go`
-  - When `BEECON_API_KEY` is set, API key is injected via `<meta>` tag and JS adds `Authorization` header to all fetch calls
+### Package Map
 
-## CLI
-
-```bash
-beecon init [dir]
-beecon validate [infra.beecon]
-beecon plan [infra.beecon]
-beecon apply [infra.beecon]
-beecon status
-beecon beacons
-beecon drift [infra.beecon]
-beecon approve <request-id> [approver]
-beecon reject <request-id> [approver] [reason]
-beecon history <resource-id>
-beecon rollback <run-id>
-beecon connect <aws|gcp|azure> [region]
-beecon performance <resource-id> <metric> <observed> <threshold> [duration]
-beecon serve [:8080]
+```
+cmd/beecon/          CLI entrypoint (Cobra commands, flag registration)
+internal/
+  api/               REST API server (15 endpoints, Bearer auth middleware)
+  ast/               Abstract syntax tree for .beecon files
+  btest/             Test assertion framework (.beecon-test files)
+  classify/          Node type classification (SERVICE/STORE/NETWORK/COMPUTE)
+  cli/               Output formatting, color, JSON output, interactive prompts
+  cloud/             Cloud provider abstraction types
+  compliance/        Framework enforcement (HIPAA, SOC2) with mutation pipeline
+  cost/              Budget parsing, pricing estimates, cheaper alternatives
+  discovery/         Beacon file scanner (.beecon pattern matching)
+  engine/            Core orchestrator — parse, plan, apply, drift, rollback, import
+  ir/                Intermediate representation (intent graph, profiles, edges)
+  logging/           Debug logging (stderr, silent by default)
+  parser/            Beacon file parser (regex-based DSL)
+  provider/          AWS/GCP/Azure executors, retry logic, target detection
+  resolver/          Plan builder (topological sort, intent diff, boundary gates)
+  scaffold/          Project initialization (init command)
+  security/          Sensitive key registry, scrubbing functions
+  state/             State store (file-locked JSON, transactions, schema migrations)
+  ui/                Mission Control UI (embedded HTML/JS)
+  wiring/            Cross-resource wiring (IAM, env vars, SG rules)
+  witness/           Performance breach remediation suggestions
 ```
 
-## Quick Start
+### Control Flow
 
-```bash
-cd beecon
-go test ./...
-go run ./cmd/beecon validate testdata/sample.beecon
-go run ./cmd/beecon plan testdata/sample.beecon
-go run ./cmd/beecon apply testdata/sample.beecon
-go run ./cmd/beecon status
-go run ./cmd/beecon serve :8080
+**`beecon apply` flow:**
+
+1. Parse and validate `.beecon` file
+2. Build IR graph (nodes + edges + domain boundary)
+3. Apply compliance mutations (HIPAA/SOC2 framework enforcement)
+4. Wire cross-resource dependencies (IAM policies, env vars, SG rules)
+5. Load state store (`.beecon/state.json`) via transaction
+6. Build resolver plan (`CREATE`/`UPDATE`/`DELETE`) from intent diff
+7. Annotate actions with boundary policy tags (`approve`/`forbid`)
+8. Estimate costs and check budget
+9. Execute non-gated actions via provider executor
+10. Persist run/action/resource updates and audit events
+11. If gated actions remain, create approval request and pause run
+12. Return result with cost report and compliance mutations
+
+**`beecon approve <request-id>`:**
+
+1. Load state via transaction
+2. Validate request status (must be PENDING) and expiry
+3. Verify beacon file integrity (SHA-256 hash comparison)
+4. Execute pending action IDs
+5. Mark approval as APPROVED, run as APPLIED
+6. Persist audit events
+
+**`beecon plan` flow:**
+
+1. Parse + validate + build IR
+2. Apply compliance mutations and wiring
+3. Diff intent against state → generate actions
+4. Skip phantom UPDATEs (empty change sets on DRIFTED resources)
+5. Estimate costs with budget check
+6. Return plan with cost report, compliance mutations, wiring metadata
+
+## Engine
+
+The engine (`internal/engine/engine.go`) is the central orchestrator. Key methods:
+
+| Method | Transaction | Description |
+|--------|-------------|-------------|
+| `Plan` | Read-only | Parse → IR → compliance → wiring → diff → cost |
+| `Apply` | Write | Plan + execute + persist state (returns partial result on failure) |
+| `Approve` | Write | Validate + execute gated actions + update approval |
+| `Reject` | Write | Reject approval + clear ApprovalBlocked on resources |
+| `Rollback` | Write | Reverse a run (CREATE→DELETE, DELETE→RESTORE) |
+| `Drift` | Write | Compare intent hashes + observe live state |
+| `Refresh` | Write | Update live state snapshots without changing status |
+| `Import` | Write | Observe existing cloud resource → create state record |
+| `Status` | Read-only | Return current state snapshot |
+
+### State Mutation Pattern
+
+All write operations follow the transactional pattern:
+
+```go
+tx, err := e.store.LoadForUpdate()  // acquire file lock + mutex
+if err != nil {
+    return nil, err
+}
+defer tx.Rollback()  // safe no-op if Commit was called
+
+// ... modify tx.State ...
+
+if err := tx.Commit(); err != nil {
+    return nil, err
+}
 ```
 
-## End-to-End Workflow
+### copyMap
 
-### 1) Initialize a New Beacon
+`copyMap` uses JSON round-trip for deep copy to prevent aliased nested maps from cross-contaminating state between resources.
 
-```bash
-cd beecon
-go run ./cmd/beecon init
+### expireApprovalsInline
+
+Pure function that mutates state in-place within a transaction. Expires approvals past their `ExpiresAt` timestamp. Returns `true` if any were expired.
+
+## State Store
+
+**Path:** `.beecon/state.json`
+**Schema version:** 2 (migration framework in `internal/state/migration.go`)
+**Directory permissions:** `0700` (owner-only)
+
+### Schema
+
+```go
+State {
+    Version           int
+    Resources         map[string]*ResourceRecord
+    Runs              map[string]*RunRecord
+    Actions           map[string]*ActionRecord
+    Approvals         map[string]*ApprovalRequest
+    Audit             []*AuditEvent       // capped at 10,000
+    Connections       map[string]*Connection
+    PerformanceEvents []*PerformanceEvent
+}
 ```
 
-This creates `infra.beecon` in the current directory.
+### ResourceRecord
 
-### 2) Validate Syntax + Semantics
-
-```bash
-go run ./cmd/beecon validate infra.beecon
+```go
+ResourceRecord {
+    ResourceID, NodeType, NodeName, Provider, ProviderID string
+    Managed bool
+    IntentSnapshot map[string]interface{}
+    IntentHash     string
+    LiveState      map[string]interface{}
+    Status         ResourceStatus  // MATCHED, DRIFTED, UNPROVISIONED, OBSERVED
+    LastAppliedRun, LastOperation string
+    ApprovalBlocked bool
+    LastSeen        *time.Time
+    Wiring          *WiringMetadata  // InferredEnvVars, InferredPolicy, InferredSGRules
+    EstimatedCost   float64
+    DriftFirstDetected *time.Time    // v2 migration
+    DriftCount         int           // v2 migration
+}
 ```
 
-Expected: `valid infra.beecon`
+### Transaction API
 
-### 3) Generate the Resolver Plan
-
-```bash
-go run ./cmd/beecon plan infra.beecon
+```go
+tx, _ := store.LoadForUpdate()  // file lock + mutex
+tx.Commit()                      // save + release
+tx.Rollback()                    // release without save (idempotent)
 ```
 
-Expected output includes:
-- `domain: ...`
-- `nodes: ... edges: ...`
-- ordered actions (`CREATE`/`UPDATE`/`DELETE`)
-- approval markers for gated actions (`[approval:<tag>]`)
+### Schema Migrations
 
-### 4) Apply the Plan
+Version-gated migrations run automatically on load when `state.Version < CurrentVersion`:
+- v1 → v2: Adds `DriftFirstDetected` and `DriftCount` fields to `ResourceRecord`
 
-```bash
-go run ./cmd/beecon apply infra.beecon
+State files from newer versions are rejected with an explicit error to prevent data corruption.
+
+### HashMap
+
+Normalizes `float64` → `int64` for whole numbers before hashing, preventing JSON round-trip phantom diffs.
+
+## Parser
+
+Regex-based DSL parser (`internal/parser/parser.go`):
+
+- Top-level blocks: `domain`, `service`, `store`, `network`, `compute` (alphanumeric + underscore + hyphen names; no dots)
+- Profile blocks: `profile <name>` (separate regex pattern)
+- Nested blocks: `boundary`, `performance`, `needs`, `env`
+- Escape-aware comment stripping (`\"` inside quoted strings)
+- Quote-aware list splitting (commas inside quoted list items preserved)
+- Semantic validation: single domain, no duplicate names, valid `needs` references, profile inheritance resolution
+
+## IR Layer
+
+Provider-agnostic intent graph:
+
+- `DomainNode`: cloud, owner, compliance frameworks, boundary policy, budget
+- `IntentNode`: type (SERVICE/STORE/NETWORK/COMPUTE), intent map, performance map, env map, needs list
+- `Profile`: reusable defaults merged via `apply = [profile_name]`
+- `Edge`: dependency relation (from → to)
+
+Profile application: validates active profile matches at least one resource's `apply` list. Returns error on unknown profile (likely typo).
+
+## Resolver
+
+Plan builder (`internal/resolver/plan.go`):
+
+- `CREATE`: intent exists, no managed state record
+- `UPDATE`: intent hash changed or status is DRIFTED (skips phantom updates with empty change sets)
+- `DELETE`: managed resource removed from current intent
+- `FORBIDDEN`: blocked by boundary policy
+
+Topological sort with type precedence: `network → store → compute → service`.
+
+Boundary tags mapped from action patterns: `new_store`, `delete_store`, `instance_type_change`, `expose_public`.
+
+## Wiring
+
+Cross-resource wiring (`internal/wiring/wiring.go`):
+
+1. **IAM policy inference**: For each `needs` edge, look up target type + access mode → generate least-privilege actions
+2. **Environment variable inference**: Auto-inject connection strings from target resources
+3. **Security group rule inference**: Generate ingress rules scoped by graph edges (not global)
+
+Mode validation: rejects invalid combinations (e.g., `admin` on `NETWORK`). Warns about wildcard access.
+
+Wiring metadata stored in `ResourceRecord.Wiring` for audit trail.
+
+## Classification
+
+`internal/classify/classify.go` provides canonical node classification:
+
+- `ClassifyNode(nodeType, nodeName, intent) → AWSTarget`
+- Used by both the provider executor (`detectAWSTarget`) and the wiring layer
+- Single source of truth — no duplicated classification logic
+
+## Compliance
+
+Framework enforcement pipeline (`internal/compliance/`):
+
+1. Collect constraints from declared frameworks (HIPAA, SOC2)
+2. Validate `compliance_override` fields
+3. Resolve strictest defaults across frameworks (e.g., HIPAA `cmk` beats SOC2 `true` for encryption)
+4. Apply mutations in-place to intent nodes
+5. Validate all nodes against rules
+6. Report: violations, overrides, mutations, warnings
+
+## Cost
+
+Budget and cost governance (`internal/cost/`):
+
+- Parse budget strings (`5000/mo`, `60000/yr`) → normalize to monthly
+- Estimate per-resource costs by type and instance class
+- Flag budget exceedance with warnings
+- Suggest cheaper alternatives with monthly savings delta
+- Budget of `$0/mo` is rejected as invalid
+
+## Provider Executor
+
+### Architecture
+
+The executor (`internal/provider/executor.go`) dispatches to provider-specific handlers:
+
+```
+ApplyRequest → detectTarget → validate → execute (or simulate) → ApplyResult
 ```
 
-If no approval is required:
-- run completes with `executed: N`
+Dry-run mode (default) returns simulated results. Live mode (`BEECON_EXECUTE=1`) calls real cloud APIs.
 
-If approval is required:
-- output includes `approval_required: <request-id>`
-- run state becomes `PENDING_APPROVAL` until approved
+### Retry
 
-### 5) Approve Gated Actions (When Needed)
+Generic retry with exponential backoff + jitter (`internal/provider/retry.go`):
 
-```bash
-go run ./cmd/beecon approve <request-id> [approver]
+```go
+withRetry[T](ctx, name, maxAttempts, fn) (T, error)
 ```
 
-Expected:
-- gated actions execute
-- run transitions to `APPLIED`
+- Base delay: 500ms, max delay: 10s, default max attempts: 3
+- Retries: throttling exceptions, 5xx, transient errors
+- Does not retry: permission denied, not found, validation errors
 
-### 6) Inspect Current State + Audit Trail
+### AWS Adapters
 
-```bash
-go run ./cmd/beecon status
-go run ./cmd/beecon history <resource-id>
+**Resource-specific** (full CREATE/UPDATE/DELETE lifecycle):
+- RDS (instance + Aurora cluster), ECS (cluster → task def → service), ALB (LB → TG → listener)
+- Lambda (VPC placement, layers, env vars), ElastiCache (AZ mode, auth token, snapshot)
+- S3, SQS, SNS, IAM (role), Secrets Manager, VPC/Subnet/Security Group
+
+**Cross-cutting concerns:**
+- `alarm_on`: CloudWatch alarms with resource-scoped Dimensions per target type
+- `log_retention`: CloudWatch Logs retention for Lambda/ECS log groups
+
+**Partial failure recovery:** Multi-step operations return partial `ApplyResult` on mid-sequence failure for orphaned resource tracking.
+
+### GCP Adapters
+
+**Resource-specific:** GCS, Cloud SQL, Cloud Run, Memorystore Redis, Pub/Sub, Secret Manager, VPC/Subnet/Firewall, IAM, Compute Engine, Cloud DNS
+
+**Project-scoped generic:** Cloud Functions, API Gateway, Cloud CDN, Cloud Monitoring, GKE, Eventarc, Identity Platform
+
+### Azure Adapters
+
+**Resource-specific:** Blob Storage, Key Vault Secret, VNet/Subnet/NSG, Managed Identity
+
+**Identity-scoped:** RBAC role assignment, Entra ID
+
+**ARM generic:** Container Apps, PostgreSQL Flexible, MySQL Flexible, Azure Cache Redis, Functions, API Management, Service Bus, Event Grid, Front Door, CDN, DNS, Monitor, AKS, VM
+
+## Security
+
+### Sensitive Key Registry
+
+Canonical list of 25 sensitive key patterns (`internal/security/redact.go`):
+
+```
+password, secret_value, token, admin_password, secret, secret_key, access_key,
+api_key, private_key, connection_string, client_secret, master_password,
+auth_token, database_url, connection_url, dsn, ssh_key, credentials,
+refresh_token, passphrase, encryption_key, signing_key, tls_key, certificate, bearer
 ```
 
-Examples:
-- `service.api`
-- `store.postgres`
+Matching is case-insensitive on the key's base name (after last `.`).
 
-### 7) Roll Back a Run
+### Scrubbing Functions
 
-```bash
-go run ./cmd/beecon rollback <run-id>
+| Function | Input type | Used by |
+|----------|-----------|---------|
+| `ScrubMap` | `map[string]interface{}` | API responses, live state |
+| `ScrubStringMap` | `map[string]string` | Intent fields, env maps |
+| `ScrubChanges` | `map[string]string` | Plan action diffs |
+
+All scrubbing replaces values with `**REDACTED**`.
+
+### API Authentication
+
+- Middleware: timing-safe Bearer token comparison (`crypto/subtle.ConstantTimeCompare`)
+- Source: `BEECON_API_KEY` environment variable
+- Auth failures logged with client IP for security monitoring
+- UI handles auth client-side via `sessionStorage` prompt (no server-side key injection)
+
+### Drift Error Sanitization
+
+API strips ARNs and AWS account IDs from drift error messages before returning to clients, preventing infrastructure metadata leakage.
+
+## API Surface
+
+15 endpoints served at `/api/`:
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/api/beacons` | GET, POST | Yes | Discover / register beacon files |
+| `/api/beacon/validate` | POST | Yes | Validate beacon syntax |
+| `/api/resolve` | POST | Yes | Generate plan (scrubbed) |
+| `/api/graph` | GET | Yes | Resource graph with nodes, edges, actions |
+| `/api/state` | GET | Yes | Full state snapshot (scrubbed) |
+| `/api/runs` | GET | Yes | Run history |
+| `/api/approvals` | GET | Yes | Pending approvals |
+| `/api/audit` | GET | Yes | Audit events (filterable by resource) |
+| `/api/history` | GET | Yes | Resource event history |
+| `/api/drift` | POST | Yes | Detect drift (errors sanitized) |
+| `/api/apply` | POST | Yes | Execute plan (supports `force` flag) |
+| `/api/approve` | POST | Yes | Approve pending actions |
+| `/api/reject` | POST | Yes | Reject pending actions |
+| `/api/connect` | POST | Yes | Register cloud provider |
+| `/api/performance` | GET, POST | Yes | Performance breach events |
+
+Auth column: required when `BEECON_API_KEY` is set.
+
+## Mission Control UI
+
+Embedded single-page app served at `/` by `internal/ui/handler.go`:
+
+- Three-panel layout: Intent Feed, Resolution Graph, Audit Rail
+- Polls API every 5 seconds (pauses when tab is hidden, exponential backoff on errors)
+- Actions: Apply, Approve, Reject with confirmation dialogs
+- Auth: client-side `sessionStorage` prompt when API requires Bearer token
+- XSS protection: all dynamic content escaped via `esc()` helper
+
+## Test Framework
+
+`.beecon-test` assertion format (`internal/btest/`):
+
+```
+assert <node-name> <field> <op> <value>
+assert_count <operation> <count>
 ```
 
-Expected:
-- a new rollback run id is returned
-- previously executed actions are reversed in reverse order
+Operations: `==`, `!=`, `contains`. Evaluated against `PlanResult`.
 
-## Notes
+## Testing
 
-- By default execution is dry-run safe. Set `BEECON_EXECUTE=1` to enable live AWS SDK mutation calls for implemented adapters.
-- Mission Control UI is served at `/` and consumes API data from `/api/*`. Set `BEECON_API_KEY` to require auth.
-- Rollback now issues cloud calls (DELETE for rollback of CREATE, CREATE for rollback of DELETE) when `BEECON_EXECUTE=1`.
-- AWS `isNotFound` detection uses smithy SDK error types (structured code matching) with string fallback.
+245 test functions across the codebase covering:
 
-## Live AWS Inputs (Current)
+- Parser syntax and semantic validation
+- Resolver dependency ordering and boundary gates
+- Profile inheritance and unknown profile detection
+- Engine apply/approval/rollback/reject/import/drift
+- State store save/load/hash/transaction/migration/permissions
+- Provider target detection and support matrix
+- Wiring IAM inference, env var injection, SG rule scoping
+- Compliance framework enforcement
+- Cost budget parsing and validation
+- API endpoint behavior
+- UI handler output
+- Security key registry
 
-When `BEECON_EXECUTE=1`, resources require explicit intent fields. Validation runs before any cloud calls.
+## Known Gaps
 
-### Required Fields
-- **RDS / Aurora**: `username`, `password`; `monitoring_role_arn` when `enhanced_monitoring=true`
-- **ECS**: `image_uri`; validates `cpu` ∈ {256,512,1024,2048,4096}, `memory` ∈ 512-30720 MB
-- **ALB**: `subnet_ids`; `vpc_id` when `target_port` is set; validates port ranges 1-65535
-- **Lambda**: `role_arn`, `code_s3_bucket`, `code_s3_key`; validates memory 128-10240 MB, timeout 1-900s
-- **Subnet**: `vpc_id` (and optional `cidr`)
-- **Security Group**: `vpc_id`
-- **ElastiCache**: validates `az_mode` ∈ {single-az, cross-az}
-
-### Optional Cross-Cutting Intents
-- `alarm_on`: creates a CloudWatch alarm scoped to the resource (e.g., `"cpu > 80"`). Supported targets: rds, ecs, lambda, ec2, elasticache, eks.
-- `log_retention`: sets CloudWatch Logs retention (e.g., `"30d"`). Supported targets: lambda, ecs.
-
-### Partial Failure Recovery
-Multi-step operations (ECS cluster→task def→service, ALB LB→TG→listener) return partial `ApplyResult` on mid-sequence failure, allowing the engine to track orphaned resources for cleanup.
-
-If required fields are missing, apply fails with explicit validation errors before creating partial infrastructure.
+- Parser is Go (not Rust + pest per original design)
+- GCP/Azure generic adapters lack resource-specific lifecycle depth
+- No background approval expiry processor (expiry enforced inline on access)
+- Drift observation depth varies by provider and target type
