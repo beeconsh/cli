@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -167,4 +168,42 @@ func (o *Writer) NumberedAction(num int, operation, name, annotation string) {
 func (o *Writer) StatusLine(name, status, detail string) {
 	line := fmt.Sprintf("  %-20s %-12s %s", name, status, detail)
 	fmt.Fprintln(o.w, strings.TrimRight(line, " "))
+}
+
+// WriteJSON marshals v as indented JSON to w. Used by --format json.
+func WriteJSON(w io.Writer, v interface{}) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// DiffLine prints a diff-style line: colored +/-/~ prefix with key and value.
+func (o *Writer) DiffLine(operation, key, value string) {
+	var prefix string
+	switch operation {
+	case "CREATE":
+		prefix = o.Green("+")
+	case "DELETE":
+		prefix = o.Red("-")
+	case "UPDATE":
+		prefix = o.Yellow("~")
+	default:
+		prefix = " "
+	}
+	fmt.Fprintf(o.w, "      %s %s: %s\n", prefix, key, value)
+}
+
+// Confirm prompts the user for a yes/no response. Returns true only if the
+// user types "y" or "yes". Returns false for non-TTY writers.
+func (o *Writer) Confirm(prompt string) bool {
+	if !isTTY(o.w) {
+		return false
+	}
+	fmt.Fprintf(o.w, "  %s ", prompt)
+	var response string
+	if _, err := fmt.Scanln(&response); err != nil {
+		return false
+	}
+	response = strings.ToLower(strings.TrimSpace(response))
+	return response == "y" || response == "yes"
 }
