@@ -35,6 +35,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/audit", s.audit)
 	mux.HandleFunc("/api/history", s.history)
 	mux.HandleFunc("/api/drift", s.drift)
+	mux.HandleFunc("/api/apply", s.apply)
 	mux.HandleFunc("/api/approve", s.approve)
 	mux.HandleFunc("/api/reject", s.reject)
 	mux.HandleFunc("/api/connect", s.connect)
@@ -330,6 +331,34 @@ func (s *Server) drift(w http.ResponseWriter, r *http.Request) {
 		warnings = append(warnings, e.Error())
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"drifted": drifted, "count": len(drifted), "warnings": warnings})
+}
+
+func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		BeaconPath string `json:"beacon_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	if req.BeaconPath == "" {
+		req.BeaconPath = "infra.beecon"
+	}
+	if err := safePath(s.engine.Root(), req.BeaconPath); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	res, err := s.engine.Apply(r.Context(), req.BeaconPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	scrubOutcomes(res.Actions)
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) approve(w http.ResponseWriter, r *http.Request) {

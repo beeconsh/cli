@@ -610,7 +610,6 @@ func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, 
 // Import imports an existing cloud resource into beecon state by observing it.
 // Returns the resource ID of the imported resource.
 func (e *Engine) Import(ctx context.Context, providerName, resourceType, providerID, region string) (string, error) {
-	// Build a synthetic ResourceRecord for observation
 	nodeID := fmt.Sprintf("%s.%s", resourceType, providerID)
 	rec := &state.ResourceRecord{
 		ResourceID: nodeID,

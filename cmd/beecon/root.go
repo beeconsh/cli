@@ -34,6 +34,7 @@ var formatFlag string
 var debugFlag bool
 var yesFlag bool
 var statusFilter string
+var watchInterval string
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -97,6 +98,9 @@ func init() {
 	// Filter flag on status command
 	statusCmd.Flags().StringVar(&statusFilter, "filter", "", "filter by status (DRIFTED,MATCHED,PENDING_APPROVAL,OBSERVED)")
 
+	// Interval flag on watch command
+	watchCmd.Flags().StringVar(&watchInterval, "interval", "5m", "drift check interval (e.g. 30s, 5m, 1h)")
+
 	rootCmd.AddCommand(
 		versionCmd,
 		initCmd,
@@ -111,8 +115,11 @@ func init() {
 		historyCmd,
 		rollbackCmd,
 		connectCmd,
+		importCmd,
 		performanceCmd,
 		refreshCmd,
+		testCmd,
+		watchCmd,
 		serveCmd,
 	)
 }
