@@ -91,6 +91,9 @@ var planCmd = &cobra.Command{
 			for _, a := range res.Plan.Actions {
 				a.Changes = security.ScrubChanges(a.Changes)
 			}
+			if res.WiringResult != nil {
+				res.WiringResult.InferredEnvVars = nil
+			}
 			return cli.WriteJSON(os.Stdout, res)
 		}
 
@@ -686,6 +689,9 @@ var watchCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("invalid interval %q: %w", watchInterval, err)
 		}
+		if interval <= 0 {
+			return fmt.Errorf("interval must be positive, got %s", watchInterval)
+		}
 		out.Blank()
 		out.Line(out.Dot(), "Watching %s every %s (Ctrl+C to stop)", path, interval)
 		out.Blank()
@@ -765,8 +771,13 @@ var serveCmd = &cobra.Command{
 		if len(args) > 0 {
 			addr = args[0]
 		}
+		apiKey := os.Getenv("BEECON_API_KEY")
+		if apiKey == "" {
+			fmt.Fprintln(os.Stderr, "WARNING: BEECON_API_KEY not set — API endpoints are unauthenticated")
+		}
+
 		apiHandler := api.New(eng).Handler()
-		uiHandler := ui.Handler(os.Getenv("BEECON_API_KEY"))
+		uiHandler := ui.Handler()
 
 		mux := http.NewServeMux()
 		mux.Handle("/api/", apiHandler)
@@ -778,6 +789,9 @@ var serveCmd = &cobra.Command{
 		} else {
 			out.Line(out.Green(out.OK()), "Serving Mission Control on %s", out.Bold("http://localhost"+addr))
 			out.Summary("API base: http://localhost%s/api", addr)
+		}
+		if apiKey != "" {
+			out.Line(out.Dim("  API key:"), "%s", apiKey)
 		}
 		out.Blank()
 

@@ -295,6 +295,9 @@ func (s *Store) loadLocked() (*State, error) {
 	if st.Connections == nil {
 		st.Connections = map[string]ProviderConnection{}
 	}
+	if st.Version > CurrentVersion {
+		return nil, fmt.Errorf("state.json version %d is newer than this beecon (supports up to %d); upgrade beecon", st.Version, CurrentVersion)
+	}
 	if st.Version < CurrentVersion {
 		runMigrations(&st)
 	}

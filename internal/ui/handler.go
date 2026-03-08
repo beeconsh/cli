@@ -1,24 +1,16 @@
 package ui
 
 import (
-	htmlpkg "html"
 	"net/http"
-	"strings"
 )
 
-// Handler returns an HTTP handler for the Mission Control UI. When apiKey is
-// non-empty, a meta tag and JS auth header are injected so the UI can
-// authenticate API requests.
-func Handler(apiKey string) http.Handler {
+// Handler returns an HTTP handler for the Mission Control UI.
+// The UI is static HTML that handles auth client-side via sessionStorage.
+func Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		html := page
-		if apiKey != "" {
-			meta := `<meta name="beecon-api-key" content="` + htmlpkg.EscapeString(apiKey) + `" />`
-			html = strings.Replace(html, "</head>", meta+"\n</head>", 1)
-		}
-		_, _ = w.Write([]byte(html))
+		_, _ = w.Write([]byte(page))
 	})
 	return mux
 }
@@ -35,10 +27,10 @@ const page = `<!doctype html>
   --ok:#3ecf8e; --warn:#f7c948; --bad:#ff5d5d; --txt:#e8eff7; --muted:#9bb0c9;
 }
 body {margin:0; font-family: ui-sans-serif, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at 20% -10%, #1f3250, var(--bg)); color:var(--txt);}
-header {padding:14px 18px; border-bottom:1px solid var(--line); background:rgba(10,15,24,.5); backdrop-filter: blur(6px);} 
-main {display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; padding:10px; min-height: calc(100vh - 56px);} 
+header {padding:14px 18px; border-bottom:1px solid var(--line); background:rgba(10,15,24,.5); backdrop-filter: blur(6px);}
+main {display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; padding:10px; min-height: calc(100vh - 56px);}
 .panel {background:linear-gradient(180deg, rgba(20,30,45,.95), rgba(15,24,36,.95)); border:1px solid var(--line); border-radius:12px; overflow:hidden;}
-.panel h2 {margin:0; padding:10px 12px; font-size:14px; color:var(--muted); border-bottom:1px solid var(--line);} 
+.panel h2 {margin:0; padding:10px 12px; font-size:14px; color:var(--muted); border-bottom:1px solid var(--line);}
 .content {padding:10px 12px; height:calc(100vh - 110px); overflow:auto;}
 .item {padding:8px; border:1px solid #22344d; border-radius:8px; margin-bottom:8px; background:#0f1a29;}
 .small {font-size:12px; color:var(--muted)}
@@ -52,9 +44,22 @@ button:hover {background:#2a4060;}
 button.btn-ok {border-color:#2b6f53; color:var(--ok);}
 button.btn-bad {border-color:#8a3a3a; color:var(--bad);}
 .actions {display:flex; gap:6px; margin-top:6px;}
+#login-overlay {position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:100;}
+#login-box {background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:24px;max-width:360px;width:100%;}
+#login-box h3 {margin:0 0 12px;}
+#login-box input {width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:#0f1a29;color:var(--txt);box-sizing:border-box;margin-bottom:12px;}
+#login-box button {width:100%;}
 </style>
 </head>
 <body>
+<div id="login-overlay" style="display:none">
+  <div id="login-box">
+    <h3>API Key Required</h3>
+    <p class="small">Enter your BEECON_API_KEY to authenticate.</p>
+    <input id="login-key" type="password" placeholder="API key" />
+    <button onclick="submitKey()">Authenticate</button>
+  </div>
+</div>
 <header><strong>Beecon Mission Control</strong> <span class="small">Intent Feed · Resolution Graph · Audit Rail</span> <button onclick="doApply()" style="margin-left:auto;float:right">Apply</button></header>
 <main>
 <section class="panel"><h2>Intent Feed</h2><div id="intent" class="content"></div></section>
@@ -62,11 +67,12 @@ button.btn-bad {border-color:#8a3a3a; color:var(--bad);}
 <section class="panel"><h2>Audit Rail</h2><div id="audit" class="content"></div></section>
 </main>
 <script>
-const _bk=document.querySelector('meta[name="beecon-api-key"]');
-const _ak=_bk?_bk.content:'';
-async function j(url){const o={};if(_ak)o.headers={'Authorization':'Bearer '+_ak};const r=await fetch(url,o);return r.json();}
-async function post(url,body){const o={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};if(_ak)o.headers['Authorization']='Bearer '+_ak;const r=await fetch(url,o);return r.json();}
-function esc(s){return (s??'').toString().replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function getKey(){return sessionStorage.getItem('beecon_api_key')||'';}
+function submitKey(){const k=document.getElementById('login-key').value;if(k){sessionStorage.setItem('beecon_api_key',k);document.getElementById('login-overlay').style.display='none';render();}}
+function showLogin(){document.getElementById('login-overlay').style.display='flex';document.getElementById('login-key').value='';document.getElementById('login-key').focus();}
+async function j(url){const o={};const k=getKey();if(k)o.headers={'Authorization':'Bearer '+k};const r=await fetch(url,o);if(r.status===401){showLogin();throw new Error('unauthorized');}return r.json();}
+async function post(url,body){const o={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};const k=getKey();if(k)o.headers['Authorization']='Bearer '+k;const r=await fetch(url,o);if(r.status===401){showLogin();throw new Error('unauthorized');}return r.json();}
+function esc(s){return (s??'').toString().replace(/[&<>"'` + "`" + `]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','` + "`" + `':'&#96;'}[c]));}
 function statusBadge(s){
   const t=(s||'').toUpperCase();
   if(t==='APPLIED'||t==='MATCHED') return '<span class="badge b-ok">'+esc(t)+'</span>';
@@ -122,13 +128,13 @@ async function doApply(){
 }
 async function doApprove(id){
   if(!confirm('Approve '+id+'?'))return;
-  try{await post('/api/approve',{request_id:id,approver:'ui-user'});alert('Approved '+id);}catch(e){alert('Approve failed: '+e);}
+  try{await post('/api/approve',{request_id:id});alert('Approved '+id);}catch(e){alert('Approve failed: '+e);}
   render();
 }
 async function doReject(id){
   const reason=prompt('Rejection reason:','rejected via UI');
   if(reason===null)return;
-  try{await post('/api/reject',{request_id:id,approver:'ui-user',reason:reason});alert('Rejected '+id);}catch(e){alert('Reject failed: '+e);}
+  try{await post('/api/reject',{request_id:id,reason:reason});alert('Rejected '+id);}catch(e){alert('Reject failed: '+e);}
   render();
 }
 let _delay=5000,_paused=false;
