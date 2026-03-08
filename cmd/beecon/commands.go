@@ -533,6 +533,30 @@ var rollbackCmd = &cobra.Command{
 	},
 }
 
+var refreshCmd = &cobra.Command{
+	Use:         "refresh [path]",
+	Short:       "Refresh live state for all managed resources",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := beaconPathArg(args)
+		refreshed, observeErrors, err := eng.Refresh(cmd.Context(), path)
+		if err != nil {
+			return err
+		}
+		for _, e := range observeErrors {
+			fmt.Fprintln(os.Stderr, "warning:", e)
+		}
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Refreshed %d resource(s)", refreshed)
+		if len(observeErrors) > 0 {
+			out.Line(out.Yellow(out.Warn()), "%d observe error(s)", len(observeErrors))
+		}
+		out.Blank()
+		return nil
+	},
+}
+
 var connectCmd = &cobra.Command{
 	Use:         "connect <provider> [region]",
 	Short:       "Connect a cloud provider",

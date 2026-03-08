@@ -530,6 +530,7 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 			rec.Status = state.StatusDrifted
 			rec.LiveState = map[string]interface{}{}
 			rec.AgentReasoning = "resource missing from provider live state"
+			trackDrift(rec)
 			drifted = append(drifted, rec)
 			changed = true
 			continue
@@ -541,10 +542,12 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 		nowHash := state.HashMap(n.Snapshot())
 		if nowHash != rec.IntentHash {
 			rec.Status = state.StatusDrifted
+			trackDrift(rec)
 			drifted = append(drifted, rec)
 			changed = true
 		} else {
 			rec.Status = state.StatusMatched
+			clearDrift(rec)
 		}
 	}
 	if changed {
@@ -554,6 +557,111 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 	}
 	sort.Slice(drifted, func(i, j int) bool { return drifted[i].ResourceID < drifted[j].ResourceID })
 	return drifted, observeErrors, nil
+}
+
+// Refresh observes all managed resources and updates LiveState + LastSeen
+// without comparing hashes or changing Status. Returns the count of refreshed
+// resources and any observe errors.
+func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, error) {
+	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
+	if err != nil {
+		return 0, nil, err
+	}
+	cloudProvider, cloudRegion, err := parseCloud(g)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+	st := tx.State
+
+	refreshed := 0
+	var observeErrors []error
+	for _, rec := range st.Resources {
+		if !rec.Managed {
+			continue
+		}
+		obs, err := e.exec.Observe(ctx, cloudProvider, cloudRegion, rec)
+		if err != nil {
+			observeErrors = append(observeErrors, fmt.Errorf("observe %s: %w", rec.ResourceID, err))
+			continue
+		}
+		if obs.Exists {
+			if obs.LiveState != nil {
+				rec.LiveState = obs.LiveState
+			}
+			rec.LastSeen = time.Now().UTC()
+			refreshed++
+		}
+	}
+
+	if refreshed > 0 {
+		if err := tx.Commit(); err != nil {
+			return refreshed, observeErrors, err
+		}
+	}
+	return refreshed, observeErrors, nil
+}
+
+// Import imports an existing cloud resource into beecon state by observing it.
+// Returns the resource ID of the imported resource.
+func (e *Engine) Import(ctx context.Context, providerName, resourceType, providerID, region string) (string, error) {
+	// Build a synthetic ResourceRecord for observation
+	nodeID := fmt.Sprintf("%s.%s", resourceType, providerID)
+	rec := &state.ResourceRecord{
+		ResourceID: nodeID,
+		NodeType:   strings.ToUpper(resourceType),
+		NodeName:   providerID,
+		Provider:   strings.ToLower(providerName),
+		ProviderID: providerID,
+		Managed:    false,
+	}
+
+	obs, err := e.exec.Observe(ctx, strings.ToLower(providerName), region, rec)
+	if err != nil {
+		return "", fmt.Errorf("observe %s: %w", providerID, err)
+	}
+	if !obs.Exists {
+		return "", fmt.Errorf("resource %s not found in %s/%s", providerID, providerName, region)
+	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
+	if existing, ok := st.Resources[nodeID]; ok && existing.Managed {
+		return "", fmt.Errorf("resource %s already exists in state (status=%s)", nodeID, existing.Status)
+	}
+
+	rec.ProviderID = obs.ProviderID
+	if rec.ProviderID == "" {
+		rec.ProviderID = providerID
+	}
+	rec.ProviderRegion = region
+	rec.LiveState = obs.LiveState
+	rec.Managed = true
+	rec.Status = state.StatusObserved
+	rec.LastSeen = time.Now().UTC()
+	rec.IntentSnapshot = map[string]interface{}{}
+	rec.IntentHash = state.HashMap(rec.IntentSnapshot)
+	rec.History = []string{fmt.Sprintf("%s IMPORTED", time.Now().UTC().Format(time.RFC3339))}
+
+	st.Resources[nodeID] = rec
+	addAudit(st, "", "RESOURCE_IMPORTED", nodeID,
+		fmt.Sprintf("imported %s from %s/%s (provider_id=%s)", nodeID, providerName, region, rec.ProviderID), nil)
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return nodeID, nil
 }
 
 func (e *Engine) History(ctx context.Context, resourceID string) ([]state.AuditEvent, error) {
@@ -834,6 +942,7 @@ func applyAction(ctx context.Context, exec provider.Executor, cloudProvider, clo
 		}
 		rec.LastSeen = time.Now().UTC()
 		rec.Status = state.StatusMatched
+		clearDrift(rec)
 		rec.AgentReasoning = a.Reasoning
 		rec.LastAppliedRun = runID
 		rec.LastOperation = a.Operation
@@ -1023,6 +1132,21 @@ func copyMap(in map[string]interface{}) map[string]interface{} {
 		out[k] = v
 	}
 	return out
+}
+
+// trackDrift sets DriftFirstDetected on first detection and increments DriftCount.
+func trackDrift(rec *state.ResourceRecord) {
+	if rec.DriftFirstDetected == nil {
+		now := time.Now().UTC()
+		rec.DriftFirstDetected = &now
+	}
+	rec.DriftCount++
+}
+
+// clearDrift resets drift tracking when a resource is no longer drifted.
+func clearDrift(rec *state.ResourceRecord) {
+	rec.DriftFirstDetected = nil
+	rec.DriftCount = 0
 }
 
 func maskIdentity(id string) string {

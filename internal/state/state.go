@@ -63,8 +63,10 @@ type ResourceRecord struct {
 	LastAppliedRun  string                 `json:"last_applied_run,omitempty"`
 	LastOperation   string                 `json:"last_operation,omitempty"`
 	ApprovalBlocked bool                   `json:"approval_blocked,omitempty"`
-	Wiring          *WiringMetadata        `json:"wiring,omitempty"`
-	EstimatedCost   float64                `json:"estimated_cost,omitempty"`
+	Wiring             *WiringMetadata        `json:"wiring,omitempty"`
+	EstimatedCost      float64                `json:"estimated_cost,omitempty"`
+	DriftFirstDetected *time.Time             `json:"drift_first_detected,omitempty"`
+	DriftCount         int                    `json:"drift_count,omitempty"`
 }
 
 type PlanAction struct {
@@ -293,6 +295,9 @@ func (s *Store) loadLocked() (*State, error) {
 	if st.Connections == nil {
 		st.Connections = map[string]ProviderConnection{}
 	}
+	if st.Version < CurrentVersion {
+		runMigrations(&st)
+	}
 	return &st, nil
 }
 
@@ -314,7 +319,7 @@ func (s *Store) saveLocked(st *State) error {
 
 func newState() *State {
 	return &State{
-		Version:     1,
+		Version:     CurrentVersion,
 		Resources:   map[string]*ResourceRecord{},
 		Audit:       []AuditEvent{},
 		Approvals:   map[string]*ApprovalRequest{},
