@@ -48,6 +48,28 @@ service api {
 	if applied.Executed == 0 {
 		t.Fatalf("expected at least one action to execute before approval")
 	}
+	if len(applied.Actions) == 0 {
+		t.Fatal("expected ActionOutcome slice to be populated")
+	}
+	if !applied.Simulated {
+		t.Log("note: Simulated=false (BEECON_EXECUTE=1 or default executor)")
+	}
+	// Verify at least one pending and one executed outcome.
+	var hasExecuted, hasPending bool
+	for _, ao := range applied.Actions {
+		switch ao.Status {
+		case ActionExecuted:
+			hasExecuted = true
+		case ActionPending:
+			hasPending = true
+		}
+	}
+	if !hasExecuted {
+		t.Fatal("expected at least one ActionExecuted outcome")
+	}
+	if !hasPending {
+		t.Fatal("expected at least one ActionPending outcome")
+	}
 
 	_, err = e.Approve(ctx, applied.ApprovalRequestID, "tester")
 	if err != nil {

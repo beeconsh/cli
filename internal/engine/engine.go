@@ -28,15 +28,49 @@ type Engine struct {
 }
 
 type PlanResult struct {
-	Graph *ir.Graph
-	Plan  *resolver.Plan
+	Graph         *ir.Graph
+	Plan          *resolver.Plan
+	CloudProvider string
+	CloudRegion   string
+}
+
+type ActionStatus int
+
+const (
+	ActionExecuted  ActionStatus = iota
+	ActionPending
+	ActionForbidden
+)
+
+func (s ActionStatus) String() string {
+	switch s {
+	case ActionExecuted:
+		return "executed"
+	case ActionPending:
+		return "pending"
+	case ActionForbidden:
+		return "forbidden"
+	default:
+		return "unknown"
+	}
+}
+
+func (s ActionStatus) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + s.String() + `"`), nil
+}
+
+type ActionOutcome struct {
+	Action *state.PlanAction `json:"action"`
+	Status ActionStatus      `json:"status"`
 }
 
 type ApplyResult struct {
-	RunID             string
-	ApprovalRequestID string
-	Executed          int
-	Pending           int
+	RunID             string          `json:"run_id"`
+	ApprovalRequestID string          `json:"approval_request_id,omitempty"`
+	Executed          int             `json:"executed"`
+	Pending           int             `json:"pending"`
+	Actions           []ActionOutcome `json:"actions"`
+	Simulated         bool            `json:"simulated"`
 }
 
 func New(rootDir string) *Engine {
@@ -45,6 +79,10 @@ func New(rootDir string) *Engine {
 		root:  rootDir,
 		exec:  provider.NewExecutor(),
 	}
+}
+
+func (e *Engine) IsSimulated() bool {
+	return e.exec.IsDryRun()
 }
 
 func (e *Engine) DiscoverBeacons() ([]string, error) {
@@ -88,7 +126,11 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 		return nil, err
 	}
 	annotateBoundary(p, g.Domain)
-	return &PlanResult{Graph: g, Plan: p}, nil
+	cloudProvider, cloudRegion, err := parseCloud(g)
+	if err != nil {
+		return nil, err
+	}
+	return &PlanResult{Graph: g, Plan: p, CloudProvider: cloudProvider, CloudRegion: cloudRegion}, nil
 }
 
 func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, error) {
@@ -139,9 +181,11 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 
 	pending := make([]*state.PlanAction, 0)
 	executed := 0
+	outcomes := make([]ActionOutcome, 0, len(p.Actions))
 	for _, a := range p.Actions {
 		if a.RequiresApproval {
 			pending = append(pending, a)
+			outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionPending})
 			continue
 		}
 		if err := applyAction(ctx, e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
@@ -155,6 +199,7 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 		}
 		executed++
 		run.ExecutedActions = append(run.ExecutedActions, a.ID)
+		outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionExecuted})
 	}
 
 	var approvalID string
@@ -190,7 +235,14 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &ApplyResult{RunID: run.ID, ApprovalRequestID: approvalID, Executed: executed, Pending: len(pending)}, nil
+	return &ApplyResult{
+		RunID:             run.ID,
+		ApprovalRequestID: approvalID,
+		Executed:          executed,
+		Pending:           len(pending),
+		Actions:           outcomes,
+		Simulated:         e.exec.IsDryRun(),
+	}, nil
 }
 
 func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*ApplyResult, error) {
@@ -238,6 +290,7 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 	}
 
 	executed := 0
+	outcomes := make([]ActionOutcome, 0, len(req.ActionIDs))
 	for _, actionID := range req.ActionIDs {
 		a, ok := st.Actions[actionID]
 		if !ok {
@@ -253,6 +306,7 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 		}
 		run.ExecutedActions = append(run.ExecutedActions, actionID)
 		executed++
+		outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionExecuted})
 	}
 	now := time.Now().UTC()
 	req.Status = state.ApprovalApproved
@@ -263,7 +317,12 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &ApplyResult{RunID: run.ID, Executed: executed}, nil
+	return &ApplyResult{
+		RunID:     run.ID,
+		Executed:  executed,
+		Actions:   outcomes,
+		Simulated: e.exec.IsDryRun(),
+	}, nil
 }
 
 func (e *Engine) Reject(ctx context.Context, requestID, approver, reason string) error {

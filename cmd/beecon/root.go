@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/terracotta-ai/beecon/internal/cli"
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
@@ -19,6 +20,9 @@ var (
 
 // eng is initialized in PersistentPreRunE for commands that need it.
 var eng *engine.Engine
+
+// out is the CLI output writer, initialized once.
+var out = cli.New(os.Stdout)
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
