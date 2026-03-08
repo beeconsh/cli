@@ -18,6 +18,9 @@ var sensitiveKeys = map[string]bool{
 	"client_secret":     true,
 	"master_password":   true,
 	"auth_token":        true,
+	"database_url":      true,
+	"connection_url":    true,
+	"dsn":               true,
 }
 
 // IsSensitiveKey returns true when the base portion (after the last ".")
