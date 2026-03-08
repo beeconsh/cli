@@ -32,14 +32,20 @@ End-to-end Beecon runtime implementation in `beecon/` with `.beecon` DSL parsing
   - Azure: Azure Identity credential init check (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`)
 - AWS provider execution adapters
   - Tier 1/2/3 target registry is wired (ECS, RDS, Aurora Serverless, ElastiCache, S3, ALB, VPC/Subnet/SG, IAM/Secrets Manager, Lambda, API Gateway, SQS/SNS, CloudFront, Route53, CloudWatch, EKS, EventBridge, Cognito, EC2)
-  - Live SDK execution implemented now for high-frequency resources:
-    - RDS (Postgres/MySQL + Aurora cluster create path)
-    - S3
-    - SQS
-    - SNS
-    - IAM (role)
-    - Secrets Manager
-    - EC2 VPC/Subnet/Security Group primitives
+  - Production-grade multi-step lifecycle adapters:
+    - ECS: cluster → task definition → Fargate service (CREATE/UPDATE/DELETE with partial-result recovery)
+    - ALB: load balancer → target group → listener with cascade delete + state evolution fallback
+    - Lambda: VPC placement, layers, env vars
+    - RDS: enhanced monitoring, CloudWatch log exports, read replica intent, Aurora Serverless
+    - ElastiCache: AZ mode, auth token rotation, snapshot retention
+  - Cross-cutting post-apply concerns:
+    - CloudWatch alarms (`alarm_on` intent) with resource-scoped Dimensions per target type
+    - CloudWatch Logs retention (`log_retention` intent) for Lambda/ECS log groups
+  - Input validation: ECS cpu/memory Fargate ranges, ALB port ranges, RDS monitoring intervals + role_arn requirement, ElastiCache AZ mode, alarm_on syntax
+  - Extracted helpers: `buildECSTaskDef` (DRY for CREATE/UPDATE), `lambdaVpcConfig`, `alarmDimensionsForTarget`
+  - Partial `ApplyResult` returned on multi-step failure (orphaned resource recovery)
+  - Additional live SDK adapters:
+    - S3, SQS, SNS, IAM (role), Secrets Manager, EC2 VPC/Subnet/Security Group primitives
   - Remaining recognized targets run via dry-run simulation or explicit live-mode validation errors
 - GCP provider execution adapters
   - Target matrix wired across Tier 1/2/3
@@ -60,7 +66,7 @@ End-to-end Beecon runtime implementation in `beecon/` with `.beecon` DSL parsing
     - Functions, API Management, Service Bus, Event Grid
     - Front Door, CDN, DNS, Monitor, AKS, VM
 - Security layer (`internal/security/`)
-  - Canonical sensitive key registry (`IsSensitiveKey`) — single source of truth for 12+ sensitive key patterns
+  - Canonical sensitive key registry (`IsSensitiveKey`) — single source of truth for 16 sensitive key patterns (password, secret_value, token, api_key, private_key, connection_string, database_url, dsn, etc.)
   - `ScrubMap(map[string]interface{})` — scrubs values of sensitive keys, returns new map (nil-safe)
   - `ScrubStringMap(map[string]string)` — for intent node scrubbing
   - `ScrubChanges(map[string]string)` — for plan action diff scrubbing
@@ -217,12 +223,22 @@ Expected:
 
 ## Live AWS Inputs (Current)
 
-When `BEECON_EXECUTE=1`, some resources require explicit intent fields:
+When `BEECON_EXECUTE=1`, resources require explicit intent fields. Validation runs before any cloud calls.
 
-- `RDS` / `Aurora`: `username`, `password` (credentials are now required; no default fallback)
-- `ALB`: `subnet_ids` (comma-separated or list form)
-- `Lambda`: `role_arn`, `code_s3_bucket`, `code_s3_key`
-- `Subnet`: `vpc_id` (and optional `cidr`)
-- `Security Group`: `vpc_id`
+### Required Fields
+- **RDS / Aurora**: `username`, `password`; `monitoring_role_arn` when `enhanced_monitoring=true`
+- **ECS**: `image_uri`; validates `cpu` ∈ {256,512,1024,2048,4096}, `memory` ∈ 512-30720 MB
+- **ALB**: `subnet_ids`; `vpc_id` when `target_port` is set; validates port ranges 1-65535
+- **Lambda**: `role_arn`, `code_s3_bucket`, `code_s3_key`; validates memory 128-10240 MB, timeout 1-900s
+- **Subnet**: `vpc_id` (and optional `cidr`)
+- **Security Group**: `vpc_id`
+- **ElastiCache**: validates `az_mode` ∈ {single-az, cross-az}
+
+### Optional Cross-Cutting Intents
+- `alarm_on`: creates a CloudWatch alarm scoped to the resource (e.g., `"cpu > 80"`). Supported targets: rds, ecs, lambda, ec2, elasticache, eks.
+- `log_retention`: sets CloudWatch Logs retention (e.g., `"30d"`). Supported targets: lambda, ecs.
+
+### Partial Failure Recovery
+Multi-step operations (ECS cluster→task def→service, ALB LB→TG→listener) return partial `ApplyResult` on mid-sequence failure, allowing the engine to track orphaned resources for cleanup.
 
 If required fields are missing, apply fails with explicit validation errors before creating partial infrastructure.

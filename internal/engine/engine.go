@@ -13,25 +13,33 @@ import (
 	"time"
 
 	"github.com/terracotta-ai/beecon/internal/cloud"
+	"github.com/terracotta-ai/beecon/internal/compliance"
+	"github.com/terracotta-ai/beecon/internal/cost"
 	"github.com/terracotta-ai/beecon/internal/discovery"
 	"github.com/terracotta-ai/beecon/internal/ir"
 	"github.com/terracotta-ai/beecon/internal/parser"
 	"github.com/terracotta-ai/beecon/internal/provider"
 	"github.com/terracotta-ai/beecon/internal/resolver"
 	"github.com/terracotta-ai/beecon/internal/state"
+	"github.com/terracotta-ai/beecon/internal/wiring"
 )
 
 type Engine struct {
-	store *state.Store
-	root  string
-	exec  provider.Executor
+	store         *state.Store
+	root          string
+	exec          provider.Executor
+	ActiveProfile string
+	Force         bool
 }
 
 type PlanResult struct {
-	Graph         *ir.Graph
-	Plan          *resolver.Plan
-	CloudProvider string
-	CloudRegion   string
+	Graph            *ir.Graph
+	Plan             *resolver.Plan
+	CloudProvider    string
+	CloudRegion      string
+	ComplianceReport *compliance.ComplianceReport
+	CostReport       *cost.CostReport
+	WiringResult     *wiring.WiringResult
 }
 
 type ActionStatus int
@@ -111,13 +119,19 @@ func (e *Engine) EnsureRoot() error {
 }
 
 func (e *Engine) Validate(beaconPath string) error {
-	_, err := parseAndBuildGraph(beaconPath)
+	_, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
 	return err
 }
 
 func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, error) {
 	e.runExpireApprovals()
 	g, st, err := e.parseAndBuild(beaconPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Phase 3 pipeline: compliance → wiring → resolver → boundary → cost
+	compReport, wiringResult, err := enrichGraph(g)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +144,25 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 	if err != nil {
 		return nil, err
 	}
-	return &PlanResult{Graph: g, Plan: p, CloudProvider: cloudProvider, CloudRegion: cloudRegion}, nil
+
+	var budget *cost.Budget
+	if g.Domain != nil && g.Domain.Budget != "" {
+		budget, err = cost.ParseBudget(g.Domain.Budget)
+		if err != nil {
+			return nil, fmt.Errorf("parse budget: %w", err)
+		}
+	}
+	costReport := cost.Evaluate(p, g, st, budget)
+
+	return &PlanResult{
+		Graph:            g,
+		Plan:             p,
+		CloudProvider:    cloudProvider,
+		CloudRegion:      cloudRegion,
+		ComplianceReport: compReport,
+		CostReport:       costReport,
+		WiringResult:     wiringResult,
+	}, nil
 }
 
 func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, error) {
@@ -138,7 +170,13 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 	if err != nil {
 		return nil, fmt.Errorf("resolve path %q: %w", beaconPath, err)
 	}
-	g, err := parseAndBuildGraph(beaconPath)
+	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
+	if err != nil {
+		return nil, err
+	}
+
+	// Phase 3 pipeline: compliance → wiring → (then resolver under tx)
+	compReport, wiringResult, err := enrichGraph(g)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +199,20 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 		return nil, err
 	}
 
+	// Budget check: block if over budget (unless --force)
+	var budget *cost.Budget
+	if g.Domain != nil && g.Domain.Budget != "" {
+		budget, err = cost.ParseBudget(g.Domain.Budget)
+		if err != nil {
+			return nil, fmt.Errorf("parse budget: %w", err)
+		}
+	}
+	costReport := cost.Evaluate(p, g, st, budget)
+	if costReport.BudgetExceeded && !e.Force {
+		return nil, fmt.Errorf("estimated cost $%.0f/mo exceeds budget $%.0f/mo (use --force to override)",
+			costReport.TotalMonthlyCost, budget.MonthlyAmount())
+	}
+
 	// Compute intent hash for approval integrity.
 	content, err := os.ReadFile(abs)
 	if err != nil {
@@ -169,10 +221,11 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 	intentHash := sha256hex(content)
 
 	run := &state.RunRecord{
-		ID:         state.NewID("run"),
-		CreatedAt:  time.Now().UTC(),
-		BeaconPath: abs,
-		Status:     state.RunApplied,
+		ID:            state.NewID("run"),
+		CreatedAt:     time.Now().UTC(),
+		BeaconPath:    abs,
+		Status:        state.RunApplied,
+		ActiveProfile: e.ActiveProfile,
 	}
 	for _, a := range p.Actions {
 		st.Actions[a.ID] = a
@@ -200,22 +253,40 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 		executed++
 		run.ExecutedActions = append(run.ExecutedActions, a.ID)
 		outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionExecuted})
+
+		// Store wiring metadata and cost estimate on the resource record
+		if rec := st.Resources[a.NodeID]; rec != nil {
+			if wm := wiring.BuildMetadata(a.NodeID, wiringResult); wm != nil {
+				rec.Wiring = &state.WiringMetadata{
+					InferredEnvVars: wm.InferredEnvVars,
+					InferredPolicy:  wm.InferredPolicy,
+					InferredSGRules: wm.InferredSGRules,
+				}
+			}
+			for _, est := range costReport.Estimates {
+				if est.NodeID == a.NodeID {
+					rec.EstimatedCost = est.MonthlyCost
+					break
+				}
+			}
+		}
 	}
 
 	var approvalID string
 	if len(pending) > 0 {
 		run.Status = state.RunPendingApproval
 		req := &state.ApprovalRequest{
-			ID:          state.NewID("apr"),
-			CreatedAt:   time.Now().UTC(),
-			RunID:       run.ID,
-			Reason:      "boundary approve gate triggered",
-			Status:      state.ApprovalPending,
-			ExpiresAt:   time.Now().UTC().Add(24 * time.Hour),
-			BeaconPath:  abs,
-			IntentHash:  intentHash,
-			CostDelta:   estimateCostDelta(pending),
-			BlastRadius: fmt.Sprintf("%d actions", len(pending)),
+			ID:            state.NewID("apr"),
+			CreatedAt:     time.Now().UTC(),
+			RunID:         run.ID,
+			Reason:        "boundary approve gate triggered",
+			Status:        state.ApprovalPending,
+			ExpiresAt:     time.Now().UTC().Add(24 * time.Hour),
+			BeaconPath:    abs,
+			IntentHash:    intentHash,
+			CostDelta:     cost.FormatDelta(costReport),
+			BlastRadius:   fmt.Sprintf("%d actions", len(pending)),
+			ActiveProfile: e.ActiveProfile,
 		}
 		for _, a := range pending {
 			req.ActionIDs = append(req.ActionIDs, a.ID)
@@ -229,6 +300,14 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 
 	st.Runs[run.ID] = run
 	addAudit(st, run.ID, "RUN_CREATED", "", fmt.Sprintf("run %s created for %s", run.ID, abs), nil)
+	// Emit audit events for compliance overrides
+	if compReport != nil {
+		for _, o := range compReport.Overrides {
+			addAudit(st, run.ID, "COMPLIANCE_OVERRIDE", o.NodeID,
+				fmt.Sprintf("compliance override: field %q bypassed on %s", o.Field, o.NodeID),
+				map[string]interface{}{"field": o.Field, "node_id": o.NodeID})
+		}
+	}
 	if approvalID != "" {
 		addAudit(st, run.ID, "APPROVAL_REQUIRED", "", fmt.Sprintf("approval %s required", approvalID), map[string]interface{}{"request_id": approvalID})
 	}
@@ -280,9 +359,13 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 	if !ok {
 		return nil, fmt.Errorf("run %s not found", req.RunID)
 	}
-	g, err := parseAndBuildGraph(req.BeaconPath)
+	g, err := parseAndBuildGraph(req.BeaconPath, req.ActiveProfile)
 	if err != nil {
 		return nil, err
+	}
+	// Enrich graph with compliance defaults and wiring (same pipeline as Apply).
+	if _, _, enrichErr := enrichGraph(g); enrichErr != nil {
+		return nil, fmt.Errorf("enrich graph for approval: %w", enrichErr)
 	}
 	cloudProvider, cloudRegion, err := parseCloud(g)
 	if err != nil {
@@ -393,9 +476,13 @@ func (e *Engine) Approvals(ctx context.Context) ([]*state.ApprovalRequest, error
 }
 
 func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.ResourceRecord, []error, error) {
-	g, err := parseAndBuildGraph(beaconPath)
+	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Enrich graph so intent hashes match what Apply stored.
+	if _, _, enrichErr := enrichGraph(g); enrichErr != nil {
+		return nil, nil, fmt.Errorf("enrich graph for drift: %w", enrichErr)
 	}
 	cloudProvider, cloudRegion, err := parseCloud(g)
 	if err != nil {
@@ -496,7 +583,7 @@ func (e *Engine) Rollback(ctx context.Context, runID string) (string, error) {
 	// Resolve cloud info for rollback cloud calls.
 	var cloudProvider, cloudRegion string
 	if run.BeaconPath != "" {
-		if g, parseErr := parseAndBuildGraph(run.BeaconPath); parseErr == nil {
+		if g, parseErr := parseAndBuildGraph(run.BeaconPath, run.ActiveProfile); parseErr == nil {
 			cloudProvider, cloudRegion, _ = parseCloud(g)
 		} else {
 			addAudit(st, runID, "ROLLBACK_PARSE_WARNING", "", fmt.Sprintf("could not re-parse beacon: %v", parseErr), nil)
@@ -592,16 +679,36 @@ func (e *Engine) IngestPerformanceBreach(ctx context.Context, resourceID, metric
 	return ev.ID, nil
 }
 
-func parseAndBuildGraph(beaconPath string) (*ir.Graph, error) {
+func parseAndBuildGraph(beaconPath string, activeProfile string) (*ir.Graph, error) {
 	f, err := parser.ParseFile(beaconPath)
 	if err != nil {
 		return nil, err
 	}
-	return ir.Build(f, beaconPath)
+	return ir.Build(f, beaconPath, activeProfile)
+}
+
+// enrichGraph runs the compliance and wiring pipeline on a parsed graph.
+// This MUST be called on every code path that uses the graph for intent hashing,
+// action execution, or drift comparison. Compliance and wiring mutate
+// IntentNode.Intent and IntentNode.Env in-place, affecting the intent hash.
+//
+// Note: compliance.Enforce mutates the graph in-place (fills defaults). If wiring
+// fails after compliance succeeds, the graph retains compliance mutations.
+// This is acceptable because callers discard the graph on error.
+func enrichGraph(g *ir.Graph) (*compliance.ComplianceReport, *wiring.WiringResult, error) {
+	compReport, err := compliance.Enforce(g)
+	if err != nil {
+		return compReport, nil, err
+	}
+	wiringResult, err := wiring.WireGraph(g)
+	if err != nil {
+		return compReport, nil, err
+	}
+	return compReport, wiringResult, nil
 }
 
 func (e *Engine) parseAndBuild(beaconPath string) (*ir.Graph, *state.State, error) {
-	g, err := parseAndBuildGraph(beaconPath)
+	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -914,17 +1021,3 @@ func maskIdentity(id string) string {
 	return "****" + id[len(id)-4:]
 }
 
-func estimateCostDelta(actions []*state.PlanAction) string {
-	if len(actions) == 0 {
-		return "$0/mo"
-	}
-	var score int
-	for _, a := range actions {
-		if a.NodeType == "STORE" {
-			score += 200
-		} else {
-			score += 40
-		}
-	}
-	return fmt.Sprintf("+$%d/mo (estimated)", score)
-}

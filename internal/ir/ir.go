@@ -26,14 +26,15 @@ type Dependency struct {
 
 // IntentNode is the provider-agnostic intent unit.
 type IntentNode struct {
-	ID          string
-	Name        string
-	Type        NodeType
-	Intent      map[string]string
-	Performance map[string]string
-	Needs       []Dependency
-	Env         map[string]string
-	Source      string
+	ID                  string
+	Name                string
+	Type                NodeType
+	Intent              map[string]string
+	Performance         map[string]string
+	Needs               []Dependency
+	Env                 map[string]string
+	Source              string
+	ComplianceOverrides []string
 }
 
 // DomainNode captures root constraints.
@@ -43,6 +44,7 @@ type DomainNode struct {
 	Owner      string
 	Compliance []string
 	Boundary   map[string][]string
+	Budget     string
 }
 
 // Edge represents a dependency relation (From -> To).
@@ -53,10 +55,11 @@ type Edge struct {
 
 // Graph is the canonical intent graph.
 type Graph struct {
-	Nodes    []IntentNode
-	Edges    []Edge
-	Domain   *DomainNode
-	Profiles map[string]Profile
+	Nodes         []IntentNode
+	Edges         []Edge
+	Domain        *DomainNode
+	Profiles      map[string]Profile
+	ActiveProfile string
 }
 
 // Profile is a reusable intent template.
@@ -95,8 +98,12 @@ func (g *Graph) NodesByID() map[string]IntentNode {
 }
 
 // Build converts AST into intent graph.
-func Build(f *ast.File, source string) (*Graph, error) {
-	g := &Graph{Profiles: map[string]Profile{}}
+func Build(f *ast.File, source string, activeProfile ...string) (*Graph, error) {
+	ap := ""
+	if len(activeProfile) > 0 {
+		ap = activeProfile[0]
+	}
+	g := &Graph{Profiles: map[string]Profile{}, ActiveProfile: ap}
 	nameToID := map[string]string{}
 
 	for _, b := range f.Blocks {
@@ -135,6 +142,9 @@ func Build(f *ast.File, source string) (*Graph, error) {
 			if v, ok := b.Fields["compliance"]; ok && v.IsList() {
 				d.Compliance = append([]string{}, v.List...)
 			}
+			if v, ok := b.Fields["budget"]; ok {
+				d.Budget = v.Raw
+			}
 			for _, c := range b.Children {
 				if c.Kind != "boundary" {
 					continue
@@ -149,7 +159,7 @@ func Build(f *ast.File, source string) (*Graph, error) {
 			}
 			g.Domain = d
 		case "service", "store", "network", "compute":
-			node, err := buildIntentNode(b, source, g.Profiles)
+			node, err := buildIntentNode(b, source, g.Profiles, ap)
 			if err != nil {
 				return nil, err
 			}
@@ -170,7 +180,7 @@ func Build(f *ast.File, source string) (*Graph, error) {
 	return g, nil
 }
 
-func buildIntentNode(b *ast.Block, source string, profiles map[string]Profile) (IntentNode, error) {
+func buildIntentNode(b *ast.Block, source string, profiles map[string]Profile, activeProfile string) (IntentNode, error) {
 	nodeType, err := toNodeType(b.Kind)
 	if err != nil {
 		return IntentNode{}, err
@@ -184,40 +194,30 @@ func buildIntentNode(b *ast.Block, source string, profiles map[string]Profile) (
 		Env:         map[string]string{},
 		Source:      source,
 	}
+	// Apply profiles with dot-variant resolution:
+	// For each ref "standard", also apply "standard.production" if activeProfile is "production".
 	for _, ref := range profileRefs(b) {
-		p, ok := profiles[ref]
-		if !ok {
-			continue
-		}
-		for k, v := range p.Fields {
-			n.Intent[k] = v
-		}
-		if child := p.Children["performance"]; child != nil {
-			for k, v := range child {
-				n.Performance[k] = v
-			}
-		}
-		if child := p.Children["env"]; child != nil {
-			for k, v := range child {
-				n.Env[k] = v
-			}
-		}
-		if child := p.Children["needs"]; child != nil {
-			keys := make([]string, 0, len(child))
-			for depName := range child {
-				keys = append(keys, depName)
-			}
-			sort.Strings(keys)
-			for _, depName := range keys {
-				n.Needs = append(n.Needs, Dependency{Target: depName, Mode: child[depName]})
+		applyProfile(&n, profiles, ref)
+		if activeProfile != "" {
+			variant := ref + "." + activeProfile
+			if _, ok := profiles[variant]; ok {
+				applyProfile(&n, profiles, variant)
 			}
 		}
 	}
 	for k, v := range b.Fields {
-		if k == "apply" {
+		if k == "apply" || k == "compliance_override" {
 			continue
 		}
 		n.Intent[k] = v.Raw
+	}
+	// Parse compliance_override field
+	if v, ok := b.Fields["compliance_override"]; ok {
+		if v.IsList() {
+			n.ComplianceOverrides = append([]string{}, v.List...)
+		} else if strings.TrimSpace(v.Raw) != "" {
+			n.ComplianceOverrides = []string{v.Raw}
+		}
 	}
 	for _, c := range b.Children {
 		switch c.Kind {
@@ -241,7 +241,66 @@ func buildIntentNode(b *ast.Block, source string, profiles map[string]Profile) (
 			}
 		}
 	}
+	// Deduplicate needs: local (appended last) overrides profile for same target.
+	n.Needs = deduplicateNeeds(n.Needs)
 	return n, nil
+}
+
+// deduplicateNeeds keeps the last occurrence of each target (local overrides profile).
+// Preserves ordering by first appearance.
+func deduplicateNeeds(needs []Dependency) []Dependency {
+	if len(needs) <= 1 {
+		return needs
+	}
+	// Record the index of the last occurrence (which is the local override if present)
+	last := make(map[string]int, len(needs))
+	for i, d := range needs {
+		last[d.Target] = i
+	}
+	if len(last) == len(needs) {
+		return needs // no duplicates
+	}
+	result := make([]Dependency, 0, len(last))
+	added := make(map[string]bool, len(last))
+	for _, d := range needs {
+		if added[d.Target] {
+			continue
+		}
+		// Use the last-seen version (preserves first-seen order, last-seen value)
+		result = append(result, needs[last[d.Target]])
+		added[d.Target] = true
+	}
+	return result
+}
+
+func applyProfile(n *IntentNode, profiles map[string]Profile, ref string) {
+	p, ok := profiles[ref]
+	if !ok {
+		return
+	}
+	for k, v := range p.Fields {
+		n.Intent[k] = v
+	}
+	if child := p.Children["performance"]; child != nil {
+		for k, v := range child {
+			n.Performance[k] = v
+		}
+	}
+	if child := p.Children["env"]; child != nil {
+		for k, v := range child {
+			n.Env[k] = v
+		}
+	}
+	if child := p.Children["needs"]; child != nil {
+		keys := make([]string, 0, len(child))
+		for depName := range child {
+			keys = append(keys, depName)
+		}
+		sort.Strings(keys)
+		for _, depName := range keys {
+			n.Needs = append(n.Needs, Dependency{Target: depName, Mode: child[depName]})
+		}
+	}
 }
 
 func profileRefs(b *ast.Block) []string {
