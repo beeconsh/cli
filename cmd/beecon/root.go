@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/terracotta-ai/beecon/internal/cli"
 	"github.com/terracotta-ai/beecon/internal/engine"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/state"
 	"gopkg.in/yaml.v3"
 )
@@ -29,6 +30,10 @@ var out = cli.New(os.Stdout)
 // CLI flags
 var profileFlag string
 var forceFlag bool
+var formatFlag string
+var debugFlag bool
+var yesFlag bool
+var statusFilter string
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -46,6 +51,9 @@ var rootCmd = &cobra.Command{
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		if debugFlag {
+			logging.Enable()
+		}
 		if cmd.Annotations["needs_engine"] != "true" {
 			return nil
 		}
@@ -74,8 +82,20 @@ func init() {
 	// Profile flag: --profile (persistent across subcommands)
 	rootCmd.PersistentFlags().StringVar(&profileFlag, "profile", "", "active profile (e.g. production, staging)")
 
+	// Format flag: --format (persistent across subcommands)
+	rootCmd.PersistentFlags().StringVar(&formatFlag, "format", "text", "output format (text, json)")
+
+	// Debug flag: --debug (persistent across subcommands)
+	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable debug logging to stderr")
+
 	// Force flag on apply command
 	applyCmd.Flags().BoolVar(&forceFlag, "force", false, "bypass budget enforcement")
+
+	// Yes flag on apply command
+	applyCmd.Flags().BoolVar(&yesFlag, "yes", false, "auto-approve pending actions")
+
+	// Filter flag on status command
+	statusCmd.Flags().StringVar(&statusFilter, "filter", "", "filter by status (DRIFTED,MATCHED,PENDING_APPROVAL,OBSERVED)")
 
 	rootCmd.AddCommand(
 		versionCmd,

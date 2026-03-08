@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/terracotta-ai/beecon/internal/logging"
+
 	"github.com/terracotta-ai/beecon/internal/cloud"
 	"github.com/terracotta-ai/beecon/internal/compliance"
 	"github.com/terracotta-ai/beecon/internal/cost"
@@ -33,13 +35,13 @@ type Engine struct {
 }
 
 type PlanResult struct {
-	Graph            *ir.Graph
-	Plan             *resolver.Plan
-	CloudProvider    string
-	CloudRegion      string
-	ComplianceReport *compliance.ComplianceReport
-	CostReport       *cost.CostReport
-	WiringResult     *wiring.WiringResult
+	Graph            *ir.Graph                    `json:"graph,omitempty"`
+	Plan             *resolver.Plan               `json:"plan"`
+	CloudProvider    string                       `json:"cloud_provider"`
+	CloudRegion      string                       `json:"cloud_region"`
+	ComplianceReport *compliance.ComplianceReport `json:"compliance_report,omitempty"`
+	CostReport       *cost.CostReport             `json:"cost_report,omitempty"`
+	WiringResult     *wiring.WiringResult         `json:"wiring_result,omitempty"`
 }
 
 type ActionStatus int
@@ -119,11 +121,13 @@ func (e *Engine) EnsureRoot() error {
 }
 
 func (e *Engine) Validate(beaconPath string) error {
+	logging.Logger.Debug("validate", "path", beaconPath, "profile", e.ActiveProfile)
 	_, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
 	return err
 }
 
 func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, error) {
+	logging.Logger.Debug("plan:start", "path", beaconPath, "profile", e.ActiveProfile)
 	e.runExpireApprovals()
 	g, st, err := e.parseAndBuild(beaconPath)
 	if err != nil {
@@ -154,6 +158,7 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 	}
 	costReport := cost.Evaluate(p, g, st, budget)
 
+	logging.Logger.Debug("plan:complete", "actions", len(p.Actions), "provider", cloudProvider, "region", cloudRegion)
 	return &PlanResult{
 		Graph:            g,
 		Plan:             p,
@@ -166,6 +171,7 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 }
 
 func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, error) {
+	logging.Logger.Debug("apply:start", "path", beaconPath, "force", e.Force, "simulated", e.exec.IsDryRun())
 	abs, err := filepath.Abs(beaconPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve path %q: %w", beaconPath, err)
@@ -314,6 +320,7 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	logging.Logger.Debug("apply:complete", "run", run.ID, "executed", executed, "pending", len(pending))
 	return &ApplyResult{
 		RunID:             run.ID,
 		ApprovalRequestID: approvalID,
@@ -325,6 +332,7 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 }
 
 func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*ApplyResult, error) {
+	logging.Logger.Debug("approve:start", "request", requestID, "approver", approver)
 	tx, err := e.store.LoadForUpdate()
 	if err != nil {
 		return nil, err
@@ -476,6 +484,7 @@ func (e *Engine) Approvals(ctx context.Context) ([]*state.ApprovalRequest, error
 }
 
 func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.ResourceRecord, []error, error) {
+	logging.Logger.Debug("drift:start", "path", beaconPath)
 	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
 	if err != nil {
 		return nil, nil, err
@@ -712,10 +721,12 @@ func (e *Engine) parseAndBuild(beaconPath string) (*ir.Graph, *state.State, erro
 	if err != nil {
 		return nil, nil, err
 	}
+	logging.Logger.Debug("parse:complete", "nodes", len(g.Nodes), "edges", len(g.Edges))
 	st, err := e.store.Load()
 	if err != nil {
 		return nil, nil, err
 	}
+	logging.Logger.Debug("state:loaded", "resources", len(st.Resources), "runs", len(st.Runs))
 	return g, st, nil
 }
 
