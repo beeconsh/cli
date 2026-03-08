@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/apigatewayv2"
@@ -24,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
+	elasticachetypes "github.com/aws/aws-sdk-go-v2/service/elasticache/types"
 	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/eventbridge"
@@ -34,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -145,6 +151,9 @@ func (e *DefaultExecutor) Observe(ctx context.Context, provider, region string, 
 
 func (e *DefaultExecutor) applyAWS(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
 	target := detectAWSTarget(req)
+	if err := validateAWSInput(target, req.Intent); err != nil {
+		return nil, fmt.Errorf("aws input validation (%s): %w", target, err)
+	}
 	if e.dryRun {
 		return simulatedApply(req, target), nil
 	}
@@ -230,7 +239,8 @@ func (e *DefaultExecutor) applyAWSRDS(ctx context.Context, c *rds.Client, req Ap
 			allocated = 20
 		}
 		class := defaultString(intent(req.Intent, "instance_type"), "db.t3.micro")
-		_, err = c.CreateDBInstance(ctx, &rds.CreateDBInstanceInput{
+		storageType := defaultString(intent(req.Intent, "storage_type"), "gp3")
+		createIn := &rds.CreateDBInstanceInput{
 			DBInstanceIdentifier: awsString(id),
 			Engine:               awsString(engine),
 			DBInstanceClass:      awsString(class),
@@ -239,20 +249,80 @@ func (e *DefaultExecutor) applyAWSRDS(ctx context.Context, c *rds.Client, req Ap
 			AllocatedStorage:     awsInt32(allocated),
 			PubliclyAccessible:   awsBool(false),
 			StorageEncrypted:     awsBool(true),
-		})
+			StorageType:          awsString(storageType),
+			MultiAZ:             awsBool(parseBoolIntent(req.Intent, "multi_az", false)),
+			BackupRetentionPeriod: awsInt32(parseIntIntent(req.Intent, "backup_retention", 7)),
+			DeletionProtection:   awsBool(parseBoolIntent(req.Intent, "deletion_protection", false)),
+		}
+		if v := intent(req.Intent, "backup_window"); v != "" {
+			createIn.PreferredBackupWindow = awsString(v)
+		}
+		if v := intent(req.Intent, "kms_key"); v != "" {
+			createIn.KmsKeyId = awsString(v)
+		}
+		if v := intent(req.Intent, "subnet_group"); v != "" {
+			createIn.DBSubnetGroupName = awsString(v)
+		}
+		if sgs := stringListFromIntent(req.Intent, "security_group_ids"); len(sgs) > 0 {
+			createIn.VpcSecurityGroupIds = sgs
+		}
+		if v := intent(req.Intent, "parameter_group"); v != "" {
+			createIn.DBParameterGroupName = awsString(v)
+		}
+		if v := intent(req.Intent, "iops"); v != "" {
+			createIn.Iops = awsInt32(parseIntIntent(req.Intent, "iops", 0))
+		}
+		_, err = c.CreateDBInstance(ctx, createIn)
 		if err != nil {
 			return nil, fmt.Errorf("rds create db instance: %w", err)
 		}
 	case "UPDATE":
 		class := defaultString(intent(req.Intent, "instance_type"), "db.t3.micro")
-		in := &rds.ModifyDBInstanceInput{DBInstanceIdentifier: awsString(id), ApplyImmediately: awsBool(true), DBInstanceClass: awsString(class)}
+		in := &rds.ModifyDBInstanceInput{
+			DBInstanceIdentifier: awsString(id),
+			ApplyImmediately:     awsBool(true),
+			DBInstanceClass:      awsString(class),
+		}
+		if v := intent(req.Intent, "multi_az"); v != "" {
+			in.MultiAZ = awsBool(parseBoolIntent(req.Intent, "multi_az", false))
+		}
+		if v := intent(req.Intent, "backup_retention"); v != "" {
+			in.BackupRetentionPeriod = awsInt32(parseIntIntent(req.Intent, "backup_retention", 7))
+		}
+		if v := intent(req.Intent, "deletion_protection"); v != "" {
+			in.DeletionProtection = awsBool(parseBoolIntent(req.Intent, "deletion_protection", false))
+		}
 		if s := parseStorageGiB(intent(req.Intent, "disk")); s > 0 {
 			in.AllocatedStorage = awsInt32(s)
+		}
+		if v := intent(req.Intent, "storage_type"); v != "" {
+			in.StorageType = awsString(v)
+		}
+		if v := intent(req.Intent, "backup_window"); v != "" {
+			in.PreferredBackupWindow = awsString(v)
+		}
+		if sgs := stringListFromIntent(req.Intent, "security_group_ids"); len(sgs) > 0 {
+			in.VpcSecurityGroupIds = sgs
+		}
+		if v := intent(req.Intent, "parameter_group"); v != "" {
+			in.DBParameterGroupName = awsString(v)
+		}
+		if v := intent(req.Intent, "iops"); v != "" {
+			in.Iops = awsInt32(parseIntIntent(req.Intent, "iops", 0))
 		}
 		if _, err := c.ModifyDBInstance(ctx, in); err != nil {
 			return nil, fmt.Errorf("rds modify db instance: %w", err)
 		}
 	case "DELETE":
+		// Always attempt to disable deletion protection before deleting.
+		// This is idempotent — if it wasn't enabled, the call is a no-op.
+		if _, err := c.ModifyDBInstance(ctx, &rds.ModifyDBInstanceInput{
+			DBInstanceIdentifier: awsString(id),
+			DeletionProtection:   awsBool(false),
+			ApplyImmediately:     awsBool(true),
+		}); err != nil && !isNotFound(err) {
+			return nil, fmt.Errorf("rds disable deletion protection: %w", err)
+		}
 		_, err := c.DeleteDBInstance(ctx, &rds.DeleteDBInstanceInput{DBInstanceIdentifier: awsString(id), SkipFinalSnapshot: awsBool(true)})
 		if err != nil && !isNotFound(err) {
 			return nil, fmt.Errorf("rds delete db instance: %w", err)
@@ -327,13 +397,19 @@ func (e *DefaultExecutor) applyAWSLambda(ctx context.Context, c *lambda.Client, 
 		}
 		runtime := defaultString(intent(req.Intent, "runtime"), "provided.al2")
 		handler := defaultString(intent(req.Intent, "handler"), "bootstrap")
-		out, err := c.CreateFunction(ctx, &lambda.CreateFunctionInput{
+		createIn := &lambda.CreateFunctionInput{
 			FunctionName: awsString(name),
 			Role:         awsString(role),
 			Runtime:      runtimeFromString(runtime),
 			Handler:      awsString(handler),
 			Code:         &lambdatypes.FunctionCode{S3Bucket: awsString(bucket), S3Key: awsString(key)},
-		})
+			MemorySize:   awsInt32(parseIntIntent(req.Intent, "memory", 128)),
+			Timeout:      awsInt32(parseIntIntent(req.Intent, "timeout", 30)),
+		}
+		if env := envFromIntent(req.Intent); env != nil {
+			createIn.Environment = &lambdatypes.Environment{Variables: env}
+		}
+		out, err := c.CreateFunction(ctx, createIn)
 		if err != nil {
 			return nil, fmt.Errorf("lambda create function: %w", err)
 		}
@@ -352,6 +428,23 @@ func (e *DefaultExecutor) applyAWSLambda(ctx context.Context, c *lambda.Client, 
 			if _, err := c.UpdateFunctionCode(ctx, &lambda.UpdateFunctionCodeInput{FunctionName: awsString(arn), S3Bucket: awsString(bucket), S3Key: awsString(key)}); err != nil {
 				return nil, fmt.Errorf("lambda update function code: %w", err)
 			}
+			// Wait for code update to complete before updating configuration.
+			// AWS Lambda rejects UpdateFunctionConfiguration while a code update is in progress.
+			waiter := lambda.NewFunctionUpdatedV2Waiter(c)
+			if err := waiter.Wait(ctx, &lambda.GetFunctionInput{FunctionName: awsString(arn)}, 2*time.Minute); err != nil {
+				return nil, fmt.Errorf("lambda wait for code update: %w", err)
+			}
+		}
+		configIn := &lambda.UpdateFunctionConfigurationInput{
+			FunctionName: awsString(arn),
+			MemorySize:   awsInt32(parseIntIntent(req.Intent, "memory", 128)),
+			Timeout:      awsInt32(parseIntIntent(req.Intent, "timeout", 30)),
+		}
+		if env := envFromIntent(req.Intent); env != nil {
+			configIn.Environment = &lambdatypes.Environment{Variables: env}
+		}
+		if _, err := c.UpdateFunctionConfiguration(ctx, configIn); err != nil {
+			return nil, fmt.Errorf("lambda update function configuration: %w", err)
 		}
 	case "DELETE":
 		if _, err := c.DeleteFunction(ctx, &lambda.DeleteFunctionInput{FunctionName: awsString(defaultString(arn, name))}); err != nil && !isNotFound(err) {
@@ -398,15 +491,79 @@ func (e *DefaultExecutor) applyAWSS3(ctx context.Context, c *s3.Client, req Appl
 		if err != nil {
 			return nil, fmt.Errorf("s3 create bucket: %w", err)
 		}
+		if err := applyS3BucketConfig(ctx, c, bucket, req.Intent); err != nil {
+			return nil, fmt.Errorf("s3 bucket created but config failed (bucket %s exists): %w", bucket, err)
+		}
 	case "DELETE":
 		_, err := c.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: awsString(bucket)})
 		if err != nil && !isNotFound(err) {
 			return nil, fmt.Errorf("s3 delete bucket: %w", err)
 		}
 	case "UPDATE":
-		// No-op for now.
+		if err := applyS3BucketConfig(ctx, c, bucket, req.Intent); err != nil {
+			return nil, fmt.Errorf("s3 update bucket config: %w", err)
+		}
 	}
 	return &ApplyResult{ProviderID: bucket, LiveState: map[string]interface{}{"service": "s3", "bucket": bucket, "operation": req.Action.Operation}}, nil
+}
+
+// applyS3BucketConfig applies versioning, encryption, and lifecycle config to an S3 bucket.
+func applyS3BucketConfig(ctx context.Context, c *s3.Client, bucket string, intentMap map[string]interface{}) error {
+	if parseBoolIntent(intentMap, "versioning", false) {
+		if _, err := c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+			Bucket: awsString(bucket),
+			VersioningConfiguration: &s3types.VersioningConfiguration{
+				Status: s3types.BucketVersioningStatusEnabled,
+			},
+		}); err != nil {
+			return fmt.Errorf("s3 put bucket versioning: %w", err)
+		}
+	}
+	kmsKey := intent(intentMap, "kms_key")
+	encryption := intent(intentMap, "encryption")
+	// Only apply encryption config when explicitly requested or on first setup (kms_key or encryption intent present).
+	if kmsKey != "" || encryption != "" {
+		encAlgo := s3types.ServerSideEncryptionAes256
+		var kmsKeyID *string
+		if kmsKey != "" {
+			encAlgo = s3types.ServerSideEncryptionAwsKms
+			kmsKeyID = awsString(kmsKey)
+		}
+		encRule := s3types.ServerSideEncryptionRule{
+			ApplyServerSideEncryptionByDefault: &s3types.ServerSideEncryptionByDefault{
+				SSEAlgorithm:   encAlgo,
+				KMSMasterKeyID: kmsKeyID,
+			},
+		}
+		if _, err := c.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{
+			Bucket: awsString(bucket),
+			ServerSideEncryptionConfiguration: &s3types.ServerSideEncryptionConfiguration{
+				Rules: []s3types.ServerSideEncryptionRule{encRule},
+			},
+		}); err != nil {
+			return fmt.Errorf("s3 put bucket encryption: %w", err)
+		}
+	}
+	if days := parseIntIntent(intentMap, "lifecycle_days", 0); days > 0 {
+		if _, err := c.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+			Bucket: awsString(bucket),
+			LifecycleConfiguration: &s3types.BucketLifecycleConfiguration{
+				Rules: []s3types.LifecycleRule{
+					{
+						ID:     awsString("beecon-expiration"),
+						Status: s3types.ExpirationStatusEnabled,
+						Filter: &s3types.LifecycleRuleFilter{Prefix: awsString("")},
+						Expiration: &s3types.LifecycleExpiration{
+							Days: awsInt32(days),
+						},
+					},
+				},
+			},
+		}); err != nil {
+			return fmt.Errorf("s3 put bucket lifecycle: %w", err)
+		}
+	}
+	return nil
 }
 
 func (e *DefaultExecutor) applyAWSSQS(ctx context.Context, c *sqs.Client, req ApplyRequest) (*ApplyResult, error) {
@@ -462,10 +619,20 @@ func (e *DefaultExecutor) applyAWSSNS(ctx context.Context, c *sns.Client, req Ap
 func (e *DefaultExecutor) applyAWSSecrets(ctx context.Context, c *secretsmanager.Client, req ApplyRequest) (*ApplyResult, error) {
 	name := identifierFor(req.Action.NodeName)
 	id := req.RecordProviderID()
-	secret := defaultString(intent(req.Intent, "secret_value", "password"), "beecon-managed-secret")
+	secret := intent(req.Intent, "secret_value", "password")
 	switch req.Action.Operation {
 	case "CREATE":
-		out, err := c.CreateSecret(ctx, &secretsmanager.CreateSecretInput{Name: awsString(name), SecretString: awsString(secret)})
+		if secret == "" {
+			return nil, fmt.Errorf("secretsmanager create requires intent.secret_value or intent.password")
+		}
+		createIn := &secretsmanager.CreateSecretInput{Name: awsString(name), SecretString: awsString(secret)}
+		if v := intent(req.Intent, "kms_key"); v != "" {
+			createIn.KmsKeyId = awsString(v)
+		}
+		if v := intent(req.Intent, "description"); v != "" {
+			createIn.Description = awsString(v)
+		}
+		out, err := c.CreateSecret(ctx, createIn)
 		if err != nil {
 			return nil, fmt.Errorf("secretsmanager create secret: %w", err)
 		}
@@ -473,6 +640,9 @@ func (e *DefaultExecutor) applyAWSSecrets(ctx context.Context, c *secretsmanager
 			id = *out.ARN
 		}
 	case "UPDATE":
+		if secret == "" {
+			return nil, fmt.Errorf("secretsmanager update requires intent.secret_value or intent.password")
+		}
 		if _, err := c.PutSecretValue(ctx, &secretsmanager.PutSecretValueInput{SecretId: awsString(defaultString(id, name)), SecretString: awsString(secret)}); err != nil {
 			return nil, fmt.Errorf("secretsmanager put secret value: %w", err)
 		}
@@ -487,7 +657,22 @@ func (e *DefaultExecutor) applyAWSSecrets(ctx context.Context, c *secretsmanager
 func (e *DefaultExecutor) applyAWSIAM(ctx context.Context, c *iam.Client, req ApplyRequest) (*ApplyResult, error) {
 	name := identifierFor(req.Action.NodeName)
 	id := req.RecordProviderID()
-	trust := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}`
+	trustService := intent(req.Intent, "trust_service")
+	if trustService == "" {
+		trustService = detectTrustService(req.Intent)
+	}
+	trust, err := trustPolicyForService(trustService)
+	if err != nil {
+		return nil, fmt.Errorf("iam trust policy: %w", err)
+	}
+
+	managedPolicies := stringListFromIntent(req.Intent, "managed_policies")
+	for _, p := range managedPolicies {
+		if !strings.HasPrefix(p, "arn:") {
+			return nil, fmt.Errorf("managed_policies entry %q must start with arn:", p)
+		}
+	}
+
 	switch req.Action.Operation {
 	case "CREATE":
 		out, err := c.CreateRole(ctx, &iam.CreateRoleInput{RoleName: awsString(name), AssumeRolePolicyDocument: awsString(trust)})
@@ -497,12 +682,83 @@ func (e *DefaultExecutor) applyAWSIAM(ctx context.Context, c *iam.Client, req Ap
 		if out.Role != nil && out.Role.Arn != nil {
 			id = *out.Role.Arn
 		}
+		for _, policyArn := range managedPolicies {
+			if _, err := c.AttachRolePolicy(ctx, &iam.AttachRolePolicyInput{
+				RoleName:  awsString(name),
+				PolicyArn: awsString(policyArn),
+			}); err != nil {
+				return nil, fmt.Errorf("iam attach role policy %s: %w", policyArn, err)
+			}
+		}
+	case "UPDATE":
+		if _, err := c.UpdateAssumeRolePolicy(ctx, &iam.UpdateAssumeRolePolicyInput{
+			RoleName:       awsString(name),
+			PolicyDocument: awsString(trust),
+		}); err != nil {
+			return nil, fmt.Errorf("iam update assume role policy: %w", err)
+		}
+		// Diff attached policies: list current → detach removed → attach new
+		currentPolicies, err := listAttachedPolicies(ctx, c, name)
+		if err != nil {
+			return nil, err
+		}
+		desiredSet := make(map[string]bool, len(managedPolicies))
+		for _, p := range managedPolicies {
+			desiredSet[p] = true
+		}
+		currentSet := make(map[string]bool, len(currentPolicies))
+		for _, p := range currentPolicies {
+			currentSet[p] = true
+		}
+		for _, p := range currentPolicies {
+			if !desiredSet[p] {
+				if _, err := c.DetachRolePolicy(ctx, &iam.DetachRolePolicyInput{RoleName: awsString(name), PolicyArn: awsString(p)}); err != nil && !isNotFound(err) {
+					return nil, fmt.Errorf("iam detach role policy %s: %w", p, err)
+				}
+			}
+		}
+		for _, p := range managedPolicies {
+			if !currentSet[p] {
+				if _, err := c.AttachRolePolicy(ctx, &iam.AttachRolePolicyInput{RoleName: awsString(name), PolicyArn: awsString(p)}); err != nil {
+					return nil, fmt.Errorf("iam attach role policy %s: %w", p, err)
+				}
+			}
+		}
 	case "DELETE":
+		// Detach all policies before deleting the role
+		policies, err := listAttachedPolicies(ctx, c, name)
+		if err != nil && !isNotFound(err) {
+			return nil, err
+		}
+		for _, p := range policies {
+			if _, err := c.DetachRolePolicy(ctx, &iam.DetachRolePolicyInput{RoleName: awsString(name), PolicyArn: awsString(p)}); err != nil && !isNotFound(err) {
+				return nil, fmt.Errorf("iam detach role policy before delete %s: %w", p, err)
+			}
+		}
 		if _, err := c.DeleteRole(ctx, &iam.DeleteRoleInput{RoleName: awsString(name)}); err != nil && !isNotFound(err) {
 			return nil, fmt.Errorf("iam delete role: %w", err)
 		}
 	}
 	return &ApplyResult{ProviderID: defaultString(id, name), LiveState: map[string]interface{}{"service": "iam", "role": defaultString(id, name), "operation": req.Action.Operation}}, nil
+}
+
+// listAttachedPolicies returns all policy ARNs attached to an IAM role,
+// paginating through all results.
+func listAttachedPolicies(ctx context.Context, c *iam.Client, roleName string) ([]string, error) {
+	var arns []string
+	paginator := iam.NewListAttachedRolePoliciesPaginator(c, &iam.ListAttachedRolePoliciesInput{RoleName: awsString(roleName)})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("iam list attached role policies: %w", err)
+		}
+		for _, p := range page.AttachedPolicies {
+			if p.PolicyArn != nil {
+				arns = append(arns, *p.PolicyArn)
+			}
+		}
+	}
+	return arns, nil
 }
 
 func (e *DefaultExecutor) applyAWSEC2(ctx context.Context, c *ec2.Client, req ApplyRequest, target string) (*ApplyResult, error) {
@@ -552,18 +808,58 @@ func (e *DefaultExecutor) applyAWSEC2(ctx context.Context, c *ec2.Client, req Ap
 			}
 		}
 	case "security_group":
+		desc := defaultString(intent(req.Intent, "description"), "beecon managed security group")
 		switch req.Action.Operation {
 		case "CREATE":
 			vpcID := intent(req.Intent, "vpc_id")
 			if vpcID == "" {
 				return nil, fmt.Errorf("security group create requires intent.vpc_id")
 			}
-			out, err := c.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{VpcId: awsString(vpcID), GroupName: awsString(name), Description: awsString("beecon managed security group")})
+			out, err := c.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{VpcId: awsString(vpcID), GroupName: awsString(name), Description: awsString(desc)})
 			if err != nil {
 				return nil, fmt.Errorf("ec2 create security group: %w", err)
 			}
 			if out.GroupId != nil {
 				id = *out.GroupId
+			}
+			if err := applySGRules(ctx, c, id, req.Intent); err != nil {
+				return nil, err
+			}
+		case "UPDATE":
+			if id == "" {
+				return nil, fmt.Errorf("security group update requires provider id")
+			}
+			// Safe update: authorize new rules first (additive), then revoke stale rules.
+			// This avoids a window where the SG has no rules at all.
+			descOut, err := c.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{GroupIds: []string{id}})
+			if err != nil {
+				return nil, fmt.Errorf("ec2 describe security group for update: %w", err)
+			}
+			// Authorize new rules first (duplicates are idempotent in AWS)
+			if err := applySGRules(ctx, c, id, req.Intent); err != nil {
+				return nil, err
+			}
+			// Now revoke old rules that aren't in the new set
+			if len(descOut.SecurityGroups) > 0 {
+				sg := descOut.SecurityGroups[0]
+				newIngress, err := buildNewPermsFromIntent(req.Intent, "ingress")
+				if err != nil {
+					return nil, err
+				}
+				newEgress, err := buildNewPermsFromIntent(req.Intent, "egress")
+				if err != nil {
+					return nil, err
+				}
+				if stale := diffIPPermissions(sg.IpPermissions, newIngress); len(stale) > 0 {
+					if _, err := c.RevokeSecurityGroupIngress(ctx, &ec2.RevokeSecurityGroupIngressInput{GroupId: awsString(id), IpPermissions: stale}); err != nil {
+						return nil, fmt.Errorf("ec2 revoke stale ingress: %w", err)
+					}
+				}
+				if stale := diffIPPermissions(sg.IpPermissionsEgress, newEgress); len(stale) > 0 {
+					if _, err := c.RevokeSecurityGroupEgress(ctx, &ec2.RevokeSecurityGroupEgressInput{GroupId: awsString(id), IpPermissions: stale}); err != nil {
+						return nil, fmt.Errorf("ec2 revoke stale egress: %w", err)
+					}
+				}
 			}
 		case "DELETE":
 			if id == "" {
@@ -601,6 +897,8 @@ func (e *DefaultExecutor) applyAWSEC2(ctx context.Context, c *ec2.Client, req Ap
 			if id == "" {
 				return nil, fmt.Errorf("ec2 update requires provider id")
 			}
+			// NOTE: Changing instance type requires the instance to be stopped.
+			// AWS will return IncorrectInstanceState if the instance is running.
 			instanceType := defaultString(intent(req.Intent, "instance_type"), "")
 			if instanceType != "" {
 				_, err := c.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
@@ -637,12 +935,29 @@ func (e *DefaultExecutor) applyAWSElastiCache(ctx context.Context, c *elasticach
 				numNodes = int32(parsed)
 			}
 		}
-		_, err := c.CreateCacheCluster(ctx, &elasticache.CreateCacheClusterInput{
+		createIn := &elasticache.CreateCacheClusterInput{
 			CacheClusterId: awsString(id),
 			Engine:         awsString(engine),
 			CacheNodeType:  awsString(nodeType),
 			NumCacheNodes:  awsInt32(numNodes),
-		})
+		}
+		if v := intent(req.Intent, "parameter_group"); v != "" {
+			createIn.CacheParameterGroupName = awsString(v)
+		}
+		if v := intent(req.Intent, "subnet_group"); v != "" {
+			createIn.CacheSubnetGroupName = awsString(v)
+		}
+		if sgs := stringListFromIntent(req.Intent, "security_group_ids"); len(sgs) > 0 {
+			createIn.SecurityGroupIds = sgs
+		}
+		if v := intent(req.Intent, "auth_token"); v != "" {
+			createIn.AuthToken = awsString(v)
+			createIn.TransitEncryptionEnabled = awsBool(true)
+		}
+		if v := parseIntIntent(req.Intent, "snapshot_retention", 0); v > 0 {
+			createIn.SnapshotRetentionLimit = awsInt32(v)
+		}
+		_, err := c.CreateCacheCluster(ctx, createIn)
 		if err != nil {
 			return nil, fmt.Errorf("elasticache create cache cluster: %w", err)
 		}
@@ -658,6 +973,19 @@ func (e *DefaultExecutor) applyAWSElastiCache(ctx context.Context, c *elasticach
 			if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
 				in.NumCacheNodes = awsInt32(int32(parsed))
 			}
+		}
+		if v := intent(req.Intent, "parameter_group"); v != "" {
+			in.CacheParameterGroupName = awsString(v)
+		}
+		if sgs := stringListFromIntent(req.Intent, "security_group_ids"); len(sgs) > 0 {
+			in.SecurityGroupIds = sgs
+		}
+		if v := parseIntIntent(req.Intent, "snapshot_retention", 0); v > 0 {
+			in.SnapshotRetentionLimit = awsInt32(v)
+		}
+		if v := intent(req.Intent, "auth_token"); v != "" {
+			in.AuthToken = awsString(v)
+			in.AuthTokenUpdateStrategy = elasticachetypes.AuthTokenUpdateStrategyTypeRotate
 		}
 		if _, err := c.ModifyCacheCluster(ctx, in); err != nil {
 			return nil, fmt.Errorf("elasticache modify cache cluster: %w", err)
@@ -928,7 +1256,24 @@ func (e *DefaultExecutor) observeAWS(ctx context.Context, region string, rec *st
 			return &ObserveResult{Exists: false, ProviderID: id, LiveState: map[string]interface{}{}}, nil
 		}
 		db := out.DBInstances[0]
-		return &ObserveResult{Exists: true, ProviderID: id, LiveState: map[string]interface{}{"service": "rds", "status": stringValue(db.DBInstanceStatus), "engine": stringValue(db.Engine), "instance_type": stringValue(db.DBInstanceClass), "allocated_storage_gb": intValue(db.AllocatedStorage)}}, nil
+		live := map[string]interface{}{
+			"service":              "rds",
+			"status":              stringValue(db.DBInstanceStatus),
+			"engine":              stringValue(db.Engine),
+			"instance_type":       stringValue(db.DBInstanceClass),
+			"allocated_storage_gb": intValue(db.AllocatedStorage),
+			"storage_type": stringValue(db.StorageType),
+		}
+		if db.DeletionProtection != nil {
+			live["deletion_protection"] = *db.DeletionProtection
+		}
+		if db.MultiAZ != nil {
+			live["multi_az"] = *db.MultiAZ
+		}
+		if db.BackupRetentionPeriod != nil {
+			live["backup_retention_period"] = *db.BackupRetentionPeriod
+		}
+		return &ObserveResult{Exists: true, ProviderID: id, LiveState: live}, nil
 	case "s3":
 		bucket := rec.ProviderID
 		if bucket == "" {
@@ -943,7 +1288,30 @@ func (e *DefaultExecutor) observeAWS(ctx context.Context, region string, rec *st
 			}
 			return nil, fmt.Errorf("s3 head bucket: %w", err)
 		}
-		return &ObserveResult{Exists: true, ProviderID: bucket, LiveState: map[string]interface{}{"service": "s3", "bucket": bucket}}, nil
+		live := map[string]interface{}{"service": "s3", "bucket": bucket}
+		if vOut, err := c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: awsString(bucket)}); err == nil {
+			live["versioning"] = string(vOut.Status) == "Enabled"
+		}
+		if eOut, err := c.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: awsString(bucket)}); err == nil && eOut.ServerSideEncryptionConfiguration != nil {
+			for _, rule := range eOut.ServerSideEncryptionConfiguration.Rules {
+				if rule.ApplyServerSideEncryptionByDefault != nil {
+					live["encryption"] = string(rule.ApplyServerSideEncryptionByDefault.SSEAlgorithm)
+					if rule.ApplyServerSideEncryptionByDefault.KMSMasterKeyID != nil {
+						live["kms_key_id"] = *rule.ApplyServerSideEncryptionByDefault.KMSMasterKeyID
+					}
+					break
+				}
+			}
+		}
+		if lcOut, err := c.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: awsString(bucket)}); err == nil {
+			for _, rule := range lcOut.Rules {
+				if rule.Expiration != nil && rule.Expiration.Days != nil {
+					live["lifecycle_days"] = *rule.Expiration.Days
+					break
+				}
+			}
+		}
+		return &ObserveResult{Exists: true, ProviderID: bucket, LiveState: live}, nil
 	case "sqs":
 		q := sqs.NewFromConfig(cfg)
 		url := rec.ProviderID
@@ -1003,6 +1371,12 @@ func (e *DefaultExecutor) observeAWS(ctx context.Context, region string, rec *st
 		if out.Name != nil {
 			live["name"] = *out.Name
 		}
+		if out.KmsKeyId != nil {
+			live["kms_key_id"] = *out.KmsKeyId
+		}
+		if out.Description != nil {
+			live["description"] = *out.Description
+		}
 		return &ObserveResult{Exists: true, ProviderID: id, LiveState: live}, nil
 	case "iam":
 		roleName := identifierFor(rec.NodeName)
@@ -1018,7 +1392,33 @@ func (e *DefaultExecutor) observeAWS(ctx context.Context, region string, rec *st
 		if out.Role != nil && out.Role.Arn != nil {
 			arn = *out.Role.Arn
 		}
-		return &ObserveResult{Exists: true, ProviderID: defaultString(rec.ProviderID, arn), LiveState: map[string]interface{}{"service": "iam", "role_name": roleName, "arn": arn}}, nil
+		live := map[string]interface{}{"service": "iam", "role_name": roleName, "arn": arn}
+		if policyArns, err := listAttachedPolicies(ctx, s, roleName); err == nil {
+			live["attached_policies"] = policyArns
+		}
+		// Extract trust_service from assume role policy document.
+		if out.Role != nil && out.Role.AssumeRolePolicyDocument != nil {
+			if decoded, err := url.QueryUnescape(*out.Role.AssumeRolePolicyDocument); err == nil {
+				var doc struct {
+					Statement []struct {
+						Principal struct {
+							Service interface{} `json:"Service"`
+						} `json:"Principal"`
+					} `json:"Statement"`
+				}
+				if err := json.Unmarshal([]byte(decoded), &doc); err == nil && len(doc.Statement) > 0 {
+					switch v := doc.Statement[0].Principal.Service.(type) {
+					case string:
+						live["trust_service"] = v
+					case []interface{}:
+						if len(v) > 0 {
+							live["trust_service"] = fmt.Sprint(v[0])
+						}
+					}
+				}
+			}
+		}
+		return &ObserveResult{Exists: true, ProviderID: defaultString(rec.ProviderID, arn), LiveState: live}, nil
 	case "vpc":
 		id := rec.ProviderID
 		if id == "" {
@@ -1069,7 +1469,11 @@ func (e *DefaultExecutor) observeAWS(ctx context.Context, region string, rec *st
 		if len(out.SecurityGroups) == 0 {
 			return &ObserveResult{Exists: false, ProviderID: id, LiveState: map[string]interface{}{}}, nil
 		}
-		return &ObserveResult{Exists: true, ProviderID: id, LiveState: map[string]interface{}{"service": "ec2", "resource": "security_group", "id": id}}, nil
+		sg := out.SecurityGroups[0]
+		sgLive := map[string]interface{}{"service": "ec2", "resource": "security_group", "id": id}
+		sgLive["ingress"] = serializeSGRules(sg.IpPermissions)
+		sgLive["egress"] = serializeSGRules(sg.IpPermissionsEgress)
+		return &ObserveResult{Exists: true, ProviderID: id, LiveState: sgLive}, nil
 	case "ec2":
 		id := rec.ProviderID
 		if id == "" {
@@ -1105,7 +1509,59 @@ func (e *DefaultExecutor) observeAWS(ctx context.Context, region string, rec *st
 			return &ObserveResult{Exists: false, ProviderID: id, LiveState: map[string]interface{}{}}, nil
 		}
 		cluster := out.CacheClusters[0]
-		return &ObserveResult{Exists: true, ProviderID: id, LiveState: map[string]interface{}{"service": "elasticache", "cache_cluster_id": id, "status": stringValue(cluster.CacheClusterStatus), "engine": stringValue(cluster.Engine), "node_type": stringValue(cluster.CacheNodeType)}}, nil
+		ecLive := map[string]interface{}{
+			"service":          "elasticache",
+			"cache_cluster_id": id,
+			"status":           stringValue(cluster.CacheClusterStatus),
+			"engine":           stringValue(cluster.Engine),
+			"node_type":        stringValue(cluster.CacheNodeType),
+		}
+		if cluster.CacheParameterGroup != nil {
+			ecLive["parameter_group"] = stringValue(cluster.CacheParameterGroup.CacheParameterGroupName)
+		}
+		if len(cluster.SecurityGroups) > 0 {
+			sgIDs := make([]string, 0, len(cluster.SecurityGroups))
+			for _, sg := range cluster.SecurityGroups {
+				if sg.SecurityGroupId != nil {
+					sgIDs = append(sgIDs, *sg.SecurityGroupId)
+				}
+			}
+			ecLive["security_groups"] = sgIDs
+		}
+		return &ObserveResult{Exists: true, ProviderID: id, LiveState: ecLive}, nil
+	case "lambda":
+		name := rec.ProviderID
+		if name == "" {
+			name = trimResourceName(identifierFor(rec.NodeName), 64)
+		}
+		lc := lambda.NewFromConfig(cfg)
+		lOut, err := lc.GetFunction(ctx, &lambda.GetFunctionInput{FunctionName: awsString(name)})
+		if err != nil {
+			if isNotFound(err) {
+				return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
+			}
+			return nil, fmt.Errorf("lambda get function: %w", err)
+		}
+		lambdaLive := map[string]interface{}{"service": "lambda"}
+		if lOut.Configuration != nil {
+			lambdaLive["runtime"] = string(lOut.Configuration.Runtime)
+			if lOut.Configuration.MemorySize != nil {
+				lambdaLive["memory_size"] = *lOut.Configuration.MemorySize
+			}
+			if lOut.Configuration.Timeout != nil {
+				lambdaLive["timeout"] = *lOut.Configuration.Timeout
+			}
+			lambdaLive["handler"] = stringValue(lOut.Configuration.Handler)
+			lambdaLive["last_modified"] = stringValue(lOut.Configuration.LastModified)
+			if lOut.Configuration.Environment != nil && lOut.Configuration.Environment.Variables != nil {
+				envVars := make(map[string]interface{}, len(lOut.Configuration.Environment.Variables))
+				for k, v := range lOut.Configuration.Environment.Variables {
+					envVars[k] = v
+				}
+				lambdaLive["environment"] = security.ScrubMap(envVars)
+			}
+		}
+		return &ObserveResult{Exists: true, ProviderID: name, LiveState: lambdaLive}, nil
 	case "cloudfront":
 		id := rec.ProviderID
 		if id == "" {
@@ -1312,7 +1768,10 @@ func detectAWSTarget(req ApplyRequest) string {
 			return "ec2"
 		}
 	}
-	// fallback heuristics from fields — sorted for deterministic results.
+	// Fallback heuristics from fields — sorted for deterministic results.
+	// NOTE: This is intentionally greedy and may produce false positives
+	// (e.g., a description containing "s3" would match target "s3").
+	// The primary detection above should handle all well-formed intents.
 	intentKeys := make([]string, 0, len(req.Intent))
 	for k := range req.Intent {
 		intentKeys = append(intentKeys, k)
@@ -1352,6 +1811,8 @@ func detectRecordTarget(rec *state.ResourceRecord) string {
 			return "secrets_manager"
 		case "iam":
 			return "iam"
+		case "lambda":
+			return "lambda"
 		case "elasticache":
 			return "elasticache"
 		case "cloudfront":
@@ -1411,6 +1872,9 @@ func detectRecordTarget(rec *state.ResourceRecord) string {
 	}
 	if rec.NodeType == "SERVICE" {
 		runtime := strings.ToLower(fmt.Sprint(rec.IntentSnapshot["intent.runtime"]))
+		if strings.Contains(runtime, "lambda") {
+			return "lambda"
+		}
 		if strings.Contains(runtime, "sqs") {
 			return "sqs"
 		}
@@ -1566,7 +2030,18 @@ func isNotFound(err error) bool {
 		switch apiErr.ErrorCode() {
 		case "NotFoundException", "ResourceNotFoundException", "NoSuchEntity",
 			"NoSuchBucket", "DBInstanceNotFoundFault", "CacheClusterNotFound",
-			"ClusterNotFoundException":
+			"ClusterNotFoundException",
+			// EC2
+			"InvalidGroup.NotFound", "InvalidInstanceID.NotFound",
+			"InvalidSubnetID.NotFound", "InvalidVpcID.NotFound",
+			// CloudFront / Route53
+			"NoSuchDistribution", "NoSuchHostedZone",
+			// ElastiCache / SQS / RDS
+			"ReplicationGroupNotFoundFault", "QueueDoesNotExist",
+			"AWS.SimpleQueueService.NonExistentQueue",
+			"DBParameterGroupNotFoundFault",
+			// Cognito
+			"UserPoolNotFoundException":
 			return true
 		}
 	}
@@ -1632,4 +2107,334 @@ func intValue(p *int32) int32 {
 func toJSON(v interface{}) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// --- C0: Helpers + Validation Framework ---
+
+// SGRule represents a parsed security group rule in compact format.
+type SGRule struct {
+	Protocol string // tcp, udp, icmp, -1
+	FromPort int32
+	ToPort   int32
+	CIDR     string
+}
+
+// parseIntIntent reads a string-valued intent key and converts to int32 with fallback.
+func parseIntIntent(m map[string]interface{}, key string, fallback int32) int32 {
+	raw := strings.TrimSpace(intent(m, key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return int32(n)
+}
+
+// parseBoolIntent reads a string-valued intent key and converts to bool.
+// Accepts "true"/"1" as true, everything else as false.
+func parseBoolIntent(m map[string]interface{}, key string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(intent(m, key)))
+	if raw == "" {
+		return fallback
+	}
+	return raw == "true" || raw == "1"
+}
+
+// envFromIntent extracts env.* prefixed keys into a plain map.
+// e.g. intent key "env.DB_HOST" → map entry "DB_HOST".
+func envFromIntent(m map[string]interface{}) map[string]string {
+	out := make(map[string]string)
+	for k, v := range m {
+		if strings.HasPrefix(k, "intent.env.") {
+			envKey := strings.TrimPrefix(k, "intent.env.")
+			if envKey != "" {
+				out[envKey] = strings.TrimSpace(fmt.Sprint(v))
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// validServicePrincipal validates that a service principal matches the expected AWS format.
+var validServicePrincipal = regexp.MustCompile(`^[a-z0-9\-]+(\.[a-z0-9\-]+)*\.amazonaws\.com$`)
+
+// trustPolicyForService generates an assume-role trust policy JSON document
+// for a given AWS service principal. Returns an error if the service doesn't
+// match the expected format (prevents JSON injection).
+func trustPolicyForService(service string) (string, error) {
+	if !validServicePrincipal.MatchString(service) {
+		return "", fmt.Errorf("invalid service principal %q: must match <service>.amazonaws.com", service)
+	}
+	return fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"%s"},"Action":"sts:AssumeRole"}]}`, service), nil
+}
+
+// parseSecurityGroupRules parses the compact rule format: "tcp:443:10.0.0.0/16"
+// Supports port ranges: "tcp:8000-8080:10.0.0.0/16"
+// ICMP uses port -1: "icmp:-1:0.0.0.0/0"
+// All traffic: "-1:0:0.0.0.0/0"
+func parseSecurityGroupRules(raw string) ([]SGRule, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		raw = strings.TrimSpace(raw[1 : len(raw)-1])
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	rules := make([]SGRule, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		segments := strings.SplitN(p, ":", 3)
+		if len(segments) != 3 {
+			return nil, fmt.Errorf("invalid security group rule %q: expected protocol:port:cidr", p)
+		}
+		protocol := strings.ToLower(strings.TrimSpace(segments[0]))
+		switch protocol {
+		case "tcp", "udp", "icmp", "-1":
+		default:
+			return nil, fmt.Errorf("invalid protocol %q in rule %q: must be tcp, udp, icmp, or -1", protocol, p)
+		}
+		portStr := strings.TrimSpace(segments[1])
+		cidr := strings.TrimSpace(segments[2])
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q in rule %q: %w", cidr, p, err)
+		}
+		var fromPort, toPort int32
+		// Check for port range (e.g., "8000-8080") but not negative numbers (e.g., "-1").
+		// A range has a dash that is not at position 0.
+		if idx := strings.Index(portStr, "-"); idx > 0 {
+			from, err := strconv.Atoi(strings.TrimSpace(portStr[:idx]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid from port in rule %q: %w", p, err)
+			}
+			to, err := strconv.Atoi(strings.TrimSpace(portStr[idx+1:]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid to port in rule %q: %w", p, err)
+			}
+			fromPort, toPort = int32(from), int32(to)
+		} else {
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port in rule %q: %w", p, err)
+			}
+			fromPort, toPort = int32(port), int32(port)
+		}
+		// Validate port ranges per protocol
+		switch protocol {
+		case "tcp", "udp":
+			if fromPort < 0 || toPort > 65535 || fromPort > toPort {
+				return nil, fmt.Errorf("invalid port range %d-%d in rule %q: tcp/udp ports must be 0-65535 with from <= to", fromPort, toPort, p)
+			}
+		case "icmp":
+			// ICMP uses -1 for type/code meaning "all"
+		case "-1":
+			// All traffic — ports are ignored by AWS
+		}
+		rules = append(rules, SGRule{Protocol: protocol, FromPort: fromPort, ToPort: toPort, CIDR: cidr})
+	}
+	return rules, nil
+}
+
+// serializeSGRules converts SDK IpPermission structs back to compact string format.
+func serializeSGRules(perms []ec2types.IpPermission) string {
+	if len(perms) == 0 {
+		return "[]"
+	}
+	parts := make([]string, 0)
+	for _, p := range perms {
+		proto := "-1"
+		if p.IpProtocol != nil {
+			proto = *p.IpProtocol
+		}
+		var from, to int32
+		if p.FromPort != nil {
+			from = *p.FromPort
+		}
+		if p.ToPort != nil {
+			to = *p.ToPort
+		}
+		for _, r := range p.IpRanges {
+			cidr := ""
+			if r.CidrIp != nil {
+				cidr = *r.CidrIp
+			}
+			portStr := fmt.Sprintf("%d", from)
+			if from != to {
+				portStr = fmt.Sprintf("%d-%d", from, to)
+			}
+			parts = append(parts, fmt.Sprintf("%s:%s:%s", proto, portStr, cidr))
+		}
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// buildNewPermsFromIntent parses intent rules and returns SDK IpPermissions.
+// Returns nil, nil if the intent key is empty.
+func buildNewPermsFromIntent(intentMap map[string]interface{}, key string) ([]ec2types.IpPermission, error) {
+	raw := intent(intentMap, key)
+	if raw == "" {
+		return nil, nil
+	}
+	rules, err := parseSecurityGroupRules(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s rules: %w", key, err)
+	}
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	return sgRulesToIPPermissions(rules), nil
+}
+
+// diffIPPermissions returns permissions in old that are not present in new.
+// Comparison is by serialized compact format for simplicity.
+func diffIPPermissions(old, new []ec2types.IpPermission) []ec2types.IpPermission {
+	if len(old) == 0 {
+		return nil
+	}
+	newSet := make(map[string]bool, len(new))
+	for _, p := range new {
+		key := ipPermissionKey(p)
+		newSet[key] = true
+	}
+	var stale []ec2types.IpPermission
+	for _, p := range old {
+		key := ipPermissionKey(p)
+		if !newSet[key] {
+			stale = append(stale, p)
+		}
+	}
+	return stale
+}
+
+// ipPermissionKey creates a string key for an IpPermission for set comparison.
+func ipPermissionKey(p ec2types.IpPermission) string {
+	proto := "-1"
+	if p.IpProtocol != nil {
+		proto = *p.IpProtocol
+	}
+	var from, to int32
+	if p.FromPort != nil {
+		from = *p.FromPort
+	}
+	if p.ToPort != nil {
+		to = *p.ToPort
+	}
+	var cidrs []string
+	for _, r := range p.IpRanges {
+		if r.CidrIp != nil {
+			cidrs = append(cidrs, *r.CidrIp)
+		}
+	}
+	sort.Strings(cidrs)
+	return fmt.Sprintf("%s:%d:%d:%s", proto, from, to, strings.Join(cidrs, ","))
+}
+
+// sgRulesToIPPermissions converts parsed SGRules to SDK IpPermission structs.
+func sgRulesToIPPermissions(rules []SGRule) []ec2types.IpPermission {
+	perms := make([]ec2types.IpPermission, 0, len(rules))
+	for _, r := range rules {
+		perms = append(perms, ec2types.IpPermission{
+			IpProtocol: awsString(r.Protocol),
+			FromPort:   awsInt32(r.FromPort),
+			ToPort:     awsInt32(r.ToPort),
+			IpRanges:   []ec2types.IpRange{{CidrIp: awsString(r.CIDR)}},
+		})
+	}
+	return perms
+}
+
+// applySGRules parses and applies ingress/egress rules to a security group.
+func applySGRules(ctx context.Context, c *ec2.Client, sgID string, intentMap map[string]interface{}) error {
+	if raw := intent(intentMap, "ingress"); raw != "" {
+		rules, err := parseSecurityGroupRules(raw)
+		if err != nil {
+			return fmt.Errorf("ec2 parse ingress rules: %w", err)
+		}
+		if len(rules) > 0 {
+			if _, err := c.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
+				GroupId:       awsString(sgID),
+				IpPermissions: sgRulesToIPPermissions(rules),
+			}); err != nil {
+				return fmt.Errorf("ec2 authorize ingress: %w", err)
+			}
+		}
+	}
+	if raw := intent(intentMap, "egress"); raw != "" {
+		rules, err := parseSecurityGroupRules(raw)
+		if err != nil {
+			return fmt.Errorf("ec2 parse egress rules: %w", err)
+		}
+		if len(rules) > 0 {
+			if _, err := c.AuthorizeSecurityGroupEgress(ctx, &ec2.AuthorizeSecurityGroupEgressInput{
+				GroupId:       awsString(sgID),
+				IpPermissions: sgRulesToIPPermissions(rules),
+			}); err != nil {
+				return fmt.Errorf("ec2 authorize egress: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// validateAWSInput performs input validation per AWS target type.
+func validateAWSInput(target string, intentMap map[string]interface{}) error {
+	switch target {
+	case "lambda":
+		mem := parseIntIntent(intentMap, "memory", 128)
+		if mem < 128 || mem > 10240 {
+			return fmt.Errorf("lambda memory must be 128-10240 MB, got %d", mem)
+		}
+		timeout := parseIntIntent(intentMap, "timeout", 30)
+		if timeout < 1 || timeout > 900 {
+			return fmt.Errorf("lambda timeout must be 1-900 seconds, got %d", timeout)
+		}
+	case "rds":
+		if iops := intent(intentMap, "iops"); iops != "" {
+			storageType := defaultString(intent(intentMap, "storage_type"), "gp3")
+			switch storageType {
+			case "io1", "io2", "gp3":
+			default:
+				return fmt.Errorf("iops requires storage_type io1, io2, or gp3, got %q", storageType)
+			}
+		}
+	case "iam":
+		for _, p := range stringListFromIntent(intentMap, "managed_policies") {
+			if !strings.HasPrefix(p, "arn:") {
+				return fmt.Errorf("managed_policies entry %q must start with arn:", p)
+			}
+		}
+		if svc := intent(intentMap, "trust_service"); svc != "" {
+			if !validServicePrincipal.MatchString(svc) {
+				return fmt.Errorf("invalid trust_service %q: must match <service>.amazonaws.com", svc)
+			}
+		}
+	}
+	return nil
+}
+
+// detectTrustService auto-detects the AWS service principal for IAM trust policies
+// based on the runtime hint in the intent map.
+func detectTrustService(intentMap map[string]interface{}) string {
+	runtime := strings.ToLower(intent(intentMap, "runtime"))
+	switch {
+	case strings.Contains(runtime, "lambda"):
+		return "lambda.amazonaws.com"
+	case strings.Contains(runtime, "ec2"):
+		return "ec2.amazonaws.com"
+	case strings.Contains(runtime, "eks"):
+		return "eks.amazonaws.com"
+	default:
+		return "ecs-tasks.amazonaws.com"
+	}
 }
