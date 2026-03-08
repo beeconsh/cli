@@ -1,7 +1,9 @@
 package state
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -144,4 +146,20 @@ func TestDoubleRollbackIsNoop(t *testing.T) {
 	tx.Rollback()
 	// Second rollback should be a no-op, not panic
 	tx.Rollback()
+}
+
+func TestLoadRejectsFutureVersion(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, ".beecon")
+	os.MkdirAll(stateDir, 0o755)
+	os.WriteFile(filepath.Join(stateDir, "state.json"), []byte(`{"version": 999}`), 0o600)
+
+	store := NewStore(dir)
+	_, err := store.Load()
+	if err == nil {
+		t.Fatal("expected error loading future version state")
+	}
+	if !strings.Contains(err.Error(), "newer than this beecon") {
+		t.Errorf("unexpected error: %v", err)
+	}
 }

@@ -368,7 +368,6 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		RequestID string `json:"request_id"`
-		Approver  string `json:"approver"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
@@ -378,10 +377,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request_id required"})
 		return
 	}
-	if req.Approver == "" {
-		req.Approver = "api-user"
-	}
-	res, err := s.engine.Approve(r.Context(), req.RequestID, req.Approver)
+	res, err := s.engine.Approve(r.Context(), req.RequestID, "api-user")
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -397,7 +393,6 @@ func (s *Server) reject(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		RequestID string `json:"request_id"`
-		Approver  string `json:"approver"`
 		Reason    string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -408,13 +403,10 @@ func (s *Server) reject(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request_id required"})
 		return
 	}
-	if req.Approver == "" {
-		req.Approver = "api-user"
-	}
 	if req.Reason == "" {
 		req.Reason = "rejected by api-user"
 	}
-	if err := s.engine.Reject(r.Context(), req.RequestID, req.Approver, req.Reason); err != nil {
+	if err := s.engine.Reject(r.Context(), req.RequestID, "api-user", req.Reason); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
