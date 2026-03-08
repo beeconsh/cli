@@ -3,6 +3,7 @@ package provider
 import (
 	"testing"
 
+	"github.com/terracotta-ai/beecon/internal/classify"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
 
@@ -1475,6 +1476,46 @@ func TestECSDryRunUpdateDesiredCountOnly(t *testing.T) {
 
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func TestDetectAWSTargetMatchesClassify(t *testing.T) {
+	cases := []struct {
+		nodeType string
+		intent   map[string]string
+		want     string
+	}{
+		{"STORE", map[string]string{"engine": "postgres"}, "rds"},
+		{"STORE", map[string]string{"engine": "redis"}, "elasticache"},
+		{"STORE", map[string]string{"engine": "s3"}, "s3"},
+		{"STORE", map[string]string{"engine": "sqs"}, "sqs"},
+		{"STORE", map[string]string{"engine": "sns"}, "sns"},
+		{"STORE", map[string]string{"engine": "secret"}, "secrets_manager"},
+		{"NETWORK", map[string]string{"topology": "vpc"}, "vpc"},
+		{"NETWORK", map[string]string{"engine": "security_group"}, "security_group"},
+		{"NETWORK", map[string]string{"engine": "alb"}, "alb"},
+		{"SERVICE", map[string]string{"runtime": "lambda"}, "lambda"},
+		{"SERVICE", map[string]string{"runtime": "container(from: ./Dockerfile)"}, "ecs"},
+		{"COMPUTE", map[string]string{"engine": "eventbridge"}, "eventbridge"},
+	}
+	for _, tc := range cases {
+		// Build executor-format intent (with intent. prefix)
+		executorIntent := make(map[string]interface{})
+		for k, v := range tc.intent {
+			executorIntent["intent."+k] = v
+		}
+		req := ApplyRequest{
+			Action: &state.PlanAction{NodeType: tc.nodeType},
+			Intent: executorIntent,
+		}
+		got := detectAWSTarget(req)
+		classifyGot := classify.ClassifyNode(tc.nodeType, tc.intent)
+		if got != tc.want {
+			t.Errorf("detectAWSTarget(%s, %v) = %q, want %q", tc.nodeType, tc.intent, got, tc.want)
+		}
+		if got != classifyGot {
+			t.Errorf("detectAWSTarget(%s) = %q but ClassifyNode = %q — divergence!", tc.nodeType, got, classifyGot)
+		}
+	}
 }
 
 func containsHelper(s, substr string) bool {
