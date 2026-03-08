@@ -12,9 +12,12 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/terracotta-ai/beecon/internal/api"
 	"github.com/terracotta-ai/beecon/internal/btest"
+	"github.com/terracotta-ai/beecon/internal/cli"
 	"github.com/terracotta-ai/beecon/internal/cost"
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/scaffold"
+	"github.com/terracotta-ai/beecon/internal/security"
+	"github.com/terracotta-ai/beecon/internal/state"
 	"github.com/terracotta-ai/beecon/internal/ui"
 	"github.com/terracotta-ai/beecon/internal/witness"
 )
@@ -80,6 +83,17 @@ var planCmd = &cobra.Command{
 			return err
 		}
 
+		if formatFlag == "json" {
+			for i := range res.Graph.Nodes {
+				res.Graph.Nodes[i].Intent = security.ScrubStringMap(res.Graph.Nodes[i].Intent)
+				res.Graph.Nodes[i].Env = security.ScrubStringMap(res.Graph.Nodes[i].Env)
+			}
+			for _, a := range res.Plan.Actions {
+				a.Changes = security.ScrubChanges(a.Changes)
+			}
+			return cli.WriteJSON(os.Stdout, res)
+		}
+
 		// Domain header
 		domainName := ""
 		if res.Graph.Domain != nil {
@@ -129,6 +143,33 @@ var planCmd = &cobra.Command{
 				annotation = out.Dim(fmt.Sprintf("%s depends on %s", out.Arrow(), strings.Join(a.DependsOn, ", ")))
 			}
 			out.NumberedAction(i+1, a.Operation, a.NodeID, annotation)
+
+			// Show diff details for CREATE/UPDATE/DELETE
+			if a.Operation == "CREATE" {
+				node := res.Graph.NodeByName(a.NodeName)
+				if node != nil {
+					for _, k := range sortedKeys(node.Intent) {
+						if k == "inline_policy" {
+							continue // too verbose
+						}
+						v := node.Intent[k]
+						if security.IsSensitiveKey(k) {
+							v = "**REDACTED**"
+						}
+						out.DiffLine("CREATE", k, v)
+					}
+				}
+			} else if a.Operation == "DELETE" {
+				out.DiffLine("DELETE", a.NodeID, "(removed)")
+			} else if a.Operation == "UPDATE" && len(a.Changes) > 0 {
+				for _, k := range sortedKeys(a.Changes) {
+					v := a.Changes[k]
+					if security.IsSensitiveKey(k) {
+						v = "**REDACTED**"
+					}
+					out.DiffLine("UPDATE", k, v)
+				}
+			}
 		}
 
 		if approvalCount > 0 {
@@ -193,6 +234,14 @@ var applyCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+
+		if formatFlag == "json" {
+			for i := range res.Actions {
+				res.Actions[i].Action.Changes = security.ScrubChanges(res.Actions[i].Action.Changes)
+			}
+			return cli.WriteJSON(os.Stdout, res)
+		}
+
 		out.Blank()
 
 		// Run header with sim/live mode
@@ -220,10 +269,28 @@ var applyCmd = &cobra.Command{
 			}
 		}
 
-		if res.ApprovalRequestID != "" {
+		if res.ApprovalRequestID != "" && res.Pending > 0 {
 			out.Blank()
-			out.Next(fmt.Sprintf("run `beecon approve %s` to approve", res.ApprovalRequestID),
-				"the pending action(s).")
+			approved := false
+			if yesFlag {
+				approved = true
+			} else if out.ColorEnabled() {
+				approved = out.Confirm(fmt.Sprintf("Approve %d pending action(s)? [y/N]", res.Pending))
+			}
+			if approved {
+				approveRes, err := eng.Approve(cmd.Context(), res.ApprovalRequestID, "cli-user")
+				if err != nil {
+					return err
+				}
+				out.Blank()
+				out.Line(out.Green(out.OK()), "Approved and executed %d action(s)", approveRes.Executed)
+				for _, ao := range approveRes.Actions {
+					out.ActionLine(out.Green(out.OK()), ao.Action.Operation, ao.Action.NodeID, "")
+				}
+			} else {
+				out.Next(fmt.Sprintf("run `beecon approve %s` to approve", res.ApprovalRequestID),
+					"the pending action(s).")
+			}
 		}
 		return nil
 	},
@@ -239,6 +306,18 @@ var statusCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+
+		if formatFlag == "json" {
+			for _, rec := range st.Resources {
+				rec.IntentSnapshot = security.ScrubMap(rec.IntentSnapshot)
+				rec.LiveState = security.ScrubMap(rec.LiveState)
+			}
+			for _, a := range st.Actions {
+				a.Changes = security.ScrubChanges(a.Changes)
+			}
+			return cli.WriteJSON(os.Stdout, st)
+		}
+
 		out.Blank()
 		out.Summary("Resources: %d     Runs: %d     Pending approvals: %d",
 			len(st.Resources), len(st.Runs), pendingApprovals(st))
@@ -252,14 +331,33 @@ var statusCmd = &cobra.Command{
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
+
+		// Apply status filter if provided
+		filterSet := parseFilter(statusFilter)
+
 		for _, id := range ids {
 			r := st.Resources[id]
+			if len(filterSet) > 0 && !filterSet[string(r.Status)] {
+				continue
+			}
 			detail := ""
 			if r.LastOperation != "" {
 				detail = "last: " + r.LastOperation
 			}
 			out.StatusLine(id, string(r.Status), detail)
 		}
+
+		// Show approval timeout warnings
+		for _, a := range st.Approvals {
+			if a.Status == state.ApprovalPending {
+				remaining := time.Until(a.ExpiresAt)
+				if remaining < 4*time.Hour && remaining > 0 {
+					out.Blank()
+					out.Line(out.Yellow(out.Warn()), "Approval %s expires in %s", a.ID, remaining.Round(time.Minute))
+				}
+			}
+		}
+
 		out.Blank()
 		return nil
 	},
@@ -299,6 +397,22 @@ var driftCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+
+		if formatFlag == "json" {
+			errStrs := make([]string, len(observeErrors))
+			for i, e := range observeErrors {
+				errStrs[i] = e.Error()
+			}
+			for _, rec := range drifted {
+				rec.IntentSnapshot = security.ScrubMap(rec.IntentSnapshot)
+				rec.LiveState = security.ScrubMap(rec.LiveState)
+			}
+			return cli.WriteJSON(os.Stdout, struct {
+				Drifted []*state.ResourceRecord `json:"drifted"`
+				Errors  []string                `json:"errors,omitempty"`
+			}{drifted, errStrs})
+		}
+
 		for _, e := range observeErrors {
 			fmt.Fprintln(os.Stderr, "warning:", e)
 		}
@@ -420,6 +534,30 @@ var rollbackCmd = &cobra.Command{
 	},
 }
 
+var refreshCmd = &cobra.Command{
+	Use:         "refresh [path]",
+	Short:       "Refresh live state for all managed resources",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := beaconPathArg(args)
+		refreshed, observeErrors, err := eng.Refresh(cmd.Context(), path)
+		if err != nil {
+			return err
+		}
+		for _, e := range observeErrors {
+			fmt.Fprintln(os.Stderr, "warning:", e)
+		}
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Refreshed %d resource(s)", refreshed)
+		if len(observeErrors) > 0 {
+			out.Line(out.Yellow(out.Warn()), "%d observe error(s)", len(observeErrors))
+		}
+		out.Blank()
+		return nil
+	},
+}
+
 var connectCmd = &cobra.Command{
 	Use:         "connect <provider> [region]",
 	Short:       "Connect a cloud provider",
@@ -491,30 +629,6 @@ var importCmd = &cobra.Command{
 		out.Line(out.Green(out.OK()), "Imported %s as %s", args[2], out.Bold(resourceID))
 		out.Blank()
 		out.Next("run `beecon status` to see the imported resource.")
-		return nil
-	},
-}
-
-var refreshCmd = &cobra.Command{
-	Use:         "refresh [path]",
-	Short:       "Refresh live state for all managed resources",
-	Args:        cobra.MaximumNArgs(1),
-	Annotations: needsEngine,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		path := beaconPathArg(args)
-		refreshed, observeErrors, err := eng.Refresh(cmd.Context(), path)
-		if err != nil {
-			return err
-		}
-		for _, e := range observeErrors {
-			fmt.Fprintln(os.Stderr, "warning:", e)
-		}
-		out.Blank()
-		out.Line(out.Green(out.OK()), "Refreshed %d resource(s)", refreshed)
-		if len(observeErrors) > 0 {
-			out.Line(out.Yellow(out.Warn()), "%d observe error(s)", len(observeErrors))
-		}
-		out.Blank()
 		return nil
 	},
 }
@@ -613,6 +727,32 @@ var watchCmd = &cobra.Command{
 			}
 		}
 	},
+}
+
+// sortedKeys returns the keys of a map sorted alphabetically.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// parseFilter splits a comma-separated filter string into a set of uppercase tokens.
+func parseFilter(filter string) map[string]bool {
+	if strings.TrimSpace(filter) == "" {
+		return nil
+	}
+	parts := strings.Split(filter, ",")
+	set := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToUpper(p))
+		if p != "" {
+			set[p] = true
+		}
+	}
+	return set
 }
 
 var serveCmd = &cobra.Command{

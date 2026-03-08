@@ -354,6 +354,135 @@ service api {
 	}
 }
 
+func TestWireGraphInjectsSGRulesIntoIntent(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+network sg {
+  topology = security_group
+  vpc_id = vpc-123
+}
+store db {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    db = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	// SG rules should be inferred
+	if len(result.InferredSGRules) == 0 {
+		t.Fatal("expected inferred SG rules")
+	}
+
+	// The security_group NETWORK node should have ingress populated
+	var sgNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "sg" {
+			sgNode = &g.Nodes[i]
+			break
+		}
+	}
+	if sgNode == nil {
+		t.Fatal("sg node not found")
+	}
+	if sgNode.Intent["ingress"] == "" {
+		t.Fatal("expected ingress to be injected into security_group node")
+	}
+	if !strings.Contains(sgNode.Intent["ingress"], "5432") {
+		t.Fatalf("expected port 5432 in ingress, got %q", sgNode.Intent["ingress"])
+	}
+}
+
+func TestWireGraphSGRulesPreservesExplicit(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+network sg {
+  topology = security_group
+  vpc_id = vpc-123
+  ingress = tcp:443:10.0.0.0/16
+}
+store db {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    db = read_write
+  }
+}
+`)
+	_, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var sgNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "sg" {
+			sgNode = &g.Nodes[i]
+			break
+		}
+	}
+	if sgNode == nil {
+		t.Fatal("sg node not found")
+	}
+
+	// Existing explicit rule should be preserved
+	if !strings.Contains(sgNode.Intent["ingress"], "tcp:443:10.0.0.0/16") {
+		t.Fatal("expected explicit ingress rule to be preserved")
+	}
+	// Inferred rule should be appended
+	if !strings.Contains(sgNode.Intent["ingress"], "5432") {
+		t.Fatal("expected inferred port 5432 to be appended")
+	}
+}
+
+func TestWireGraphSGRulesNoSGNode(t *testing.T) {
+	// When there's no security_group node, inferred rules should still be in result
+	// but no intent injection should occur
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store db {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    db = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	// Rules should still be inferred
+	if len(result.InferredSGRules) == 0 {
+		t.Fatal("expected inferred SG rules even without SG node")
+	}
+
+	// No node should have ingress set (no SG node to inject into)
+	for i := range g.Nodes {
+		if g.Nodes[i].Intent["ingress"] != "" {
+			t.Fatalf("unexpected ingress on node %s without SG node in graph", g.Nodes[i].Name)
+		}
+	}
+}
+
 func TestWireGraphNoDependencies(t *testing.T) {
 	g := buildGraph(t, `domain acme {
   cloud = aws(region: us-east-1)
