@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -50,6 +51,7 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 			auth := r.Header.Get("Authorization")
 			provided := strings.TrimPrefix(auth, "Bearer ")
 			if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
+				log.Printf("auth: rejected request from %s", r.RemoteAddr)
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing API key"})
 				return
 			}
@@ -328,7 +330,20 @@ func (s *Server) drift(w http.ResponseWriter, r *http.Request) {
 	}
 	var warnings []string
 	for _, e := range observeErrors {
-		warnings = append(warnings, e.Error())
+		// Sanitize cloud error details — only expose the resource name and generic error
+		msg := e.Error()
+		// Strip common AWS patterns that leak account info
+		if idx := strings.Index(msg, "arn:"); idx >= 0 {
+			msg = msg[:idx] + "[ARN redacted]"
+		}
+		if idx := strings.Index(msg, "account"); idx >= 0 {
+			end := idx + len("account")
+			for end < len(msg) && msg[end] != ' ' && msg[end] != ',' && msg[end] != ')' {
+				end++
+			}
+			msg = msg[:idx] + "[account redacted]" + msg[end:]
+		}
+		warnings = append(warnings, msg)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"drifted": drifted, "count": len(drifted), "warnings": warnings})
 }
@@ -340,6 +355,7 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		BeaconPath string `json:"beacon_path"`
+		Force      bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
@@ -352,6 +368,11 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	// Note: Force is set temporarily on the shared engine. This is safe because
+	// state mutations are serialized by the store mutex.
+	prevForce := s.engine.Force
+	s.engine.Force = req.Force
+	defer func() { s.engine.Force = prevForce }()
 	res, err := s.engine.Apply(r.Context(), req.BeaconPath)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
