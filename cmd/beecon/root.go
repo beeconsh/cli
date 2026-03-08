@@ -92,6 +92,7 @@ func init() {
 		rollbackCmd,
 		connectCmd,
 		performanceCmd,
+		refreshCmd,
 		serveCmd,
 	)
 }

@@ -54,7 +54,7 @@ func TestLoadMissingReturnsFreshState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
-	if st.Version != 1 {
+	if st.Version != CurrentVersion {
 		t.Fatalf("unexpected version: %d", st.Version)
 	}
 	if st.Resources == nil || st.Actions == nil || st.Approvals == nil {
