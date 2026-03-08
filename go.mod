@@ -39,6 +39,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/apigatewayv2 v1.33.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/cloudfront v1.60.2 // indirect
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.55.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.64.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider v1.59.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.294.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ecs v1.73.1 // indirect

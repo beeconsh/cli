@@ -24,7 +24,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	ekstypes "github.com/aws/aws-sdk-go-v2/service/eks/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
@@ -37,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
+	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -165,48 +168,115 @@ func (e *DefaultExecutor) applyAWS(ctx context.Context, req ApplyRequest) (*Appl
 		return nil, fmt.Errorf("aws config: %w", err)
 	}
 
+	var result *ApplyResult
+	var applyErr error
+
 	switch target {
 	case "rds":
-		return e.applyAWSRDS(ctx, rds.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSRDS(ctx, rds.NewFromConfig(cfg), req)
 	case "rds_aurora_serverless":
-		return e.applyAWSRDS(ctx, rds.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSRDS(ctx, rds.NewFromConfig(cfg), req)
 	case "alb":
-		return e.applyAWSALB(ctx, elbv2.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSALB(ctx, elbv2.NewFromConfig(cfg), req)
 	case "ecs":
-		return e.applyAWSECS(ctx, ecs.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSECS(ctx, ecs.NewFromConfig(cfg), req)
 	case "s3":
-		return e.applyAWSS3(ctx, s3.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSS3(ctx, s3.NewFromConfig(cfg), req)
 	case "lambda":
-		return e.applyAWSLambda(ctx, lambda.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSLambda(ctx, lambda.NewFromConfig(cfg), req)
 	case "api_gateway":
-		return e.applyAWSAPIGateway(ctx, apigatewayv2.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSAPIGateway(ctx, apigatewayv2.NewFromConfig(cfg), req)
 	case "sqs":
-		return e.applyAWSSQS(ctx, sqs.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSSQS(ctx, sqs.NewFromConfig(cfg), req)
 	case "sns":
-		return e.applyAWSSNS(ctx, sns.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSSNS(ctx, sns.NewFromConfig(cfg), req)
 	case "secrets_manager":
-		return e.applyAWSSecrets(ctx, secretsmanager.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSSecrets(ctx, secretsmanager.NewFromConfig(cfg), req)
 	case "iam":
-		return e.applyAWSIAM(ctx, iam.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSIAM(ctx, iam.NewFromConfig(cfg), req)
 	case "elasticache":
-		return e.applyAWSElastiCache(ctx, elasticache.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSElastiCache(ctx, elasticache.NewFromConfig(cfg), req)
 	case "cloudfront":
-		return e.applyAWSCloudFront(ctx, cloudfront.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSCloudFront(ctx, cloudfront.NewFromConfig(cfg), req)
 	case "route53":
-		return e.applyAWSRoute53(ctx, route53.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSRoute53(ctx, route53.NewFromConfig(cfg), req)
 	case "cloudwatch":
-		return e.applyAWSCloudWatch(ctx, cloudwatch.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSCloudWatch(ctx, cloudwatch.NewFromConfig(cfg), req)
 	case "eks":
-		return e.applyAWSEKS(ctx, eks.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSEKS(ctx, eks.NewFromConfig(cfg), req)
 	case "eventbridge":
-		return e.applyAWSEventBridge(ctx, eventbridge.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSEventBridge(ctx, eventbridge.NewFromConfig(cfg), req)
 	case "cognito":
-		return e.applyAWSCognito(ctx, cognitoidentityprovider.NewFromConfig(cfg), req)
+		result, applyErr = e.applyAWSCognito(ctx, cognitoidentityprovider.NewFromConfig(cfg), req)
 	case "vpc", "subnet", "security_group", "ec2":
-		return e.applyAWSEC2(ctx, ec2.NewFromConfig(cfg), req, target)
+		result, applyErr = e.applyAWSEC2(ctx, ec2.NewFromConfig(cfg), req, target)
 	default:
 		return nil, fmt.Errorf("aws target %q is recognized but requires additional adapter implementation for live execution (set BEECON_EXECUTE!=1 for dry-run)", target)
 	}
+	if applyErr != nil {
+		return result, applyErr
+	}
+
+	// --- Post-apply cross-cutting concerns ---
+	if result.LiveState == nil {
+		result.LiveState = map[string]interface{}{}
+	}
+
+	// Log retention: set CloudWatch Logs retention policy for Lambda/ECS log groups
+	if retRaw := intent(req.Intent, "log_retention"); retRaw != "" && req.Action.Operation != "DELETE" {
+		days := parseDurationDays(retRaw)
+		if days > 0 {
+			logsClient := cloudwatchlogs.NewFromConfig(cfg)
+			var logGroup string
+			switch target {
+			case "lambda":
+				logGroup = "/aws/lambda/" + trimResourceName(identifierFor(req.Action.NodeName), 64)
+			case "ecs":
+				logGroup = "/aws/ecs/" + trimResourceName(identifierFor(req.Action.NodeName), 255)
+			}
+			if logGroup != "" {
+				if err := setLogRetention(ctx, logsClient, logGroup, days); err != nil {
+					// Log group may not exist yet (auto-created on first invocation).
+					// Store the intent; don't fail the apply.
+					result.LiveState["log_retention_pending"] = retRaw
+				} else {
+					result.LiveState["log_retention_days"] = logRetentionDays(days)
+				}
+			}
+		}
+	}
+
+	// alarm_on: create CloudWatch alarm as side-effect of resource creation.
+	// Only meaningful for compute/database targets that emit CloudWatch metrics.
+	alarmTargets := map[string]bool{"rds": true, "ecs": true, "lambda": true, "ec2": true, "elasticache": true, "eks": true}
+	if alarmRaw := intent(req.Intent, "alarm_on"); alarmRaw != "" && req.Action.Operation != "DELETE" && alarmTargets[target] {
+		cond, err := parseAlarmOn(alarmRaw)
+		if err == nil && cond != nil {
+			metricName, namespace := alarmMetricForTarget(target, cond.Metric)
+			cwClient := cloudwatch.NewFromConfig(cfg)
+			alarmName := trimResourceName(identifierFor(req.Action.NodeName), 200) + "-" + strings.ToLower(cond.Metric)
+			dims := alarmDimensionsForTarget(target, identifierFor(req.Action.NodeName))
+			if _, err := cwClient.PutMetricAlarm(ctx, &cloudwatch.PutMetricAlarmInput{
+				AlarmName:          awsString(alarmName),
+				MetricName:         awsString(metricName),
+				Namespace:          awsString(namespace),
+				ComparisonOperator: alarmComparisonOperator(cond.Operator),
+				EvaluationPeriods:  awsInt32(1),
+				Period:             awsInt32(60),
+				Threshold:          awsFloat64(cond.Threshold),
+				Statistic:          cloudwatchtypes.StatisticAverage,
+				Dimensions:         dims,
+			}); err != nil {
+				// Don't fail the main resource apply for an alarm failure.
+				// Sanitize error to avoid leaking AWS internals (account IDs, ARNs).
+				result.LiveState["alarm_error"] = "failed to create alarm"
+			} else {
+				result.LiveState["alarm_name"] = alarmName
+			}
+		}
+	}
+
+	return result, nil
 }
 
 func (e *DefaultExecutor) applyAWSRDS(ctx context.Context, c *rds.Client, req ApplyRequest) (*ApplyResult, error) {
@@ -272,6 +342,15 @@ func (e *DefaultExecutor) applyAWSRDS(ctx context.Context, c *rds.Client, req Ap
 		if v := intent(req.Intent, "iops"); v != "" {
 			createIn.Iops = awsInt32(parseIntIntent(req.Intent, "iops", 0))
 		}
+		if parseBoolIntent(req.Intent, "enhanced_monitoring", false) {
+			createIn.MonitoringInterval = awsInt32(parseIntIntent(req.Intent, "monitoring_interval", 60))
+			if v := intent(req.Intent, "monitoring_role_arn"); v != "" {
+				createIn.MonitoringRoleArn = awsString(v)
+			}
+		}
+		if v := intent(req.Intent, "log_exports"); v != "" {
+			createIn.EnableCloudwatchLogsExports = stringListFromIntent(req.Intent, "log_exports")
+		}
 		_, err = c.CreateDBInstance(ctx, createIn)
 		if err != nil {
 			return nil, fmt.Errorf("rds create db instance: %w", err)
@@ -310,6 +389,21 @@ func (e *DefaultExecutor) applyAWSRDS(ctx context.Context, c *rds.Client, req Ap
 		if v := intent(req.Intent, "iops"); v != "" {
 			in.Iops = awsInt32(parseIntIntent(req.Intent, "iops", 0))
 		}
+		if v := intent(req.Intent, "enhanced_monitoring"); v != "" {
+			if parseBoolIntent(req.Intent, "enhanced_monitoring", false) {
+				in.MonitoringInterval = awsInt32(parseIntIntent(req.Intent, "monitoring_interval", 60))
+				if role := intent(req.Intent, "monitoring_role_arn"); role != "" {
+					in.MonitoringRoleArn = awsString(role)
+				}
+			} else {
+				in.MonitoringInterval = awsInt32(0) // disable
+			}
+		}
+		if v := intent(req.Intent, "log_exports"); v != "" {
+			in.CloudwatchLogsExportConfiguration = &rdstypes.CloudwatchLogsExportConfiguration{
+				EnableLogTypes: stringListFromIntent(req.Intent, "log_exports"),
+			}
+		}
 		if _, err := c.ModifyDBInstance(ctx, in); err != nil {
 			return nil, fmt.Errorf("rds modify db instance: %w", err)
 		}
@@ -328,12 +422,18 @@ func (e *DefaultExecutor) applyAWSRDS(ctx context.Context, c *rds.Client, req Ap
 			return nil, fmt.Errorf("rds delete db instance: %w", err)
 		}
 	}
-	return &ApplyResult{ProviderID: id, LiveState: map[string]interface{}{"service": "rds", "db_instance_id": id, "operation": req.Action.Operation}}, nil
+	live := map[string]interface{}{"service": "rds", "db_instance_id": id, "operation": req.Action.Operation}
+	if v := intent(req.Intent, "read_replica_count"); v != "" {
+		live["intended_read_replicas"] = v
+	}
+	return &ApplyResult{ProviderID: id, LiveState: live}, nil
 }
 
 func (e *DefaultExecutor) applyAWSALB(ctx context.Context, c *elbv2.Client, req ApplyRequest) (*ApplyResult, error) {
 	name := trimResourceName(identifierFor(req.Action.NodeName), 32)
 	arn := req.RecordProviderID()
+	live := map[string]interface{}{"service": "elbv2", "operation": req.Action.Operation}
+
 	switch req.Action.Operation {
 	case "CREATE":
 		subnets := stringListFromIntent(req.Intent, "subnet_ids")
@@ -341,47 +441,320 @@ func (e *DefaultExecutor) applyAWSALB(ctx context.Context, c *elbv2.Client, req 
 			return nil, fmt.Errorf("alb create requires intent.subnet_ids")
 		}
 		scheme := defaultString(intent(req.Intent, "scheme"), "internet-facing")
-		out, err := c.CreateLoadBalancer(ctx, &elbv2.CreateLoadBalancerInput{
+		sgs := stringListFromIntent(req.Intent, "security_group_ids")
+
+		// 1. Create load balancer
+		lbIn := &elbv2.CreateLoadBalancerInput{
 			Name:    awsString(name),
 			Scheme:  elbv2types.LoadBalancerSchemeEnum(scheme),
 			Subnets: subnets,
 			Type:    elbv2types.LoadBalancerTypeEnumApplication,
-		})
+		}
+		if len(sgs) > 0 {
+			lbIn.SecurityGroups = sgs
+		}
+		out, err := c.CreateLoadBalancer(ctx, lbIn)
 		if err != nil {
 			return nil, fmt.Errorf("elbv2 create load balancer: %w", err)
 		}
 		if len(out.LoadBalancers) > 0 && out.LoadBalancers[0].LoadBalancerArn != nil {
 			arn = *out.LoadBalancers[0].LoadBalancerArn
 		}
+		live["load_balancer_arn"] = arn
+
+		// 2. Create target group (if target_port is specified)
+		targetPort := parseIntIntent(req.Intent, "target_port", 0)
+		var tgArn string
+		if targetPort > 0 {
+			vpcID := intent(req.Intent, "vpc_id")
+			if vpcID == "" {
+				return nil, fmt.Errorf("alb target group requires intent.vpc_id")
+			}
+			targetType := defaultString(intent(req.Intent, "target_type"), "ip")
+			tgIn := &elbv2.CreateTargetGroupInput{
+				Name:       awsString(trimResourceName(name+"-tg", 32)),
+				Port:       awsInt32(targetPort),
+				Protocol:   elbv2types.ProtocolEnumHttp,
+				VpcId:      awsString(vpcID),
+				TargetType: elbv2types.TargetTypeEnum(targetType),
+			}
+			if hcPath := intent(req.Intent, "health_check_path"); hcPath != "" {
+				tgIn.HealthCheckEnabled = awsBool(true)
+				tgIn.HealthCheckPath = awsString(hcPath)
+				if interval := parseIntIntent(req.Intent, "health_check_interval", 0); interval > 0 {
+					tgIn.HealthCheckIntervalSeconds = awsInt32(interval)
+				}
+				if timeout := parseIntIntent(req.Intent, "health_check_timeout", 0); timeout > 0 {
+					tgIn.HealthCheckTimeoutSeconds = awsInt32(timeout)
+				}
+				if healthy := parseIntIntent(req.Intent, "healthy_threshold", 0); healthy > 0 {
+					tgIn.HealthyThresholdCount = awsInt32(healthy)
+				}
+				if unhealthy := parseIntIntent(req.Intent, "unhealthy_threshold", 0); unhealthy > 0 {
+					tgIn.UnhealthyThresholdCount = awsInt32(unhealthy)
+				}
+			}
+			tgOut, err := c.CreateTargetGroup(ctx, tgIn)
+			if err != nil {
+				live["load_balancer"] = defaultString(arn, name)
+				return &ApplyResult{ProviderID: defaultString(arn, name), LiveState: live}, fmt.Errorf("elbv2 create target group: %w", err)
+			}
+			if len(tgOut.TargetGroups) > 0 && tgOut.TargetGroups[0].TargetGroupArn != nil {
+				tgArn = *tgOut.TargetGroups[0].TargetGroupArn
+			}
+			live["target_group_arn"] = tgArn
+		}
+
+		// 3. Create listener (if we have a target group to forward to)
+		if tgArn != "" {
+			listenerPort := parseIntIntent(req.Intent, "listener_port", 80)
+			listenerProto := elbv2types.ProtocolEnumHttp
+			lnIn := &elbv2.CreateListenerInput{
+				LoadBalancerArn: awsString(arn),
+				Port:            awsInt32(listenerPort),
+				Protocol:        listenerProto,
+				DefaultActions: []elbv2types.Action{
+					{Type: elbv2types.ActionTypeEnumForward, TargetGroupArn: awsString(tgArn)},
+				},
+			}
+			// If certificate_arn is present, switch to HTTPS
+			if certArn := intent(req.Intent, "certificate_arn"); certArn != "" {
+				lnIn.Protocol = elbv2types.ProtocolEnumHttps
+				if listenerPort == 80 {
+					lnIn.Port = awsInt32(443) // auto-upgrade port when cert is provided
+				}
+				lnIn.Certificates = []elbv2types.Certificate{{CertificateArn: awsString(certArn)}}
+			}
+			lnOut, err := c.CreateListener(ctx, lnIn)
+			if err != nil {
+				live["load_balancer"] = defaultString(arn, name)
+				return &ApplyResult{ProviderID: defaultString(arn, name), LiveState: live}, fmt.Errorf("elbv2 create listener: %w", err)
+			}
+			if len(lnOut.Listeners) > 0 && lnOut.Listeners[0].ListenerArn != nil {
+				live["listener_arn"] = *lnOut.Listeners[0].ListenerArn
+			}
+		}
+
+	case "UPDATE":
+		if arn == "" {
+			return nil, fmt.Errorf("alb update requires provider id (arn)")
+		}
+		// Update LB-level attributes: security groups, subnets
+		if sgs := stringListFromIntent(req.Intent, "security_group_ids"); len(sgs) > 0 {
+			if _, err := c.SetSecurityGroups(ctx, &elbv2.SetSecurityGroupsInput{
+				LoadBalancerArn: awsString(arn), SecurityGroups: sgs,
+			}); err != nil {
+				return nil, fmt.Errorf("elbv2 set security groups: %w", err)
+			}
+		}
+		if subnets := stringListFromIntent(req.Intent, "subnet_ids"); len(subnets) > 0 {
+			if _, err := c.SetSubnets(ctx, &elbv2.SetSubnetsInput{
+				LoadBalancerArn: awsString(arn), Subnets: subnets,
+			}); err != nil {
+				return nil, fmt.Errorf("elbv2 set subnets: %w", err)
+			}
+		}
+		// Update target group health check settings if they changed
+		if tgArn, ok := req.Record.LiveState["target_group_arn"].(string); ok && tgArn != "" {
+			modIn := &elbv2.ModifyTargetGroupInput{TargetGroupArn: awsString(tgArn)}
+			modified := false
+			if hcPath := intent(req.Intent, "health_check_path"); hcPath != "" {
+				modIn.HealthCheckPath = awsString(hcPath)
+				modIn.HealthCheckEnabled = awsBool(true)
+				modified = true
+			}
+			if interval := parseIntIntent(req.Intent, "health_check_interval", 0); interval > 0 {
+				modIn.HealthCheckIntervalSeconds = awsInt32(interval)
+				modified = true
+			}
+			if modified {
+				if _, err := c.ModifyTargetGroup(ctx, modIn); err != nil {
+					return nil, fmt.Errorf("elbv2 modify target group: %w", err)
+				}
+			}
+		}
+
 	case "DELETE":
 		if arn == "" {
 			return nil, fmt.Errorf("alb delete requires provider id (arn)")
 		}
+		// Cascade delete: listeners → target groups → load balancer.
+		// Use LiveState keys if available; fall back to AWS Describe calls for
+		// resources created before sub-resource tracking was added.
+		lnArn, _ := req.Record.LiveState["listener_arn"].(string)
+		tgArn, _ := req.Record.LiveState["target_group_arn"].(string)
+
+		// Discover listeners from AWS if not in state
+		if lnArn == "" {
+			if lnOut, err := c.DescribeListeners(ctx, &elbv2.DescribeListenersInput{LoadBalancerArn: awsString(arn)}); err == nil {
+				for _, ln := range lnOut.Listeners {
+					if ln.ListenerArn != nil {
+						if _, delErr := c.DeleteListener(ctx, &elbv2.DeleteListenerInput{ListenerArn: ln.ListenerArn}); delErr != nil && !isNotFound(delErr) {
+							return nil, fmt.Errorf("elbv2 delete listener: %w", delErr)
+						}
+					}
+				}
+			}
+		} else {
+			if _, err := c.DeleteListener(ctx, &elbv2.DeleteListenerInput{ListenerArn: awsString(lnArn)}); err != nil && !isNotFound(err) {
+				return nil, fmt.Errorf("elbv2 delete listener: %w", err)
+			}
+		}
+
+		// Discover target groups from AWS if not in state
+		if tgArn == "" {
+			if tgOut, err := c.DescribeTargetGroups(ctx, &elbv2.DescribeTargetGroupsInput{LoadBalancerArn: awsString(arn)}); err == nil {
+				for _, tg := range tgOut.TargetGroups {
+					if tg.TargetGroupArn != nil {
+						if _, delErr := c.DeleteTargetGroup(ctx, &elbv2.DeleteTargetGroupInput{TargetGroupArn: tg.TargetGroupArn}); delErr != nil && !isNotFound(delErr) {
+							return nil, fmt.Errorf("elbv2 delete target group: %w", delErr)
+						}
+					}
+				}
+			}
+		} else {
+			if _, err := c.DeleteTargetGroup(ctx, &elbv2.DeleteTargetGroupInput{TargetGroupArn: awsString(tgArn)}); err != nil && !isNotFound(err) {
+				return nil, fmt.Errorf("elbv2 delete target group: %w", err)
+			}
+		}
+
 		if _, err := c.DeleteLoadBalancer(ctx, &elbv2.DeleteLoadBalancerInput{LoadBalancerArn: awsString(arn)}); err != nil && !isNotFound(err) {
 			return nil, fmt.Errorf("elbv2 delete load balancer: %w", err)
 		}
 	}
-	return &ApplyResult{ProviderID: defaultString(arn, name), LiveState: map[string]interface{}{"service": "elbv2", "load_balancer": defaultString(arn, name), "operation": req.Action.Operation}}, nil
+
+	live["load_balancer"] = defaultString(arn, name)
+	return &ApplyResult{ProviderID: defaultString(arn, name), LiveState: live}, nil
 }
 
 func (e *DefaultExecutor) applyAWSECS(ctx context.Context, c *ecs.Client, req ApplyRequest) (*ApplyResult, error) {
 	name := trimResourceName(identifierFor(req.Action.NodeName), 255)
-	arn := req.RecordProviderID()
+	clusterArn := req.RecordProviderID()
+	live := map[string]interface{}{"service": "ecs", "operation": req.Action.Operation}
+
 	switch req.Action.Operation {
 	case "CREATE":
-		out, err := c.CreateCluster(ctx, &ecs.CreateClusterInput{ClusterName: awsString(name)})
+		imageURI := intent(req.Intent, "image_uri")
+		if imageURI == "" {
+			return nil, fmt.Errorf("ecs create requires intent.image_uri")
+		}
+		// 1. Create cluster
+		clusterOut, err := c.CreateCluster(ctx, &ecs.CreateClusterInput{ClusterName: awsString(name)})
 		if err != nil {
 			return nil, fmt.Errorf("ecs create cluster: %w", err)
 		}
-		if out.Cluster != nil && out.Cluster.ClusterArn != nil {
-			arn = *out.Cluster.ClusterArn
+		if clusterOut.Cluster != nil && clusterOut.Cluster.ClusterArn != nil {
+			clusterArn = *clusterOut.Cluster.ClusterArn
 		}
+		live["cluster"] = defaultString(clusterArn, name)
+		live["service_name"] = name
+
+		// 2. Register task definition
+		taskIn := buildECSTaskDef(name, imageURI, req.Intent)
+		taskOut, err := c.RegisterTaskDefinition(ctx, taskIn)
+		if err != nil {
+			// Return partial result so engine can track the orphaned cluster
+			return &ApplyResult{ProviderID: defaultString(clusterArn, name), LiveState: live}, fmt.Errorf("ecs register task definition: %w", err)
+		}
+		taskDefArn := ""
+		if taskOut.TaskDefinition != nil && taskOut.TaskDefinition.TaskDefinitionArn != nil {
+			taskDefArn = *taskOut.TaskDefinition.TaskDefinitionArn
+		}
+		live["task_definition_arn"] = taskDefArn
+
+		// 3. Create service
+		desiredCount := parseIntIntent(req.Intent, "desired_count", 1)
+		svcIn := &ecs.CreateServiceInput{
+			Cluster:        awsString(defaultString(clusterArn, name)),
+			ServiceName:    awsString(name),
+			TaskDefinition: awsString(taskDefArn),
+			DesiredCount:   awsInt32(desiredCount),
+			LaunchType:     ecstypes.LaunchTypeFargate,
+		}
+		// Fargate requires awsvpc with subnets
+		if subnets := stringListFromIntent(req.Intent, "subnet_ids"); len(subnets) > 0 {
+			netCfg := &ecstypes.AwsVpcConfiguration{
+				Subnets:        subnets,
+				AssignPublicIp: ecstypes.AssignPublicIpEnabled,
+			}
+			if sgs := stringListFromIntent(req.Intent, "security_group_ids"); len(sgs) > 0 {
+				netCfg.SecurityGroups = sgs
+			}
+			svcIn.NetworkConfiguration = &ecstypes.NetworkConfiguration{AwsvpcConfiguration: netCfg}
+		}
+		if _, err := c.CreateService(ctx, svcIn); err != nil {
+			// Return partial result so engine can track orphaned cluster + task def
+			return &ApplyResult{ProviderID: defaultString(clusterArn, name), LiveState: live}, fmt.Errorf("ecs create service: %w", err)
+		}
+		live["desired_count"] = desiredCount
+		live["cpu"] = defaultString(intent(req.Intent, "cpu"), "256")
+		live["memory"] = defaultString(intent(req.Intent, "memory"), "512")
+		live["image_uri"] = imageURI
+
+	case "UPDATE":
+		cluster := defaultString(clusterArn, name)
+		live["service_name"] = name
+
+		// Re-register task definition if image changed
+		imageURI := intent(req.Intent, "image_uri")
+		var taskDefArn string
+		if imageURI != "" {
+			taskIn := buildECSTaskDef(name, imageURI, req.Intent)
+			taskOut, err := c.RegisterTaskDefinition(ctx, taskIn)
+			if err != nil {
+				return nil, fmt.Errorf("ecs register task definition (update): %w", err)
+			}
+			if taskOut.TaskDefinition != nil && taskOut.TaskDefinition.TaskDefinitionArn != nil {
+				taskDefArn = *taskOut.TaskDefinition.TaskDefinitionArn
+			}
+			live["task_definition_arn"] = taskDefArn
+		}
+
+		// Always update service if any update fields are present (desired_count, task def, etc.)
+		updateIn := &ecs.UpdateServiceInput{
+			Cluster: awsString(cluster),
+			Service: awsString(name),
+		}
+		hasUpdate := false
+		if taskDefArn != "" {
+			updateIn.TaskDefinition = awsString(taskDefArn)
+			hasUpdate = true
+		}
+		if dc := intent(req.Intent, "desired_count"); dc != "" {
+			updateIn.DesiredCount = awsInt32(parseIntIntent(req.Intent, "desired_count", 1))
+			hasUpdate = true
+		}
+		if hasUpdate {
+			if _, err := c.UpdateService(ctx, updateIn); err != nil {
+				return nil, fmt.Errorf("ecs update service: %w", err)
+			}
+		}
+
 	case "DELETE":
-		if _, err := c.DeleteCluster(ctx, &ecs.DeleteClusterInput{Cluster: awsString(defaultString(arn, name))}); err != nil && !isNotFound(err) {
+		cluster := defaultString(clusterArn, name)
+		svcName := name
+		if stored, ok := req.Record.LiveState["service_name"].(string); ok && stored != "" {
+			svcName = stored
+		}
+		// Scale down service first, then delete service, then cluster.
+		// Tolerate NotFound (service may not have been created), but surface other errors.
+		if _, err := c.UpdateService(ctx, &ecs.UpdateServiceInput{
+			Cluster: awsString(cluster), Service: awsString(svcName), DesiredCount: awsInt32(0),
+		}); err != nil && !isNotFound(err) {
+			return nil, fmt.Errorf("ecs scale down service before delete: %w", err)
+		}
+		if _, err := c.DeleteService(ctx, &ecs.DeleteServiceInput{
+			Cluster: awsString(cluster), Service: awsString(svcName), Force: awsBool(true),
+		}); err != nil && !isNotFound(err) {
+			return nil, fmt.Errorf("ecs delete service: %w", err)
+		}
+		if _, err := c.DeleteCluster(ctx, &ecs.DeleteClusterInput{Cluster: awsString(cluster)}); err != nil && !isNotFound(err) {
 			return nil, fmt.Errorf("ecs delete cluster: %w", err)
 		}
 	}
-	return &ApplyResult{ProviderID: defaultString(arn, name), LiveState: map[string]interface{}{"service": "ecs", "cluster": defaultString(arn, name), "operation": req.Action.Operation}}, nil
+
+	live["cluster"] = defaultString(clusterArn, name)
+	return &ApplyResult{ProviderID: defaultString(clusterArn, name), LiveState: live}, nil
 }
 
 func (e *DefaultExecutor) applyAWSLambda(ctx context.Context, c *lambda.Client, req ApplyRequest) (*ApplyResult, error) {
@@ -408,6 +781,12 @@ func (e *DefaultExecutor) applyAWSLambda(ctx context.Context, c *lambda.Client, 
 		}
 		if env := envFromIntent(req.Intent); env != nil {
 			createIn.Environment = &lambdatypes.Environment{Variables: env}
+		}
+		if vpc := lambdaVpcConfig(req.Intent); vpc != nil {
+			createIn.VpcConfig = vpc
+		}
+		if layers := stringListFromIntent(req.Intent, "layer_arns"); len(layers) > 0 {
+			createIn.Layers = layers
 		}
 		out, err := c.CreateFunction(ctx, createIn)
 		if err != nil {
@@ -442,6 +821,12 @@ func (e *DefaultExecutor) applyAWSLambda(ctx context.Context, c *lambda.Client, 
 		}
 		if env := envFromIntent(req.Intent); env != nil {
 			configIn.Environment = &lambdatypes.Environment{Variables: env}
+		}
+		if vpc := lambdaVpcConfig(req.Intent); vpc != nil {
+			configIn.VpcConfig = vpc
+		}
+		if layers := stringListFromIntent(req.Intent, "layer_arns"); len(layers) > 0 {
+			configIn.Layers = layers
 		}
 		if _, err := c.UpdateFunctionConfiguration(ctx, configIn); err != nil {
 			return nil, fmt.Errorf("lambda update function configuration: %w", err)
@@ -957,6 +1342,9 @@ func (e *DefaultExecutor) applyAWSElastiCache(ctx context.Context, c *elasticach
 		if v := parseIntIntent(req.Intent, "snapshot_retention", 0); v > 0 {
 			createIn.SnapshotRetentionLimit = awsInt32(v)
 		}
+		if v := intent(req.Intent, "az_mode"); v != "" {
+			createIn.AZMode = elasticachetypes.AZMode(strings.ReplaceAll(v, "-", "_"))
+		}
 		_, err := c.CreateCacheCluster(ctx, createIn)
 		if err != nil {
 			return nil, fmt.Errorf("elasticache create cache cluster: %w", err)
@@ -986,6 +1374,9 @@ func (e *DefaultExecutor) applyAWSElastiCache(ctx context.Context, c *elasticach
 		if v := intent(req.Intent, "auth_token"); v != "" {
 			in.AuthToken = awsString(v)
 			in.AuthTokenUpdateStrategy = elasticachetypes.AuthTokenUpdateStrategyTypeRotate
+		}
+		if v := intent(req.Intent, "az_mode"); v != "" {
+			in.AZMode = elasticachetypes.AZMode(strings.ReplaceAll(v, "-", "_"))
 		}
 		if _, err := c.ModifyCacheCluster(ctx, in); err != nil {
 			return nil, fmt.Errorf("elasticache modify cache cluster: %w", err)
@@ -2408,6 +2799,40 @@ func validateAWSInput(target string, intentMap map[string]interface{}) error {
 				return fmt.Errorf("iops requires storage_type io1, io2, or gp3, got %q", storageType)
 			}
 		}
+		if v := intent(intentMap, "monitoring_interval"); v != "" {
+			interval := parseIntIntent(intentMap, "monitoring_interval", 60)
+			switch interval {
+			case 0, 1, 5, 10, 15, 30, 60:
+			default:
+				return fmt.Errorf("rds monitoring_interval must be 0, 1, 5, 10, 15, 30, or 60 seconds, got %d", interval)
+			}
+		}
+		if parseBoolIntent(intentMap, "enhanced_monitoring", false) {
+			if intent(intentMap, "monitoring_role_arn") == "" {
+				return fmt.Errorf("rds enhanced_monitoring requires monitoring_role_arn")
+			}
+		}
+	case "ecs":
+		if cpu := intent(intentMap, "cpu"); cpu != "" {
+			switch cpu {
+			case "256", "512", "1024", "2048", "4096":
+			default:
+				return fmt.Errorf("ecs cpu must be 256, 512, 1024, 2048, or 4096, got %q", cpu)
+			}
+		}
+		if mem := intent(intentMap, "memory"); mem != "" {
+			m := parseIntIntent(intentMap, "memory", 512)
+			if m < 512 || m > 30720 {
+				return fmt.Errorf("ecs memory must be 512-30720 MB, got %d", m)
+			}
+		}
+	case "alb":
+		if port := parseIntIntent(intentMap, "target_port", 0); port > 65535 {
+			return fmt.Errorf("alb target_port must be 1-65535, got %d", port)
+		}
+		if port := parseIntIntent(intentMap, "listener_port", 0); port > 65535 {
+			return fmt.Errorf("alb listener_port must be 1-65535, got %d", port)
+		}
 	case "iam":
 		for _, p := range stringListFromIntent(intentMap, "managed_policies") {
 			if !strings.HasPrefix(p, "arn:") {
@@ -2419,8 +2844,241 @@ func validateAWSInput(target string, intentMap map[string]interface{}) error {
 				return fmt.Errorf("invalid trust_service %q: must match <service>.amazonaws.com", svc)
 			}
 		}
+	case "elasticache":
+		if v := intent(intentMap, "az_mode"); v != "" {
+			mode := strings.ToLower(v)
+			if mode != "single-az" && mode != "cross-az" && mode != "single_az" && mode != "cross_az" {
+				return fmt.Errorf("elasticache az_mode must be single-az or cross-az, got %q", v)
+			}
+		}
+	}
+	// Cross-cutting: validate alarm_on syntax if present
+	if alarmRaw := intent(intentMap, "alarm_on"); alarmRaw != "" {
+		if _, err := parseAlarmOn(alarmRaw); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// parseDurationDays parses a duration string like "7d", "30d" into days.
+func parseDurationDays(s string) int32 {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return 0
+	}
+	s = strings.TrimSuffix(s, "d")
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return int32(n)
+}
+
+// logRetentionDays maps a day count to the nearest valid CloudWatch Logs retention value.
+// Valid values: 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653
+func logRetentionDays(days int32) int32 {
+	if days <= 0 {
+		return 0
+	}
+	valid := []int32{1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653}
+	for _, v := range valid {
+		if days <= v {
+			return v
+		}
+	}
+	return valid[len(valid)-1]
+}
+
+// setLogRetention sets the retention policy on a CloudWatch Logs log group.
+func setLogRetention(ctx context.Context, logsClient *cloudwatchlogs.Client, logGroupName string, days int32) error {
+	_, err := logsClient.PutRetentionPolicy(ctx, &cloudwatchlogs.PutRetentionPolicyInput{
+		LogGroupName:    awsString(logGroupName),
+		RetentionInDays: awsInt32(logRetentionDays(days)),
+	})
+	if err != nil {
+		return fmt.Errorf("cloudwatch logs put retention policy for %s: %w", logGroupName, err)
+	}
+	return nil
+}
+
+// AlarmCondition represents a parsed alarm_on condition.
+type AlarmCondition struct {
+	Metric    string  // user-facing metric name (e.g. "cpu", "memory", "errors")
+	Operator  string  // >, <, >=, <=
+	Threshold float64
+}
+
+// parseAlarmOn parses a condition string like "cpu > 80" or "errors >= 10".
+func parseAlarmOn(s string) (*AlarmCondition, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	// Try two-char operators first, then single-char
+	for _, op := range []string{">=", "<=", ">", "<"} {
+		idx := strings.Index(s, op)
+		if idx < 0 {
+			continue
+		}
+		metric := strings.TrimSpace(s[:idx])
+		thresholdStr := strings.TrimSpace(s[idx+len(op):])
+		if metric == "" || thresholdStr == "" {
+			return nil, fmt.Errorf("invalid alarm_on %q: empty metric or threshold", s)
+		}
+		// Strip trailing % if present
+		thresholdStr = strings.TrimSuffix(thresholdStr, "%")
+		threshold, err := strconv.ParseFloat(thresholdStr, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid alarm_on threshold %q: %w", thresholdStr, err)
+		}
+		return &AlarmCondition{Metric: metric, Operator: op, Threshold: threshold}, nil
+	}
+	return nil, fmt.Errorf("invalid alarm_on %q: no operator found (use >, <, >=, <=)", s)
+}
+
+// alarmComparisonOperator maps a parsed operator to a CloudWatch ComparisonOperator.
+func alarmComparisonOperator(op string) cloudwatchtypes.ComparisonOperator {
+	switch op {
+	case ">":
+		return cloudwatchtypes.ComparisonOperatorGreaterThanThreshold
+	case ">=":
+		return cloudwatchtypes.ComparisonOperatorGreaterThanOrEqualToThreshold
+	case "<":
+		return cloudwatchtypes.ComparisonOperatorLessThanThreshold
+	case "<=":
+		return cloudwatchtypes.ComparisonOperatorLessThanOrEqualToThreshold
+	default:
+		return cloudwatchtypes.ComparisonOperatorGreaterThanOrEqualToThreshold
+	}
+}
+
+// alarmMetricForTarget resolves a user-facing metric name to AWS CloudWatch metric + namespace.
+func alarmMetricForTarget(target, metric string) (metricName, namespace string) {
+	metric = strings.ToLower(metric)
+	switch metric {
+	case "cpu":
+		switch target {
+		case "rds":
+			return "CPUUtilization", "AWS/RDS"
+		case "ecs":
+			return "CPUUtilization", "AWS/ECS"
+		case "ec2":
+			return "CPUUtilization", "AWS/EC2"
+		default:
+			return "CPUUtilization", "AWS/EC2"
+		}
+	case "memory":
+		switch target {
+		case "ecs":
+			return "MemoryUtilization", "AWS/ECS"
+		default:
+			return "MemoryUtilization", "AWS/EC2"
+		}
+	case "errors":
+		return "Errors", "AWS/Lambda"
+	case "duration":
+		return "Duration", "AWS/Lambda"
+	case "connections":
+		return "DatabaseConnections", "AWS/RDS"
+	case "freeable_memory":
+		return "FreeableMemory", "AWS/RDS"
+	case "read_latency":
+		return "ReadLatency", "AWS/RDS"
+	case "write_latency":
+		return "WriteLatency", "AWS/RDS"
+	default:
+		// Pass through as-is for advanced users specifying exact metric names
+		return metric, "AWS/EC2"
+	}
+}
+
+// alarmDimensionsForTarget returns CloudWatch dimensions scoping an alarm to the specific resource.
+// Without dimensions, alarms monitor the aggregate metric across ALL resources in the namespace.
+func alarmDimensionsForTarget(target, resourceName string) []cloudwatchtypes.Dimension {
+	switch target {
+	case "lambda":
+		return []cloudwatchtypes.Dimension{{
+			Name: awsString("FunctionName"), Value: awsString(trimResourceName(resourceName, 64)),
+		}}
+	case "ecs":
+		return []cloudwatchtypes.Dimension{{
+			Name: awsString("ClusterName"), Value: awsString(trimResourceName(resourceName, 255)),
+		}}
+	case "rds":
+		return []cloudwatchtypes.Dimension{{
+			Name: awsString("DBInstanceIdentifier"), Value: awsString(resourceName),
+		}}
+	case "ec2":
+		// EC2 dimensions require InstanceId which we may not have at alarm-creation time.
+		// Return empty — the alarm will be account-wide. Users should set dimensions manually.
+		return nil
+	case "elasticache":
+		return []cloudwatchtypes.Dimension{{
+			Name: awsString("CacheClusterId"), Value: awsString(trimResourceName(resourceName, 50)),
+		}}
+	case "eks":
+		return []cloudwatchtypes.Dimension{{
+			Name: awsString("ClusterName"), Value: awsString(trimResourceName(resourceName, 100)),
+		}}
+	default:
+		return nil
+	}
+}
+
+// buildECSTaskDef constructs a RegisterTaskDefinitionInput from intent fields.
+// Used by both ECS CREATE and UPDATE to avoid duplicating task definition logic.
+func buildECSTaskDef(name, imageURI string, intentMap map[string]interface{}) *ecs.RegisterTaskDefinitionInput {
+	cpu := defaultString(intent(intentMap, "cpu"), "256")
+	memory := defaultString(intent(intentMap, "memory"), "512")
+	containerPort := parseIntIntent(intentMap, "container_port", 8080)
+	containerDef := ecstypes.ContainerDefinition{
+		Name:      awsString(name),
+		Image:     awsString(imageURI),
+		Essential: awsBool(true),
+		PortMappings: []ecstypes.PortMapping{
+			{ContainerPort: awsInt32(containerPort), Protocol: ecstypes.TransportProtocolTcp},
+		},
+	}
+	if env := envFromIntent(intentMap); env != nil {
+		// Sort keys for deterministic task definition revisions
+		keys := make([]string, 0, len(env))
+		for k := range env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			containerDef.Environment = append(containerDef.Environment, ecstypes.KeyValuePair{
+				Name: awsString(k), Value: awsString(env[k]),
+			})
+		}
+	}
+	taskIn := &ecs.RegisterTaskDefinitionInput{
+		Family:                  awsString(name),
+		Cpu:                     awsString(cpu),
+		Memory:                  awsString(memory),
+		NetworkMode:             ecstypes.NetworkModeAwsvpc,
+		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
+		ContainerDefinitions:    []ecstypes.ContainerDefinition{containerDef},
+	}
+	if role := intent(intentMap, "role_arn"); role != "" {
+		taskIn.ExecutionRoleArn = awsString(role)
+		taskIn.TaskRoleArn = awsString(role)
+	}
+	return taskIn
+}
+
+// lambdaVpcConfig builds a VPC configuration from intent fields, or nil if no subnets specified.
+func lambdaVpcConfig(intentMap map[string]interface{}) *lambdatypes.VpcConfig {
+	subnets := stringListFromIntent(intentMap, "subnet_ids")
+	if len(subnets) == 0 {
+		return nil
+	}
+	cfg := &lambdatypes.VpcConfig{SubnetIds: subnets}
+	if sgs := stringListFromIntent(intentMap, "security_group_ids"); len(sgs) > 0 {
+		cfg.SecurityGroupIds = sgs
+	}
+	return cfg
 }
 
 // detectTrustService auto-detects the AWS service principal for IAM trust policies
