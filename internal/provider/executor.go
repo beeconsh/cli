@@ -69,6 +69,7 @@ type ObserveResult struct {
 type Executor interface {
 	Apply(ctx context.Context, req ApplyRequest) (*ApplyResult, error)
 	Observe(ctx context.Context, provider, region string, rec *state.ResourceRecord) (*ObserveResult, error)
+	IsDryRun() bool
 }
 
 type DefaultExecutor struct {
@@ -103,6 +104,10 @@ var AWSSupportMatrix = map[string]string{
 
 func NewExecutor() *DefaultExecutor {
 	return &DefaultExecutor{dryRun: os.Getenv("BEECON_EXECUTE") != "1"}
+}
+
+func (e *DefaultExecutor) IsDryRun() bool {
+	return e.dryRun
 }
 
 func (e *DefaultExecutor) Apply(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {

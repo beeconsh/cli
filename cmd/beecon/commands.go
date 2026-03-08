@@ -11,7 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/terracotta-ai/beecon/internal/api"
-	"github.com/terracotta-ai/beecon/internal/resolver"
+	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/scaffold"
 	"github.com/terracotta-ai/beecon/internal/ui"
 	"github.com/terracotta-ai/beecon/internal/witness"
@@ -39,7 +39,11 @@ var initCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Println("created", p)
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Created %s", p)
+		out.Blank()
+		out.Next("edit "+p+" with your infrastructure intent,",
+			"then run `beecon validate` to check syntax.")
 		return nil
 	},
 }
@@ -54,7 +58,10 @@ var validateCmd = &cobra.Command{
 		if err := eng.Validate(path); err != nil {
 			return err
 		}
-		fmt.Println("valid", path)
+		out.Blank()
+		out.Line(out.Green(out.OK()), "%s is valid", path)
+		out.Blank()
+		out.Next("run `beecon plan` to see what actions will be taken.")
 		return nil
 	},
 }
@@ -70,9 +77,65 @@ var planCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Printf("domain: %s\n", res.Graph.Domain.Name)
-		fmt.Printf("nodes: %d edges: %d\n", len(res.Graph.Nodes), len(res.Graph.Edges))
-		fmt.Print(resolver.FormatPlan(res.Plan))
+
+		// Domain header
+		domainName := ""
+		if res.Graph.Domain != nil {
+			domainName = res.Graph.Domain.Name
+		}
+		cloudInfo := ""
+		if res.CloudProvider != "" {
+			cloudInfo = fmt.Sprintf("(%s", res.CloudProvider)
+			if res.CloudRegion != "" {
+				cloudInfo += " / " + res.CloudRegion
+			}
+			cloudInfo += ")"
+		}
+		out.Blank()
+		out.Line(out.Dot(), "domain %s  %s", out.Bold(domainName), out.Dim(cloudInfo))
+		out.Blank()
+
+		actions := res.Plan.Actions
+		if len(actions) == 0 {
+			out.Line(out.Green(out.OK()), "No changes needed.")
+			return nil
+		}
+
+		// Count auto vs approval
+		approvalCount := 0
+		for _, a := range actions {
+			if a.RequiresApproval {
+				approvalCount++
+			}
+		}
+		autoCount := len(actions) - approvalCount
+		planSummary := fmt.Sprintf("%d actions", len(actions))
+		if approvalCount > 0 {
+			planSummary += fmt.Sprintf(" (%d auto, %d approval)", autoCount, approvalCount)
+		}
+		out.Header("Plan: %s", planSummary)
+		out.Blank()
+
+		// Action list
+		for i, a := range actions {
+			annotation := ""
+			if a.RequiresApproval {
+				annotation = out.Yellow(fmt.Sprintf("%s requires approval (%s)", out.Warn(), a.BoundaryTag))
+			} else if a.Operation == "FORBIDDEN" {
+				annotation = out.Red(fmt.Sprintf("%s forbidden (%s)", out.Fail(), a.BoundaryTag))
+			} else if len(a.DependsOn) > 0 {
+				annotation = out.Dim(fmt.Sprintf("%s depends on %s", out.Arrow(), strings.Join(a.DependsOn, ", ")))
+			}
+			out.NumberedAction(i+1, a.Operation, a.NodeID, annotation)
+		}
+
+		if approvalCount > 0 {
+			out.Blank()
+			out.Line(out.Yellow(out.Warn()), "%d action(s) require approval before execution.", approvalCount)
+		}
+
+		out.Blank()
+		out.Next("run `beecon apply` to execute this plan.")
 		return nil
 	},
 }
@@ -88,11 +151,37 @@ var applyCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Printf("run: %s\n", res.RunID)
-		fmt.Printf("executed: %d\n", res.Executed)
+		out.Blank()
+
+		// Run header with sim/live mode
+		if res.Simulated {
+			out.Header("Run %s %s", res.RunID, out.Dim("(simulated)"))
+			out.Summary("No cloud resources were modified.")
+		} else {
+			out.Header("Run %s %s", res.RunID, out.Red("(LIVE)"))
+			out.Summary("Cloud resources were modified.")
+		}
+		out.Blank()
+
+		// Per-action status
+		for _, ao := range res.Actions {
+			a := ao.Action
+			switch ao.Status {
+			case engine.ActionExecuted:
+				out.ActionLine(out.Green(out.OK()), a.Operation, a.NodeID, "")
+			case engine.ActionPending:
+				out.ActionLine(out.Yellow(out.Warn()), "PENDING", a.NodeID,
+					out.Dim(fmt.Sprintf("requires approval (%s)", a.BoundaryTag)))
+			case engine.ActionForbidden:
+				out.ActionLine(out.Red(out.Fail()), "FORBIDDEN", a.NodeID,
+					out.Dim(fmt.Sprintf("(%s)", a.BoundaryTag)))
+			}
+		}
+
 		if res.ApprovalRequestID != "" {
-			fmt.Printf("approval_required: %s\n", res.ApprovalRequestID)
-			fmt.Printf("pending_actions: %d\n", res.Pending)
+			out.Blank()
+			out.Next(fmt.Sprintf("run `beecon approve %s` to approve", res.ApprovalRequestID),
+				"the pending action(s).")
 		}
 		return nil
 	},
@@ -108,10 +197,11 @@ var statusCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Printf("resources: %d\n", len(st.Resources))
-		fmt.Printf("runs: %d\n", len(st.Runs))
-		fmt.Printf("approvals_pending: %d\n", pendingApprovals(st))
-		fmt.Printf("audit_events: %d\n", len(st.Audit))
+		out.Blank()
+		out.Summary("Resources: %d     Runs: %d     Pending approvals: %d",
+			len(st.Resources), len(st.Runs), pendingApprovals(st))
+		out.Blank()
+
 		if len(st.Resources) == 0 {
 			return nil
 		}
@@ -122,8 +212,13 @@ var statusCmd = &cobra.Command{
 		sort.Strings(ids)
 		for _, id := range ids {
 			r := st.Resources[id]
-			fmt.Printf("- %s status=%s managed=%v last_op=%s\n", id, r.Status, r.Managed, r.LastOperation)
+			detail := ""
+			if r.LastOperation != "" {
+				detail = "last: " + r.LastOperation
+			}
+			out.StatusLine(id, string(r.Status), detail)
 		}
+		out.Blank()
 		return nil
 	},
 }
@@ -138,13 +233,15 @@ var beaconsCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		out.Blank()
 		if len(paths) == 0 {
-			fmt.Println("no .beecon files found")
-			return nil
+			out.Line(out.Dim(out.Dot()), "No .beecon files found")
+		} else {
+			for _, p := range paths {
+				out.Line(out.Dot(), "%s", p)
+			}
 		}
-		for _, p := range paths {
-			fmt.Println(p)
-		}
+		out.Blank()
 		return nil
 	},
 }
@@ -163,14 +260,19 @@ var driftCmd = &cobra.Command{
 		for _, e := range observeErrors {
 			fmt.Fprintln(os.Stderr, "warning:", e)
 		}
+		out.Blank()
 		if len(drifted) == 0 {
-			fmt.Println("no drift detected")
-			return nil
+			out.Line(out.Green(out.OK()), "No drift detected")
+		} else {
+			out.Line(out.Yellow(out.Warn()), "%d resource(s) have drifted", len(drifted))
+			out.Blank()
+			for _, r := range drifted {
+				out.StatusLine(r.ResourceID, "DRIFTED", "("+strings.ToLower(r.NodeType)+")")
+			}
+			out.Blank()
+			out.Next("run `beecon plan` to generate a reconciliation plan.")
 		}
-		fmt.Printf("drifted: %d\n", len(drifted))
-		for _, r := range drifted {
-			fmt.Printf("- %s (%s)\n", r.ResourceID, r.NodeType)
-		}
+		out.Blank()
 		return nil
 	},
 }
@@ -189,8 +291,21 @@ var approveCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Printf("run: %s\n", res.RunID)
-		fmt.Printf("executed_after_approval: %d\n", res.Executed)
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Approved %s", args[0])
+		out.Blank()
+		if res.Simulated {
+			out.Header("Run %s %s", res.RunID, out.Dim("(simulated)"))
+		} else {
+			out.Header("Run %s", res.RunID)
+		}
+		out.Summary("Executed %d remaining action(s).", res.Executed)
+		out.Blank()
+
+		for _, ao := range res.Actions {
+			out.ActionLine(out.Green(out.OK()), ao.Action.Operation, ao.Action.NodeID, "")
+		}
+		out.Blank()
 		return nil
 	},
 }
@@ -212,7 +327,9 @@ var rejectCmd = &cobra.Command{
 		if err := eng.Reject(cmd.Context(), args[0], approver, reason); err != nil {
 			return err
 		}
-		fmt.Printf("rejected: %s by %s\n", args[0], approver)
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Rejected %s by %s", args[0], approver)
+		out.Blank()
 		return nil
 	},
 }
@@ -227,13 +344,18 @@ var historyCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		out.Blank()
 		if len(events) == 0 {
-			fmt.Println("no history")
-			return nil
+			out.Line(out.Dim(out.Dot()), "No history for %s", args[0])
+		} else {
+			out.Header("History: %s", args[0])
+			out.Blank()
+			for _, ev := range events {
+				ts := ev.Timestamp.Format("2006-01-02 15:04:05")
+				out.Line(out.Dot(), "%s  %s  %s", out.Dim(ts), ev.Type, ev.Message)
+			}
 		}
-		for _, ev := range events {
-			fmt.Printf("%s %s %s %s\n", ev.Timestamp.Format("2006-01-02T15:04:05Z07:00"), ev.Type, ev.ResourceID, ev.Message)
-		}
+		out.Blank()
 		return nil
 	},
 }
@@ -248,7 +370,10 @@ var rollbackCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Println("rollback_run:", id)
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Rolled back %s", args[0])
+		out.Summary("Rollback run: %s", id)
+		out.Blank()
 		return nil
 	},
 }
@@ -266,7 +391,13 @@ var connectCmd = &cobra.Command{
 		if err := eng.Connect(cmd.Context(), args[0], region); err != nil {
 			return err
 		}
-		fmt.Printf("connected %s %s\n", args[0], region)
+		out.Blank()
+		connMsg := args[0]
+		if region != "" {
+			connMsg += " (" + region + ")"
+		}
+		out.Line(out.Green(out.OK()), "Connected %s", connMsg)
+		out.Blank()
 		return nil
 	},
 }
@@ -282,14 +413,20 @@ var performanceCmd = &cobra.Command{
 			dur = args[4]
 		}
 		candidates := witness.EvaluateBreach(args[1], args[2], args[3])
-		for _, c := range candidates {
-			fmt.Printf("candidate: %s (%s)\n", c.Action, c.Reason)
+		out.Blank()
+		if len(candidates) > 0 {
+			out.Header("Candidate remediations")
+			for _, c := range candidates {
+				out.Line(out.Arrow(), "%s  %s", c.Action, out.Dim(c.Reason))
+			}
+			out.Blank()
 		}
 		id, err := eng.IngestPerformanceBreach(cmd.Context(), args[0], args[1], args[2], args[3], dur)
 		if err != nil {
 			return err
 		}
-		fmt.Println("event_id:", id)
+		out.Line(out.Green(out.OK()), "Recorded performance event %s", id)
+		out.Blank()
 		return nil
 	},
 }
@@ -311,12 +448,14 @@ var serveCmd = &cobra.Command{
 		mux.Handle("/api/", apiHandler)
 		mux.Handle("/", uiHandler)
 
+		out.Blank()
 		if !strings.HasPrefix(addr, ":") {
-			fmt.Println("serving Mission Control + API on", addr)
+			out.Line(out.Green(out.OK()), "Serving Mission Control + API on %s", out.Bold(addr))
 		} else {
-			fmt.Println("serving Mission Control on http://localhost" + addr)
-			fmt.Println("API base: http://localhost" + addr + "/api")
+			out.Line(out.Green(out.OK()), "Serving Mission Control on %s", out.Bold("http://localhost"+addr))
+			out.Summary("API base: http://localhost%s/api", addr)
 		}
+		out.Blank()
 
 		srv := &http.Server{Addr: addr, Handler: mux}
 		go func() {

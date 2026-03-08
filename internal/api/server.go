@@ -158,6 +158,7 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		scrubOutcomes(res.Actions)
 		writeJSON(w, http.StatusOK, res)
 		return
 	}
@@ -356,6 +357,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	scrubOutcomes(res.Actions)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -468,6 +470,14 @@ func scrubAuditEvents(events []state.AuditEvent) {
 func scrubActions(actions []*state.PlanAction) {
 	for _, a := range actions {
 		a.Changes = security.ScrubChanges(a.Changes)
+	}
+}
+
+func scrubOutcomes(outcomes []engine.ActionOutcome) {
+	for _, ao := range outcomes {
+		if ao.Action != nil {
+			ao.Action.Changes = security.ScrubChanges(ao.Action.Changes)
+		}
 	}
 }
 
