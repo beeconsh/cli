@@ -62,6 +62,16 @@ type Graph struct {
 	ActiveProfile string
 }
 
+// NodeByName returns the first node matching the given name, or nil.
+func (g *Graph) NodeByName(name string) *IntentNode {
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == name {
+			return &g.Nodes[i]
+		}
+	}
+	return nil
+}
+
 // Profile is a reusable intent template.
 type Profile struct {
 	Name     string

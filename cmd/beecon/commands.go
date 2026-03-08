@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/terracotta-ai/beecon/internal/api"
+	"github.com/terracotta-ai/beecon/internal/btest"
 	"github.com/terracotta-ai/beecon/internal/cost"
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/scaffold"
@@ -469,6 +470,148 @@ var performanceCmd = &cobra.Command{
 		out.Line(out.Green(out.OK()), "Recorded performance event %s", id)
 		out.Blank()
 		return nil
+	},
+}
+
+var importCmd = &cobra.Command{
+	Use:         "import <provider> <resource-type> <provider-id> [region]",
+	Short:       "Import an existing cloud resource into beecon state",
+	Args:        cobra.RangeArgs(3, 4),
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		region := ""
+		if len(args) > 3 {
+			region = args[3]
+		}
+		resourceID, err := eng.Import(cmd.Context(), args[0], args[1], args[2], region)
+		if err != nil {
+			return err
+		}
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Imported %s as %s", args[2], out.Bold(resourceID))
+		out.Blank()
+		out.Next("run `beecon status` to see the imported resource.")
+		return nil
+	},
+}
+
+var refreshCmd = &cobra.Command{
+	Use:         "refresh [path]",
+	Short:       "Refresh live state for all managed resources",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := beaconPathArg(args)
+		refreshed, observeErrors, err := eng.Refresh(cmd.Context(), path)
+		if err != nil {
+			return err
+		}
+		for _, e := range observeErrors {
+			fmt.Fprintln(os.Stderr, "warning:", e)
+		}
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Refreshed %d resource(s)", refreshed)
+		if len(observeErrors) > 0 {
+			out.Line(out.Yellow(out.Warn()), "%d observe error(s)", len(observeErrors))
+		}
+		out.Blank()
+		return nil
+	},
+}
+
+var testCmd = &cobra.Command{
+	Use:         "test <test-file> [beacon-path]",
+	Short:       "Run assertions against a plan result",
+	Args:        cobra.RangeArgs(1, 2),
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		testPath := args[0]
+		beaconPath := "infra.beecon"
+		if len(args) > 1 {
+			beaconPath = args[1]
+		}
+		res, err := eng.Plan(cmd.Context(), beaconPath)
+		if err != nil {
+			return err
+		}
+		tr, err := btest.RunFile(testPath, res)
+		if err != nil {
+			return err
+		}
+		out.Blank()
+		out.Header("Test: %s", testPath)
+		out.Blank()
+		for _, a := range tr.Assertions {
+			if a.Passed {
+				out.Line(out.Green(out.OK()), "line %d: %s", a.Line, a.Raw)
+			} else {
+				out.Line(out.Red(out.Fail()), "line %d: %s", a.Line, a.Raw)
+				if a.Message != "" {
+					out.Line(" ", "  %s", out.Red(a.Message))
+				}
+			}
+		}
+		out.Blank()
+		out.Summary("%d passed, %d failed", tr.Passed, tr.Failed)
+		out.Blank()
+		if tr.Failed > 0 {
+			return fmt.Errorf("%d assertion(s) failed", tr.Failed)
+		}
+		return nil
+	},
+}
+
+var watchCmd = &cobra.Command{
+	Use:         "watch [path]",
+	Short:       "Watch for drift on a recurring interval",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := beaconPathArg(args)
+		interval, err := time.ParseDuration(watchInterval)
+		if err != nil {
+			return fmt.Errorf("invalid interval %q: %w", watchInterval, err)
+		}
+		out.Blank()
+		out.Line(out.Dot(), "Watching %s every %s (Ctrl+C to stop)", path, interval)
+		out.Blank()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		runCheck := func() {
+			drifted, observeErrors, err := eng.Drift(cmd.Context(), path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  %s drift check failed: %v\n", out.Red(out.Fail()), err)
+				return
+			}
+			for _, e := range observeErrors {
+				fmt.Fprintln(os.Stderr, "  warning:", e)
+			}
+			ts := time.Now().Format("15:04:05")
+			if len(drifted) == 0 {
+				out.Line(out.Dim(ts), "%s no drift", out.Green(out.OK()))
+			} else {
+				out.Line(out.Dim(ts), "%s %d resource(s) drifted", out.Yellow(out.Warn()), len(drifted))
+				for _, r := range drifted {
+					out.Line(" ", "  %s %s", r.ResourceID, out.Dim("("+strings.ToLower(r.NodeType)+")"))
+				}
+			}
+		}
+
+		// Run immediately on start
+		runCheck()
+
+		for {
+			select {
+			case <-cmd.Context().Done():
+				out.Blank()
+				out.Line(out.Dot(), "Watch stopped")
+				return nil
+			case <-ticker.C:
+				runCheck()
+			}
+		}
 	},
 }
 

@@ -547,6 +547,108 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 	return drifted, observeErrors, nil
 }
 
+// Refresh observes all managed resources and updates LiveState + LastSeen
+// without comparing hashes or changing Status.
+func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, error) {
+	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
+	if err != nil {
+		return 0, nil, err
+	}
+	cloudProvider, cloudRegion, err := parseCloud(g)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.Rollback()
+	st := tx.State
+
+	refreshed := 0
+	var observeErrors []error
+	for _, rec := range st.Resources {
+		if !rec.Managed {
+			continue
+		}
+		obs, err := e.exec.Observe(ctx, cloudProvider, cloudRegion, rec)
+		if err != nil {
+			observeErrors = append(observeErrors, fmt.Errorf("observe %s: %w", rec.ResourceID, err))
+			continue
+		}
+		if obs.Exists {
+			if obs.LiveState != nil {
+				rec.LiveState = obs.LiveState
+			}
+			rec.LastSeen = time.Now().UTC()
+			refreshed++
+		}
+	}
+
+	if refreshed > 0 {
+		if err := tx.Commit(); err != nil {
+			return refreshed, observeErrors, err
+		}
+	}
+	return refreshed, observeErrors, nil
+}
+
+// Import imports an existing cloud resource into beecon state by observing it.
+func (e *Engine) Import(ctx context.Context, providerName, resourceType, providerID, region string) (string, error) {
+	nodeID := fmt.Sprintf("%s.%s", resourceType, providerID)
+	rec := &state.ResourceRecord{
+		ResourceID: nodeID,
+		NodeType:   strings.ToUpper(resourceType),
+		NodeName:   providerID,
+		Provider:   strings.ToLower(providerName),
+		ProviderID: providerID,
+		Managed:    false,
+	}
+
+	obs, err := e.exec.Observe(ctx, strings.ToLower(providerName), region, rec)
+	if err != nil {
+		return "", fmt.Errorf("observe %s: %w", providerID, err)
+	}
+	if !obs.Exists {
+		return "", fmt.Errorf("resource %s not found in %s/%s", providerID, providerName, region)
+	}
+
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
+	if existing, ok := st.Resources[nodeID]; ok && existing.Managed {
+		return "", fmt.Errorf("resource %s already exists in state (status=%s)", nodeID, existing.Status)
+	}
+
+	rec.ProviderID = obs.ProviderID
+	if rec.ProviderID == "" {
+		rec.ProviderID = providerID
+	}
+	rec.ProviderRegion = region
+	rec.LiveState = obs.LiveState
+	rec.Managed = true
+	rec.Status = state.StatusObserved
+	rec.LastSeen = time.Now().UTC()
+	rec.IntentSnapshot = map[string]interface{}{}
+	rec.IntentHash = state.HashMap(rec.IntentSnapshot)
+	rec.History = []string{fmt.Sprintf("%s IMPORTED", time.Now().UTC().Format(time.RFC3339))}
+
+	st.Resources[nodeID] = rec
+	addAudit(st, "", "RESOURCE_IMPORTED", nodeID,
+		fmt.Sprintf("imported %s from %s/%s (provider_id=%s)", nodeID, providerName, region, rec.ProviderID), nil)
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return nodeID, nil
+}
+
 func (e *Engine) History(ctx context.Context, resourceID string) ([]state.AuditEvent, error) {
 	e.runExpireApprovals()
 	st, err := e.store.Load()

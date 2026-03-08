@@ -29,6 +29,7 @@ var out = cli.New(os.Stdout)
 // CLI flags
 var profileFlag string
 var forceFlag bool
+var watchInterval string
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -77,6 +78,9 @@ func init() {
 	// Force flag on apply command
 	applyCmd.Flags().BoolVar(&forceFlag, "force", false, "bypass budget enforcement")
 
+	// Interval flag on watch command
+	watchCmd.Flags().StringVar(&watchInterval, "interval", "5m", "drift check interval (e.g. 30s, 5m, 1h)")
+
 	rootCmd.AddCommand(
 		versionCmd,
 		initCmd,
@@ -91,7 +95,11 @@ func init() {
 		historyCmd,
 		rollbackCmd,
 		connectCmd,
+		importCmd,
 		performanceCmd,
+		refreshCmd,
+		testCmd,
+		watchCmd,
 		serveCmd,
 	)
 }
