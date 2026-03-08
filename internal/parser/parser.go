@@ -12,7 +12,7 @@ import (
 	"github.com/terracotta-ai/beecon/internal/ast"
 )
 
-var topLevelBlockPattern = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{$`)
+var topLevelBlockPattern = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_.\-]*)\s*\{$`)
 var nestedBlockPattern = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s*\{$`)
 
 var allowedTopLevelKinds = map[string]bool{

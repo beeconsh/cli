@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/terracotta-ai/beecon/internal/cli"
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/state"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -23,6 +25,10 @@ var eng *engine.Engine
 
 // out is the CLI output writer, initialized once.
 var out = cli.New(os.Stdout)
+
+// CLI flags
+var profileFlag string
+var forceFlag bool
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -47,7 +53,13 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		profile, err := resolveProfile(cwd)
+		if err != nil {
+			return err
+		}
 		eng = engine.New(cwd)
+		eng.ActiveProfile = profile
+		eng.Force = forceFlag
 		return nil
 	},
 }
@@ -58,6 +70,13 @@ var needsEngine = map[string]string{"needs_engine": "true"}
 func init() {
 	rootCmd.Version = fmt.Sprintf("%s (%s)", version, commit)
 	rootCmd.SetVersionTemplate("beecon {{.Version}}\n")
+
+	// Profile flag: --profile (persistent across subcommands)
+	rootCmd.PersistentFlags().StringVar(&profileFlag, "profile", "", "active profile (e.g. production, staging)")
+
+	// Force flag on apply command
+	applyCmd.Flags().BoolVar(&forceFlag, "force", false, "bypass budget enforcement")
+
 	rootCmd.AddCommand(
 		versionCmd,
 		initCmd,
@@ -75,6 +94,32 @@ func init() {
 		performanceCmd,
 		serveCmd,
 	)
+}
+
+// resolveProfile determines the active profile from CLI flag > env var > config file.
+func resolveProfile(cwd string) (string, error) {
+	// 1. CLI flag (highest precedence)
+	if profileFlag != "" {
+		return profileFlag, nil
+	}
+	// 2. Environment variable
+	if env := os.Getenv("BEECON_PROFILE"); env != "" {
+		return env, nil
+	}
+	// 3. Config file
+	configPath := filepath.Join(cwd, ".beecon", "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		// File doesn't exist or can't be read — no config profile
+		return "", nil
+	}
+	var cfg struct {
+		Profile string `yaml:"profile"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return "", fmt.Errorf("parse %s: %w", configPath, err)
+	}
+	return cfg.Profile, nil
 }
 
 func beaconPathArg(args []string) string {
