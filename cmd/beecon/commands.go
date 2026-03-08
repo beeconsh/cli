@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/terracotta-ai/beecon/internal/api"
+	"github.com/terracotta-ai/beecon/internal/cost"
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/scaffold"
 	"github.com/terracotta-ai/beecon/internal/ui"
@@ -132,6 +133,46 @@ var planCmd = &cobra.Command{
 		if approvalCount > 0 {
 			out.Blank()
 			out.Line(out.Yellow(out.Warn()), "%d action(s) require approval before execution.", approvalCount)
+		}
+
+		// Compliance report
+		if cr := res.ComplianceReport; cr != nil && len(cr.Mutations) > 0 {
+			out.Blank()
+			out.Header("Compliance")
+			for _, m := range cr.Mutations {
+				out.Line(out.Dot(), "%s: set %s = %s %s",
+					m.NodeID, m.Field, m.Value, out.Dim("("+m.Framework+": "+m.Reason+")"))
+			}
+		}
+
+		// Cost report
+		if cr := res.CostReport; cr != nil && len(cr.Estimates) > 0 {
+			out.Blank()
+			out.Header("Cost estimate: %s", cost.FormatDelta(cr))
+			for _, est := range cr.Estimates {
+				detail := est.ResourceType
+				if est.InstanceType != "" {
+					detail += " (" + est.InstanceType + ")"
+				}
+				out.Line(out.Dot(), "%s: ~$%.0f/mo %s", est.NodeID, est.MonthlyCost, out.Dim(detail))
+			}
+			if cr.BudgetExceeded && cr.Budget != nil {
+				out.Blank()
+				out.Line(out.Red(out.Fail()), "Exceeds budget of $%.0f/mo", cr.Budget.MonthlyAmount())
+			}
+			for _, w := range cr.Warnings {
+				out.Line(out.Yellow(out.Warn()), "%s", w)
+			}
+			// Cheaper alternatives
+			if len(cr.Alternatives) > 0 {
+				out.Blank()
+				for _, alt := range cr.Alternatives {
+					out.Line(out.Yellow("!"), "%s: %s costs ~$%.0f/mo",
+						alt.NodeName, alt.CurrentInstance, alt.CurrentCost)
+					out.Line(" ", "  > %s at ~$%.0f/mo saves $%.0f/mo",
+						alt.SuggestedInstance, alt.SuggestedCost, alt.MonthlySavings)
+				}
+			}
 		}
 
 		out.Blank()

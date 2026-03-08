@@ -1,0 +1,192 @@
+package wiring
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+
+	"github.com/terracotta-ai/beecon/internal/classify"
+	"github.com/terracotta-ai/beecon/internal/ir"
+)
+
+// WiringResult contains artifacts produced by WireGraph.
+type WiringResult struct {
+	InferredEnvVars   map[string]map[string]string // nodeID → env vars added
+	InferredPolicies  map[string]string            // nodeID → inline policy JSON
+	InferredSGRules   []SGRule
+	Warnings          []string                     // non-fatal warnings surfaced during wiring
+}
+
+// WireGraph infers IAM policies, environment variables, and security group rules
+// from dependency declarations in the intent graph. It mutates IntentNode.Env
+// and IntentNode.Intent in-place.
+func WireGraph(g *ir.Graph) (*WiringResult, error) {
+	result := &WiringResult{
+		InferredEnvVars:  make(map[string]map[string]string),
+		InferredPolicies: make(map[string]string),
+	}
+
+	nodeByName := make(map[string]*ir.IntentNode, len(g.Nodes))
+	for i := range g.Nodes {
+		nodeByName[g.Nodes[i].Name] = &g.Nodes[i]
+	}
+
+	for i := range g.Nodes {
+		node := &g.Nodes[i]
+		if len(node.Needs) == 0 {
+			continue
+		}
+
+		sourceTarget := classify.ClassifyNode(string(node.Type), node.Intent)
+		var allActions []string
+
+		for _, dep := range node.Needs {
+			target, ok := nodeByName[dep.Target]
+			if !ok {
+				return nil, fmt.Errorf("node %q declares dependency on %q but no such node exists in the graph", node.Name, dep.Target)
+			}
+
+			targetTarget := classify.ClassifyNode(string(target.Type), target.Intent)
+
+			// Validate and normalize mode
+			mode, err := NormalizeMode(dep.Mode)
+			if err != nil {
+				return nil, fmt.Errorf("node %q needs %q: %w", node.Name, dep.Target, err)
+			}
+
+			if !IsValidMode(targetTarget, mode) {
+				return nil, fmt.Errorf("node %q: invalid mode %q for %s target %q",
+					node.Name, mode, targetTarget, dep.Target)
+			}
+
+			if mode == ModeAdmin {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("node %q: admin mode on %q grants wildcard IAM actions; review before deploying", node.Name, dep.Target))
+			}
+
+			// Infer IAM actions
+			actions, err := IAMActionsFor(targetTarget, mode)
+			if err == nil {
+				allActions = append(allActions, actions...)
+			} else if targetTarget != "" {
+				// Known target type with no IAM mapping — surface as warning
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("node %q: no IAM actions defined for %s with mode %s; service may lack permissions", node.Name, targetTarget, mode))
+			}
+
+			// Infer env vars (only if not already explicitly set)
+			envVars := InferEnvVars(dep.Target, targetTarget, target.Intent)
+			for k, v := range envVars.Vars {
+				if _, exists := node.Env[k]; !exists {
+					node.Env[k] = v
+					if result.InferredEnvVars[node.ID] == nil {
+						result.InferredEnvVars[node.ID] = make(map[string]string)
+					}
+					result.InferredEnvVars[node.ID][k] = v
+				}
+			}
+
+			// Infer SG rules
+			sgRules := InferSGRules(node.ID, target.ID, sourceTarget, targetTarget, target.Intent)
+			result.InferredSGRules = append(result.InferredSGRules, sgRules...)
+		}
+
+		// Build inline policy from collected IAM actions
+		if len(allActions) > 0 {
+			sort.Strings(allActions)
+			allActions = dedup(allActions)
+			policy := buildInlinePolicy(node.Name, allActions)
+			policyJSON, err := json.Marshal(policy)
+			if err != nil {
+				return nil, fmt.Errorf("marshal inline policy for %s: %w", node.Name, err)
+			}
+			node.Intent["inline_policy"] = string(policyJSON)
+			result.InferredPolicies[node.ID] = string(policyJSON)
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("node %q: IAM policy uses Resource \"*\"; scope to specific ARNs in production", node.Name))
+		}
+	}
+
+	return result, nil
+}
+
+// inlinePolicy represents an AWS IAM inline policy document.
+type inlinePolicy struct {
+	Version   string            `json:"Version"`
+	Statement []policyStatement `json:"Statement"`
+}
+
+type policyStatement struct {
+	Effect   string   `json:"Effect"`
+	Action   []string `json:"Action"`
+	Resource string   `json:"Resource"`
+}
+
+func buildInlinePolicy(nodeName string, actions []string) inlinePolicy {
+	return inlinePolicy{
+		Version: "2012-10-17",
+		Statement: []policyStatement{
+			{
+				Effect:   "Allow",
+				Action:   actions,
+				Resource: "*", // TODO: scope to specific ARNs from state records
+			},
+		},
+	}
+}
+
+func dedup(sorted []string) []string {
+	if len(sorted) == 0 {
+		return sorted
+	}
+	out := []string{sorted[0]}
+	for _, s := range sorted[1:] {
+		if s != out[len(out)-1] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// WiringMetadata tracks what was inferred for a resource (informational).
+type WiringMetadata struct {
+	InferredEnvVars  map[string]string `json:"inferred_env_vars,omitempty"`
+	InferredPolicy   string            `json:"inferred_policy,omitempty"`
+	InferredSGRules  []string          `json:"inferred_sg_rules,omitempty"`
+}
+
+// BuildMetadata constructs WiringMetadata for a node from WiringResult.
+func BuildMetadata(nodeID string, result *WiringResult) *WiringMetadata {
+	if result == nil {
+		return nil
+	}
+	m := &WiringMetadata{}
+	if envs, ok := result.InferredEnvVars[nodeID]; ok {
+		m.InferredEnvVars = envs
+	}
+	if policy, ok := result.InferredPolicies[nodeID]; ok {
+		m.InferredPolicy = policy
+	}
+	for _, sg := range result.InferredSGRules {
+		if sg.SourceNodeID == nodeID || sg.TargetNodeID == nodeID {
+			m.InferredSGRules = append(m.InferredSGRules, sg.Description)
+		}
+	}
+	if len(m.InferredEnvVars) == 0 && m.InferredPolicy == "" && len(m.InferredSGRules) == 0 {
+		return nil
+	}
+	return m
+}
+
+// FormatSGRules returns human-readable SG rule descriptions.
+func FormatSGRules(rules []SGRule) []string {
+	out := make([]string, len(rules))
+	for i, r := range rules {
+		out[i] = fmt.Sprintf("%s → %s (%s/%d): %s",
+			r.SourceNodeID, r.TargetNodeID,
+			r.Protocol, r.Port,
+			r.Description)
+	}
+	return out
+}
+

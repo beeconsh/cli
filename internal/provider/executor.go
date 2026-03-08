@@ -754,6 +754,14 @@ func (e *DefaultExecutor) applyAWSECS(ctx context.Context, c *ecs.Client, req Ap
 	}
 
 	live["cluster"] = defaultString(clusterArn, name)
+
+	// Apply inline policy from wiring inference (if present)
+	if req.Action.Operation != "DELETE" {
+		if err := e.applyInlinePolicyIfPresent(ctx, req); err != nil {
+			return nil, fmt.Errorf("apply inline IAM policy for %s: %w", req.Action.NodeName, err)
+		}
+	}
+
 	return &ApplyResult{ProviderID: defaultString(clusterArn, name), LiveState: live}, nil
 }
 
@@ -836,7 +844,16 @@ func (e *DefaultExecutor) applyAWSLambda(ctx context.Context, c *lambda.Client, 
 			return nil, fmt.Errorf("lambda delete function: %w", err)
 		}
 	}
-	return &ApplyResult{ProviderID: defaultString(arn, name), LiveState: map[string]interface{}{"service": "lambda", "function": defaultString(arn, name), "operation": req.Action.Operation}}, nil
+	live := map[string]interface{}{"service": "lambda", "function": defaultString(arn, name), "operation": req.Action.Operation}
+
+	// Apply inline policy from wiring inference (if present)
+	if req.Action.Operation != "DELETE" {
+		if err := e.applyInlinePolicyIfPresent(ctx, req); err != nil {
+			return nil, fmt.Errorf("apply inline IAM policy for %s: %w", req.Action.NodeName, err)
+		}
+	}
+
+	return &ApplyResult{ProviderID: defaultString(arn, name), LiveState: live}, nil
 }
 
 func (e *DefaultExecutor) applyAWSAPIGateway(ctx context.Context, c *apigatewayv2.Client, req ApplyRequest) (*ApplyResult, error) {
@@ -1144,6 +1161,45 @@ func listAttachedPolicies(ctx context.Context, c *iam.Client, roleName string) (
 		}
 	}
 	return arns, nil
+}
+
+// applyInlinePolicyIfPresent checks the intent for an inline_policy field
+// (injected by the wiring package) and applies it to the resource's IAM role
+// via iam:PutRolePolicy.
+func (e *DefaultExecutor) applyInlinePolicyIfPresent(ctx context.Context, req ApplyRequest) error {
+	policyDoc := intent(req.Intent, "inline_policy")
+	if policyDoc == "" {
+		return nil
+	}
+	roleARN := intent(req.Intent, "role_arn")
+	if roleARN == "" {
+		return nil // no role to attach policy to
+	}
+	// Extract role name from ARN (last segment after /)
+	roleName := roleARN
+	if idx := strings.LastIndex(roleARN, "/"); idx >= 0 {
+		roleName = roleARN[idx+1:]
+	}
+
+	region := intent(req.Intent, "region")
+	if region == "" {
+		region = "us-east-1"
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return fmt.Errorf("aws config for inline policy: %w", err)
+	}
+	iamClient := iam.NewFromConfig(cfg)
+
+	_, err = iamClient.PutRolePolicy(ctx, &iam.PutRolePolicyInput{
+		RoleName:       awsString(roleName),
+		PolicyName:     awsString("beecon-wiring-" + req.Action.NodeName),
+		PolicyDocument: awsString(policyDoc),
+	})
+	if err != nil {
+		return fmt.Errorf("iam put inline policy for %s: %w", req.Action.NodeName, err)
+	}
+	return nil
 }
 
 func (e *DefaultExecutor) applyAWSEC2(ctx context.Context, c *ec2.Client, req ApplyRequest, target string) (*ApplyResult, error) {

@@ -36,6 +36,13 @@ type AuditEvent struct {
 	Data       map[string]interface{} `json:"data,omitempty"`
 }
 
+// WiringMetadata tracks inferred wiring artifacts for a resource.
+type WiringMetadata struct {
+	InferredEnvVars map[string]string `json:"inferred_env_vars,omitempty"`
+	InferredPolicy  string            `json:"inferred_policy,omitempty"`
+	InferredSGRules []string          `json:"inferred_sg_rules,omitempty"`
+}
+
 type ResourceRecord struct {
 	ResourceID      string                 `json:"resource_id"`
 	NodeType        string                 `json:"node_type"`
@@ -56,6 +63,8 @@ type ResourceRecord struct {
 	LastAppliedRun  string                 `json:"last_applied_run,omitempty"`
 	LastOperation   string                 `json:"last_operation,omitempty"`
 	ApprovalBlocked bool                   `json:"approval_blocked,omitempty"`
+	Wiring          *WiringMetadata        `json:"wiring,omitempty"`
+	EstimatedCost   float64                `json:"estimated_cost,omitempty"`
 }
 
 type PlanAction struct {
@@ -89,6 +98,7 @@ type RunRecord struct {
 	Status          RunStatus `json:"status"`
 	Error           string    `json:"error,omitempty"`
 	RollbackOfRunID string    `json:"rollback_of_run_id,omitempty"`
+	ActiveProfile   string    `json:"active_profile,omitempty"`
 }
 
 type ApprovalStatus string
@@ -100,19 +110,20 @@ const (
 )
 
 type ApprovalRequest struct {
-	ID          string         `json:"id"`
-	CreatedAt   time.Time      `json:"created_at"`
-	RunID       string         `json:"run_id"`
-	ActionIDs   []string       `json:"action_ids"`
-	Reason      string         `json:"reason"`
-	Status      ApprovalStatus `json:"status"`
-	ResolvedBy  string         `json:"resolved_by,omitempty"`
-	ResolvedAt  *time.Time     `json:"resolved_at,omitempty"`
-	ExpiresAt   time.Time      `json:"expires_at"`
-	BeaconPath  string         `json:"beacon_path"`
-	IntentHash  string         `json:"intent_hash,omitempty"`
-	CostDelta   string         `json:"cost_delta,omitempty"`
-	BlastRadius string         `json:"blast_radius,omitempty"`
+	ID            string         `json:"id"`
+	CreatedAt     time.Time      `json:"created_at"`
+	RunID         string         `json:"run_id"`
+	ActionIDs     []string       `json:"action_ids"`
+	Reason        string         `json:"reason"`
+	Status        ApprovalStatus `json:"status"`
+	ResolvedBy    string         `json:"resolved_by,omitempty"`
+	ResolvedAt    *time.Time     `json:"resolved_at,omitempty"`
+	ExpiresAt     time.Time      `json:"expires_at"`
+	BeaconPath    string         `json:"beacon_path"`
+	IntentHash    string         `json:"intent_hash,omitempty"`
+	CostDelta     string         `json:"cost_delta,omitempty"`
+	BlastRadius   string         `json:"blast_radius,omitempty"`
+	ActiveProfile string         `json:"active_profile,omitempty"`
 }
 
 type ProviderConnection struct {

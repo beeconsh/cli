@@ -1,0 +1,376 @@
+package wiring
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/terracotta-ai/beecon/internal/ir"
+	"github.com/terracotta-ai/beecon/internal/parser"
+)
+
+func buildGraph(t *testing.T, src string) *ir.Graph {
+	t.Helper()
+	f, err := parser.Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := ir.Build(f, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+func TestWireGraphInfersEnvVars(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store postgres {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    postgres = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	// Check inferred env vars on the service node
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	if apiNode.Env["DATABASE_URL"] == "" {
+		t.Error("expected DATABASE_URL env var to be inferred")
+	}
+	if apiNode.Env["HOST"] == "" {
+		t.Error("expected HOST env var to be inferred")
+	}
+
+	// Check inferred env vars in result
+	if len(result.InferredEnvVars["service.api"]) == 0 {
+		t.Error("expected inferred env vars in result")
+	}
+}
+
+func TestWireGraphInfersIAMPolicy(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store mydb {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    mydb = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	// Check inline policy was set
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	if apiNode.Intent["inline_policy"] == "" {
+		t.Error("expected inline_policy to be set")
+	}
+	if !strings.Contains(apiNode.Intent["inline_policy"], "rds-data") {
+		t.Error("expected inline_policy to contain rds-data actions")
+	}
+
+	if len(result.InferredPolicies) == 0 {
+		t.Error("expected inferred policies in result")
+	}
+}
+
+func TestWireGraphSGRules(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store db {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    db = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	if len(result.InferredSGRules) == 0 {
+		t.Error("expected SG rules for VPC-resident resources")
+	}
+	for _, rule := range result.InferredSGRules {
+		if rule.Port != 5432 {
+			t.Errorf("expected port 5432, got %d", rule.Port)
+		}
+	}
+}
+
+func TestWireGraphExplicitEnvWins(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store postgres {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    postgres = read_write
+  }
+  env {
+    DATABASE_URL = my-custom-url
+  }
+}
+`)
+	_, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	if apiNode.Env["DATABASE_URL"] != "my-custom-url" {
+		t.Errorf("explicit env should win, got %q", apiNode.Env["DATABASE_URL"])
+	}
+}
+
+func TestWireGraphInvalidMode(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store db {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    db = publish
+  }
+}
+`)
+	_, err := WireGraph(g)
+	if err == nil {
+		t.Fatal("expected error for invalid mode 'publish' on rds target")
+	}
+	if !strings.Contains(err.Error(), "invalid mode") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestWireGraphS3Dependency(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store uploads {
+  engine = s3
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    uploads = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+
+	// Should infer S3 env vars (prefixed with UPLOADS_ since dep name != target type)
+	if apiNode.Env["UPLOADS_BUCKET_NAME"] == "" {
+		t.Error("expected UPLOADS_BUCKET_NAME env var")
+	}
+
+	// Inline policy should contain s3 actions
+	if !strings.Contains(apiNode.Intent["inline_policy"], "s3:GetObject") {
+		t.Error("expected s3:GetObject in inline policy")
+	}
+
+	// No SG rules for S3 (not VPC-resident)
+	if len(result.InferredSGRules) != 0 {
+		t.Error("expected no SG rules for S3")
+	}
+}
+
+func TestNormalizeModeVariants(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected Mode
+	}{
+		{"read", ModeRead},
+		{"read_only", ModeRead},
+		{"ro", ModeRead},
+		{"write", ModeWrite},
+		{"read_write", ModeReadWrite},
+		{"rw", ModeReadWrite},
+		{"invoke", ModeInvoke},
+		{"publish", ModePublish},
+		{"pub", ModePublish},
+		{"subscribe", ModeSubscribe},
+		{"sub", ModeSubscribe},
+		{"admin", ModeAdmin},
+	}
+	for _, tt := range tests {
+		m, err := NormalizeMode(tt.input)
+		if err != nil {
+			t.Errorf("NormalizeMode(%q) error: %v", tt.input, err)
+			continue
+		}
+		if m != tt.expected {
+			t.Errorf("NormalizeMode(%q) = %q, want %q", tt.input, m, tt.expected)
+		}
+	}
+}
+
+func TestNormalizeModeInvalid(t *testing.T) {
+	_, err := NormalizeMode("destroy")
+	if err == nil {
+		t.Error("expected error for unknown mode")
+	}
+}
+
+func TestIsValidModeDeniesUnknownTargets(t *testing.T) {
+	if IsValidMode("unknown_type", ModeRead) {
+		t.Error("expected unknown targets to be denied by default")
+	}
+	// Empty target (unclassified) should be allowed
+	if !IsValidMode("", ModeRead) {
+		t.Error("expected empty target to be allowed")
+	}
+}
+
+func TestWireGraphDanglingDependencyError(t *testing.T) {
+	// Manually create a graph with a dangling dependency (target doesn't exist as a node)
+	g := &ir.Graph{
+		Nodes: []ir.IntentNode{
+			{
+				ID:   "service.api",
+				Name: "api",
+				Type: ir.NodeService,
+				Intent: map[string]string{"runtime": "container(from: ./Dockerfile)"},
+				Env:  map[string]string{},
+				Needs: []ir.Dependency{{Target: "nonexistent", Mode: "read"}},
+			},
+		},
+	}
+	_, err := WireGraph(g)
+	if err == nil {
+		t.Fatal("expected error for dangling dependency reference")
+	}
+	if !strings.Contains(err.Error(), "no such node exists") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestWireGraphAdminModeWarning(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store mydb {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    mydb = admin
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+	foundAdmin := false
+	foundResource := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "admin mode") {
+			foundAdmin = true
+		}
+		if strings.Contains(w, "Resource \"*\"") {
+			foundResource = true
+		}
+	}
+	if !foundAdmin {
+		t.Error("expected admin mode warning")
+	}
+	if !foundResource {
+		t.Error("expected Resource \"*\" warning")
+	}
+}
+
+func TestWireGraphNoDependencies(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+	if len(result.InferredEnvVars) != 0 {
+		t.Error("expected no inferred env vars for node without dependencies")
+	}
+	if len(result.InferredPolicies) != 0 {
+		t.Error("expected no inferred policies")
+	}
+}
