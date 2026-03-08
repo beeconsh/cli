@@ -84,6 +84,13 @@ var planCmd = &cobra.Command{
 		}
 
 		if formatFlag == "json" {
+			for i := range res.Graph.Nodes {
+				res.Graph.Nodes[i].Intent = security.ScrubStringMap(res.Graph.Nodes[i].Intent)
+				res.Graph.Nodes[i].Env = security.ScrubStringMap(res.Graph.Nodes[i].Env)
+			}
+			for _, a := range res.Plan.Actions {
+				a.Changes = security.ScrubChanges(a.Changes)
+			}
 			return cli.WriteJSON(os.Stdout, res)
 		}
 
@@ -145,14 +152,22 @@ var planCmd = &cobra.Command{
 						if k == "inline_policy" {
 							continue // too verbose
 						}
-						out.DiffLine("CREATE", k, node.Intent[k])
+						v := node.Intent[k]
+						if security.IsSensitiveKey(k) {
+							v = "**REDACTED**"
+						}
+						out.DiffLine("CREATE", k, v)
 					}
 				}
 			} else if a.Operation == "DELETE" {
 				out.DiffLine("DELETE", a.NodeID, "(removed)")
 			} else if a.Operation == "UPDATE" && len(a.Changes) > 0 {
 				for _, k := range sortedKeys(a.Changes) {
-					out.DiffLine("UPDATE", k, a.Changes[k])
+					v := a.Changes[k]
+					if security.IsSensitiveKey(k) {
+						v = "**REDACTED**"
+					}
+					out.DiffLine("UPDATE", k, v)
 				}
 			}
 		}
@@ -221,6 +236,9 @@ var applyCmd = &cobra.Command{
 		}
 
 		if formatFlag == "json" {
+			for i := range res.Actions {
+				res.Actions[i].Action.Changes = security.ScrubChanges(res.Actions[i].Action.Changes)
+			}
 			return cli.WriteJSON(os.Stdout, res)
 		}
 
@@ -384,6 +402,10 @@ var driftCmd = &cobra.Command{
 			errStrs := make([]string, len(observeErrors))
 			for i, e := range observeErrors {
 				errStrs[i] = e.Error()
+			}
+			for _, rec := range drifted {
+				rec.IntentSnapshot = security.ScrubMap(rec.IntentSnapshot)
+				rec.LiveState = security.ScrubMap(rec.LiveState)
 			}
 			return cli.WriteJSON(os.Stdout, struct {
 				Drifted []*state.ResourceRecord `json:"drifted"`

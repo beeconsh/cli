@@ -591,11 +591,13 @@ func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, 
 			observeErrors = append(observeErrors, fmt.Errorf("observe %s: %w", rec.ResourceID, err))
 			continue
 		}
-		if obs.LiveState != nil {
-			rec.LiveState = obs.LiveState
+		if obs.Exists {
+			if obs.LiveState != nil {
+				rec.LiveState = obs.LiveState
+			}
+			rec.LastSeen = time.Now().UTC()
+			refreshed++
 		}
-		rec.LastSeen = time.Now().UTC()
-		refreshed++
 	}
 
 	if refreshed > 0 {
@@ -735,6 +737,11 @@ func (e *Engine) Import(ctx context.Context, providerName, resourceType, provide
 	}
 	defer tx.Rollback()
 	st := tx.State
+	expireApprovalsInline(st)
+
+	if existing, ok := st.Resources[nodeID]; ok && existing.Managed {
+		return "", fmt.Errorf("resource %s already exists in state (status=%s)", nodeID, existing.Status)
+	}
 
 	rec.ProviderID = obs.ProviderID
 	if rec.ProviderID == "" {
@@ -940,6 +947,7 @@ func applyAction(ctx context.Context, exec provider.Executor, cloudProvider, clo
 		}
 		rec.LastSeen = time.Now().UTC()
 		rec.Status = state.StatusMatched
+		clearDrift(rec)
 		rec.AgentReasoning = a.Reasoning
 		rec.LastAppliedRun = runID
 		rec.LastOperation = a.Operation

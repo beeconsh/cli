@@ -66,7 +66,7 @@ const _bk=document.querySelector('meta[name="beecon-api-key"]');
 const _ak=_bk?_bk.content:'';
 async function j(url){const o={};if(_ak)o.headers={'Authorization':'Bearer '+_ak};const r=await fetch(url,o);return r.json();}
 async function post(url,body){const o={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};if(_ak)o.headers['Authorization']='Bearer '+_ak;const r=await fetch(url,o);return r.json();}
-function esc(s){return (s??'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function esc(s){return (s??'').toString().replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function statusBadge(s){
   const t=(s||'').toUpperCase();
   if(t==='APPLIED'||t==='MATCHED') return '<span class="badge b-ok">'+esc(t)+'</span>';
