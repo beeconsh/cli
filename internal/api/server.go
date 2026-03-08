@@ -479,6 +479,7 @@ func (s *Server) performance(w http.ResponseWriter, r *http.Request) {
 func scrubNodes(nodes []ir.IntentNode) {
 	for i := range nodes {
 		nodes[i].Intent = security.ScrubStringMap(nodes[i].Intent)
+		nodes[i].Env = security.ScrubStringMap(nodes[i].Env)
 	}
 }
 
