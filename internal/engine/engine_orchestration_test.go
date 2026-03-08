@@ -4,10 +4,32 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/terracotta-ai/beecon/internal/provider"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
+
+// importTestExecutor is a test executor that returns Exists=true for Observe,
+// allowing Import to succeed in test environments without real cloud calls.
+type importTestExecutor struct {
+	provider.Executor
+}
+
+func (e *importTestExecutor) Observe(_ context.Context, _, _ string, rec *state.ResourceRecord) (*provider.ObserveResult, error) {
+	return &provider.ObserveResult{
+		Exists:     true,
+		ProviderID: rec.ProviderID,
+		LiveState:  map[string]interface{}{"status": "available"},
+	}, nil
+}
+
+func (e *importTestExecutor) Apply(_ context.Context, req provider.ApplyRequest) (*provider.ApplyResult, error) {
+	return &provider.ApplyResult{ProviderID: req.Record.ProviderID}, nil
+}
+
+func (e *importTestExecutor) IsDryRun() bool { return true }
 
 const basicBeacon = `domain acme {
   cloud = aws(region: us-east-1)
@@ -522,5 +544,207 @@ store postgres {
 	}
 	if res.CostReport == nil {
 		t.Fatal("expected cost report with budget")
+	}
+}
+
+// --- Reject clears ApprovalBlocked ---
+
+const approveGateBeacon = `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+  boundary {
+    approve = [new_store]
+  }
+}
+store postgres {
+  engine = postgres
+}
+`
+
+func TestRejectClearsApprovalBlocked(t *testing.T) {
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, approveGateBeacon)
+
+	ctx := context.Background()
+	e := New(dir)
+	res, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.ApprovalRequestID == "" {
+		t.Fatal("expected approval request for new_store gate")
+	}
+
+	// The approval gate triggers on CREATE for STORE, but since it's a fresh
+	// CREATE, the resource record doesn't exist yet. Manually set ApprovalBlocked
+	// on the resource to simulate the state after a resource already exists and
+	// an approval is pending.
+	st, err := e.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Find the action to get the node ID
+	req := st.Approvals[res.ApprovalRequestID]
+	if req == nil {
+		t.Fatal("approval request not found in state")
+	}
+	for _, actionID := range req.ActionIDs {
+		a := st.Actions[actionID]
+		if a == nil {
+			continue
+		}
+		// Create the resource record with ApprovalBlocked=true
+		st.Resources[a.NodeID] = &state.ResourceRecord{
+			ResourceID:      a.NodeID,
+			NodeType:        a.NodeType,
+			NodeName:        a.NodeName,
+			Managed:         false,
+			ApprovalBlocked: true,
+		}
+	}
+	if err := e.store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reject the approval
+	if err := e.Reject(ctx, res.ApprovalRequestID, "tester", "no"); err != nil {
+		t.Fatalf("reject failed: %v", err)
+	}
+
+	// Verify ApprovalBlocked is cleared
+	st, err = e.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, rec := range st.Resources {
+		if rec.ApprovalBlocked {
+			t.Fatalf("resource %s still has ApprovalBlocked=true after rejection", id)
+		}
+	}
+}
+
+// --- Rollback guards run status ---
+
+func TestRollbackGuardsRunStatus(t *testing.T) {
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, noBoundaryBeacon)
+
+	ctx := context.Background()
+	e := New(dir)
+
+	res, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	// First rollback should succeed
+	_, err = e.Rollback(ctx, res.RunID)
+	if err != nil {
+		t.Fatalf("first rollback failed: %v", err)
+	}
+
+	// Second rollback of same run should fail with status guard
+	_, err = e.Rollback(ctx, res.RunID)
+	if err == nil {
+		t.Fatal("expected error on second rollback")
+	}
+	if !strings.Contains(err.Error(), "status is ROLLED_BACK") {
+		t.Fatalf("expected status guard error, got: %v", err)
+	}
+}
+
+// --- Rollback updates original run status ---
+
+func TestRollbackUpdatesOriginalRunStatus(t *testing.T) {
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, noBoundaryBeacon)
+
+	ctx := context.Background()
+	e := New(dir)
+
+	res, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	_, err = e.Rollback(ctx, res.RunID)
+	if err != nil {
+		t.Fatalf("rollback failed: %v", err)
+	}
+
+	st, err := e.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := st.Runs[res.RunID]
+	if run == nil {
+		t.Fatalf("original run %s not found", res.RunID)
+	}
+	if run.Status != state.RunRolledBack {
+		t.Fatalf("expected original run status ROLLED_BACK, got %s", run.Status)
+	}
+}
+
+// --- Approve validates run status ---
+
+func TestApproveValidatesRunStatus(t *testing.T) {
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, approveGateBeacon)
+
+	ctx := context.Background()
+	e := New(dir)
+
+	res, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if res.ApprovalRequestID == "" {
+		t.Fatal("expected approval request")
+	}
+
+	// Approve it
+	_, err = e.Approve(ctx, res.ApprovalRequestID, "tester")
+	if err != nil {
+		t.Fatalf("approve failed: %v", err)
+	}
+
+	// Try to approve the same request again — should fail because status is APPROVED
+	_, err = e.Approve(ctx, res.ApprovalRequestID, "tester")
+	if err == nil {
+		t.Fatal("expected error on second approve")
+	}
+}
+
+// --- Import short name ---
+
+func TestImportShortName(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	e := &Engine{
+		store: state.NewStore(dir),
+		root:  dir,
+		exec:  &importTestExecutor{},
+	}
+
+	// Import with an ARN-like provider ID
+	nodeID, err := e.Import(ctx, "aws", "store", "arn:aws:s3:::my-bucket", "us-east-1")
+	if err != nil {
+		t.Fatalf("import failed: %v", err)
+	}
+	if nodeID != "store.my-bucket" {
+		t.Fatalf("expected node ID store.my-bucket, got %s", nodeID)
+	}
+
+	// Verify in state
+	st, err := e.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := st.Resources["store.my-bucket"]
+	if rec == nil {
+		t.Fatal("expected resource store.my-bucket in state")
+	}
+	if rec.LastOperation != "IMPORT" {
+		t.Fatalf("expected LastOperation IMPORT, got %s", rec.LastOperation)
 	}
 }
