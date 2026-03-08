@@ -217,6 +217,28 @@ service api {
 	}
 }
 
+func TestBuildWarnsOnUnknownProfile(t *testing.T) {
+	src := `domain test {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+service api {
+  runtime = container
+}
+`
+	f, err := parser.Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	_, err = Build(f, "test", "nonexistent-profile")
+	if err == nil {
+		t.Error("expected error for unknown profile")
+	}
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
 func TestProfileInheritanceApplied(t *testing.T) {
 	src := `domain acme {
   cloud = aws(region: us-east-1)

@@ -109,23 +109,60 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 	}
 
 	// Inject inferred SG rules into security_group NETWORK nodes.
-	// At wiring time we don't know which SG protects which resource, so rules
-	// are injected into all security_group nodes. This matches the IAM policy
-	// pattern of using Resource:"*" — scope in production.
+	// Use graph edges to scope rules: only inject into the SG that a related
+	// node (source or target of the rule) depends on. If no edge-based match
+	// is found, fall back to injecting into all SG nodes.
 	if len(result.InferredSGRules) > 0 {
-		var sgNodes []*ir.IntentNode
+		sgNodesByID := make(map[string]*ir.IntentNode)
 		for i := range g.Nodes {
 			if g.Nodes[i].Type == ir.NodeNetwork && g.Nodes[i].Intent["topology"] == "security_group" {
-				sgNodes = append(sgNodes, &g.Nodes[i])
+				sgNodesByID[g.Nodes[i].ID] = &g.Nodes[i]
 			}
 		}
-		if len(sgNodes) > 0 {
-			var parts []string
-			for _, r := range result.InferredSGRules {
-				parts = append(parts, fmt.Sprintf("%s:%d:0.0.0.0/0", r.Protocol, r.Port))
+		if len(sgNodesByID) > 0 {
+			// Build a mapping: nodeID → set of security_group IDs it depends on via graph edges.
+			nodeToSGs := make(map[string]map[string]bool)
+			for _, edge := range g.Edges {
+				if _, ok := sgNodesByID[edge.From]; ok {
+					// edge.From is an SG, edge.To depends on it
+					if nodeToSGs[edge.To] == nil {
+						nodeToSGs[edge.To] = make(map[string]bool)
+					}
+					nodeToSGs[edge.To][edge.From] = true
+				}
 			}
-			inferred := strings.Join(parts, ",")
-			for _, sgNode := range sgNodes {
+
+			// Track which SG nodes received at least one scoped rule.
+			injected := make(map[string][]string) // sgNodeID → rule strings
+			unscoped := false
+
+			for _, r := range result.InferredSGRules {
+				ruleStr := fmt.Sprintf("%s:%d:0.0.0.0/0", r.Protocol, r.Port)
+
+				// Find SGs associated with either source or target of the rule.
+				matched := make(map[string]bool)
+				for _, nid := range []string{r.SourceNodeID, r.TargetNodeID} {
+					for sgID := range nodeToSGs[nid] {
+						matched[sgID] = true
+					}
+				}
+
+				if len(matched) > 0 {
+					for sgID := range matched {
+						injected[sgID] = append(injected[sgID], ruleStr)
+					}
+				} else {
+					// No edge-based match — fall back to all SG nodes.
+					unscoped = true
+					for sgID := range sgNodesByID {
+						injected[sgID] = append(injected[sgID], ruleStr)
+					}
+				}
+			}
+
+			for sgID, rules := range injected {
+				sgNode := sgNodesByID[sgID]
+				inferred := strings.Join(rules, ",")
 				existing := sgNode.Intent["ingress"]
 				if existing != "" {
 					sgNode.Intent["ingress"] = existing + "," + inferred
@@ -133,8 +170,14 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 					sgNode.Intent["ingress"] = inferred
 				}
 			}
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("injected %d inferred SG ingress rule(s) using 0.0.0.0/0; scope to specific CIDRs in production", len(result.InferredSGRules)))
+
+			if unscoped {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("injected %d inferred SG ingress rule(s) into all security_group nodes (no edge-based scoping); scope to specific CIDRs in production", len(result.InferredSGRules)))
+			} else {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("injected %d inferred SG ingress rule(s) scoped by graph edges using 0.0.0.0/0; scope to specific CIDRs in production", len(result.InferredSGRules)))
+			}
 		}
 	}
 

@@ -12,7 +12,8 @@ import (
 	"github.com/terracotta-ai/beecon/internal/ast"
 )
 
-var topLevelBlockPattern = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_.\-]*)\s*\{$`)
+var topLevelBlockPattern = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_\-]*)\s*\{$`)
+var profileBlockPattern = regexp.MustCompile(`^(profile)\s+([a-zA-Z_][a-zA-Z0-9_.\-]*)\s*\{$`)
 var nestedBlockPattern = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s*\{$`)
 
 var allowedTopLevelKinds = map[string]bool{
@@ -200,7 +201,12 @@ func stripComment(line string) string {
 
 func parseBlockHeader(line string, topLevel bool) (*ast.Block, error) {
 	if topLevel {
-		m := topLevelBlockPattern.FindStringSubmatch(line)
+		// Profile blocks allow dots in names (e.g., "standard.production").
+		m := profileBlockPattern.FindStringSubmatch(line)
+		if len(m) == 3 {
+			return &ast.Block{Kind: strings.ToLower(m[1]), Name: m[2], Fields: map[string]ast.Value{}}, nil
+		}
+		m = topLevelBlockPattern.FindStringSubmatch(line)
 		if len(m) == 3 {
 			return &ast.Block{Kind: strings.ToLower(m[1]), Name: m[2], Fields: map[string]ast.Value{}}, nil
 		}
