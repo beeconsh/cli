@@ -24,6 +24,9 @@ func applyGCPCloudCDN(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 		return nil, fmt.Errorf("cloud_cdn requires intent.project_id")
 	}
 	name := req.RecordProviderID()
+	if name != "" && strings.Contains(name, "/") {
+		name = name[strings.LastIndex(name, "/")+1:]
+	}
 	if name == "" {
 		name = strings.TrimPrefix(identifierFor(req.Action.NodeName), "beecon-")
 	}
@@ -112,7 +115,10 @@ func applyGCPCloudCDN(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 			existing.CdnPolicy.NegativeCaching = neg == "true"
 		}
 
-		if _, err := svc.BackendServices.Update(projectID, name, existing).Context(ctx).Do(); err != nil {
+		if err := withGCPRetry(ctx, "cloud_cdn_update", func() error {
+			_, err := svc.BackendServices.Update(projectID, name, existing).Context(ctx).Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("cloud cdn update backend service: %w", err)
 		}
 
@@ -302,7 +308,10 @@ func applyGCPCloudMonitoring(ctx context.Context, req ApplyRequest) (*ApplyResul
 			existing.NotificationChannels = channels
 		}
 
-		if _, err := svc.Projects.AlertPolicies.Patch(policyName, existing).Context(ctx).Do(); err != nil {
+		if err := withGCPRetry(ctx, "cloud_monitoring_update", func() error {
+			_, err := svc.Projects.AlertPolicies.Patch(policyName, existing).Context(ctx).Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("cloud monitoring update alert policy: %w", err)
 		}
 		result.ProviderID = policyName
@@ -395,6 +404,9 @@ func applyGCPEventarc(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 		return nil, fmt.Errorf("eventarc requires intent.project_id")
 	}
 	name := req.RecordProviderID()
+	if name != "" && strings.Contains(name, "/") {
+		name = name[strings.LastIndex(name, "/")+1:]
+	}
 	if name == "" {
 		name = strings.TrimPrefix(identifierFor(req.Action.NodeName), "beecon-")
 	}
@@ -436,18 +448,10 @@ func applyGCPEventarc(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 			Destination: &eventarc.Destination{},
 		}
 
-		// Parse destination — could be a Cloud Run service or other
-		if strings.Contains(destination, "/services/") {
-			trigger.Destination.CloudRun = &eventarc.CloudRun{
-				Service: destination,
-				Region:  region,
-			}
-		} else {
-			// Assume it's a Cloud Run service name in the same project
-			trigger.Destination.CloudRun = &eventarc.CloudRun{
-				Service: destination,
-				Region:  region,
-			}
+		// Parse destination — Cloud Run service (full path or short name)
+		trigger.Destination.CloudRun = &eventarc.CloudRun{
+			Service: destination,
+			Region:  region,
 		}
 
 		// Parse event filters
@@ -498,7 +502,10 @@ func applyGCPEventarc(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 			existing.EventFilters = parseEventFilters(filtersRaw)
 		}
 
-		if _, err := svc.Projects.Locations.Triggers.Patch(fullName, existing).Context(ctx).Do(); err != nil {
+		if err := withGCPRetry(ctx, "eventarc_update", func() error {
+			_, err := svc.Projects.Locations.Triggers.Patch(fullName, existing).Context(ctx).Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("eventarc update trigger: %w", err)
 		}
 
