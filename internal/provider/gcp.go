@@ -114,8 +114,10 @@ case "cloud_functions":
 		result, applyErr = applyGCPCloudMonitoring(ctx, req)
 	case "eventarc":
 		result, applyErr = applyGCPEventarc(ctx, req)
-	case "api_gateway", "identity_platform":
-		result, applyErr = applyGCPProjectScopedGeneric(ctx, target, req)
+	case "api_gateway":
+		result, applyErr = applyGCPAPIGateway(ctx, req)
+	case "identity_platform":
+		result, applyErr = applyGCPIdentityPlatform(ctx, req)
 	default:
 		return nil, fmt.Errorf("gcp target %q is recognized but requires additional adapter implementation for live execution (set BEECON_EXECUTE!=1 for dry-run)", target)
 	}
@@ -308,8 +310,10 @@ case "cloud_functions":
 		return observeGCPCloudMonitoring(ctx, rec)
 	case "eventarc":
 		return observeGCPEventarc(ctx, rec)
-	case "api_gateway", "identity_platform":
-		return observeGCPProjectScopedGeneric(ctx, target, rec)
+	case "api_gateway":
+		return observeGCPAPIGateway(ctx, rec)
+	case "identity_platform":
+		return observeGCPIdentityPlatform(ctx, rec)
 	default:
 		return &ObserveResult{Exists: rec.Managed, ProviderID: rec.ProviderID, LiveState: rec.LiveState}, nil
 	}
@@ -1770,6 +1774,12 @@ func detectGCPRecordTarget(rec *state.ResourceRecord) string {
 		if svc == "pubsub" {
 			return "pubsub"
 		}
+		if svc == "api_gateway" || svc == "gateway" {
+			return "api_gateway"
+		}
+		if svc == "identity_platform" || svc == "identity" {
+			return "identity_platform"
+		}
 		runtime := strings.ToLower(intentString(rec.IntentSnapshot, "intent.runtime"))
 		if strings.Contains(runtime, "pubsub") {
 			return "pubsub"
@@ -1788,6 +1798,12 @@ func detectGCPRecordTarget(rec *state.ResourceRecord) string {
 		}
 		if strings.Contains(runtime, "gke") {
 			return "gke"
+		}
+		if strings.Contains(runtime, "api_gateway") || strings.Contains(runtime, "gateway") {
+			return "api_gateway"
+		}
+		if strings.Contains(runtime, "identity") {
+			return "identity_platform"
 		}
 	}
 	if rec.NodeType == "COMPUTE" {
@@ -1910,9 +1926,14 @@ case "cloud_functions":
 			return fmt.Errorf("eventarc requires intent.project_id")
 		}
 		return nil
-	case "api_gateway", "identity_platform":
+	case "api_gateway":
 		if requiredIntent(intentMap, "project_id") == "" {
-			return fmt.Errorf("%s requires intent.project_id", target)
+			return fmt.Errorf("api_gateway requires intent.project_id")
+		}
+		return nil
+	case "identity_platform":
+		if requiredIntent(intentMap, "project_id") == "" {
+			return fmt.Errorf("identity_platform requires intent.project_id")
 		}
 		return nil
 	default:
