@@ -39,12 +39,13 @@ type IntentNode struct {
 
 // DomainNode captures root constraints.
 type DomainNode struct {
-	Name       string
-	Cloud      string
-	Owner      string
-	Compliance []string
-	Boundary   map[string][]string
-	Budget     string
+	Name        string
+	Cloud       string
+	Owner       string
+	Compliance  []string
+	Boundary    map[string][]string
+	Budget      string
+	AutoApprove map[string]string // e.g., {"max_cost_delta": "100", "max_risk": "medium"}
 }
 
 // Edge represents a dependency relation (From -> To).
@@ -156,14 +157,19 @@ func Build(f *ast.File, source string, activeProfile ...string) (*Graph, error) 
 				d.Budget = v.Raw
 			}
 			for _, c := range b.Children {
-				if c.Kind != "boundary" {
-					continue
-				}
-				for k, v := range c.Fields {
-					if v.IsList() {
-						d.Boundary[k] = append([]string{}, v.List...)
-					} else {
-						d.Boundary[k] = []string{v.Raw}
+				switch c.Kind {
+				case "boundary":
+					for k, v := range c.Fields {
+						if v.IsList() {
+							d.Boundary[k] = append([]string{}, v.List...)
+						} else {
+							d.Boundary[k] = []string{v.Raw}
+						}
+					}
+				case "auto_approve":
+					d.AutoApprove = map[string]string{}
+					for k, v := range c.Fields {
+						d.AutoApprove[k] = v.Raw
 					}
 				}
 			}

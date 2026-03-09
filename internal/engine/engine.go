@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +61,8 @@ type PlanSummary struct {
 	TotalMonthlyCost    float64 `json:"total_monthly_cost"`
 	CostDelta           float64 `json:"cost_delta,omitempty"`
 	BudgetRemaining     float64 `json:"budget_remaining,omitempty"`
+	BudgetUtilization   float64 `json:"budget_utilization,omitempty"`
+	BudgetWarning       string  `json:"budget_warning,omitempty"`
 }
 
 type ActionStatus int
@@ -199,7 +202,7 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 		}
 	}
 	costReport := cost.Evaluate(p, g, st, budget)
-	summary := enrichPlanActions(p, costReport, compReport)
+	summary := enrichPlanActions(p, costReport, compReport, st, g.Domain)
 
 	logging.Logger.Debug("plan:complete", "actions", len(p.Actions), "provider", cloudProvider, "region", cloudRegion)
 	return &PlanResult{
@@ -263,6 +266,9 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 		return nil, fmt.Errorf("estimated cost $%.0f/mo exceeds budget $%.0f/mo (use --force to override)",
 			costReport.TotalMonthlyCost, budget.MonthlyAmount())
 	}
+
+	// Enrich plan actions with cost delta, risk scores, and auto-approve policy.
+	applySummary := enrichPlanActions(p, costReport, compReport, st, g.Domain)
 
 	// Compute intent hash for approval integrity.
 	content, err := os.ReadFile(abs)
@@ -362,8 +368,8 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 			ExpiresAt:     time.Now().UTC().Add(24 * time.Hour),
 			BeaconPath:    abs,
 			IntentHash:    intentHash,
-			CostDelta:     cost.FormatDelta(costReport),
-			BlastRadius:   fmt.Sprintf("%d actions", len(pending)),
+			CostDelta:     formatCostDelta(applySummary),
+			BlastRadius:   formatBlastRadius(applySummary, len(pending)),
 			ActiveProfile: e.ActiveProfile,
 		}
 		for _, a := range pending {
@@ -1756,7 +1762,7 @@ func maskIdentity(id string) string {
 
 // enrichPlanActions annotates each PlanAction with cost, risk, rollback feasibility,
 // and compliance mutation count, then builds an aggregate PlanSummary.
-func enrichPlanActions(p *resolver.Plan, cr *cost.CostReport, compReport *compliance.ComplianceReport) *PlanSummary {
+func enrichPlanActions(p *resolver.Plan, cr *cost.CostReport, compReport *compliance.ComplianceReport, st *state.State, domain *ir.DomainNode) *PlanSummary {
 	if p == nil {
 		return nil
 	}
@@ -1777,6 +1783,7 @@ func enrichPlanActions(p *resolver.Plan, cr *cost.CostReport, compReport *compli
 
 	summary := &PlanSummary{}
 	highestRisk := 0
+	var newCost, removedCost float64
 
 	for _, a := range p.Actions {
 		// Cost per action.
@@ -1793,6 +1800,18 @@ func enrichPlanActions(p *resolver.Plan, cr *cost.CostReport, compReport *compli
 
 		// Rollback feasibility.
 		a.RollbackFeasibility = rollbackFeasibility(a.Operation, a.NodeType)
+
+		// Cost delta tracking: CREATE adds cost, DELETE removes cost.
+		switch a.Operation {
+		case "CREATE":
+			newCost += a.EstimatedCost
+		case "DELETE":
+			if st != nil {
+				if rec, ok := st.Resources[a.NodeID]; ok {
+					removedCost += rec.EstimatedCost
+				}
+			}
+		}
 
 		// Aggregate summary counts.
 		summary.TotalActions++
@@ -1820,13 +1839,36 @@ func enrichPlanActions(p *resolver.Plan, cr *cost.CostReport, compReport *compli
 		}
 	}
 
+	summary.CostDelta = newCost - removedCost
 	summary.AggregateRisk = riskLevelFromScore(highestRisk)
 	summary.MaxBlastRadius = highestBlast
 	summary.MaxBlastRadiusLevel = riskLevelFromScore(highestBlast)
 	if cr != nil {
 		summary.TotalMonthlyCost = cr.TotalMonthlyCost
 		if cr.Budget != nil {
-			summary.BudgetRemaining = cr.Budget.MonthlyAmount() - cr.TotalMonthlyCost
+			monthlyBudget := cr.Budget.MonthlyAmount()
+			summary.BudgetRemaining = monthlyBudget - cr.TotalMonthlyCost
+			if monthlyBudget > 0 {
+				summary.BudgetUtilization = (cr.TotalMonthlyCost / monthlyBudget) * 100
+				switch {
+				case summary.BudgetUtilization > 95:
+					summary.BudgetWarning = "exceeded"
+				case summary.BudgetUtilization >= 80:
+					summary.BudgetWarning = "approaching"
+				}
+			}
+		}
+	}
+
+	// Auto-approve: check domain policy and downgrade RequiresApproval if within bounds.
+	if domain != nil && len(domain.AutoApprove) > 0 {
+		autoApproveActions(p, summary, domain)
+		// Recount pending approvals after auto-approve.
+		summary.PendingApproval = 0
+		for _, a := range p.Actions {
+			if a.RequiresApproval {
+				summary.PendingApproval++
+			}
 		}
 	}
 
@@ -1967,5 +2009,72 @@ func rollbackFeasibility(operation, nodeType string) string {
 	default:
 		return "safe"
 	}
+}
+
+// autoApproveActions checks each pending-approval action against domain auto-approve
+// policy. If cost delta and risk are within bounds, RequiresApproval is cleared.
+func autoApproveActions(p *resolver.Plan, summary *PlanSummary, domain *ir.DomainNode) {
+	maxCostDelta, hasCost := parseAutoApproveFloat(domain.AutoApprove["max_cost_delta"])
+	maxRisk, hasRisk := domain.AutoApprove["max_risk"]
+	if !hasCost && !hasRisk {
+		return
+	}
+
+	for _, a := range p.Actions {
+		if !a.RequiresApproval {
+			continue
+		}
+		if hasCost && summary.CostDelta > maxCostDelta {
+			continue
+		}
+		if hasRisk && !riskAtOrBelow(a.RiskLevel, maxRisk) {
+			continue
+		}
+		a.RequiresApproval = false
+	}
+}
+
+// riskAtOrBelow returns true if level is at or below the threshold.
+func riskAtOrBelow(level, threshold string) bool {
+	order := map[string]int{"low": 1, "medium": 2, "high": 3, "critical": 4}
+	l, lok := order[level]
+	t, tok := order[threshold]
+	if !lok || !tok {
+		return false
+	}
+	return l <= t
+}
+
+// parseAutoApproveFloat parses a float from auto-approve policy. Returns (value, true) on success.
+func parseAutoApproveFloat(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	s = strings.TrimSpace(s)
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// formatCostDelta returns a human-readable cost delta string like "+$12.50/mo" or "-$5.00/mo".
+func formatCostDelta(summary *PlanSummary) string {
+	if summary == nil {
+		return "$0.00/mo"
+	}
+	d := summary.CostDelta
+	if d >= 0 {
+		return fmt.Sprintf("+$%.2f/mo", d)
+	}
+	return fmt.Sprintf("-$%.2f/mo", -d)
+}
+
+// formatBlastRadius returns a string combining action count and aggregate risk.
+func formatBlastRadius(summary *PlanSummary, pendingCount int) string {
+	if summary == nil {
+		return fmt.Sprintf("%d actions", pendingCount)
+	}
+	return fmt.Sprintf("%d actions, %s risk", pendingCount, summary.AggregateRisk)
 }
 
