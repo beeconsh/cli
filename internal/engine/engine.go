@@ -32,7 +32,6 @@ type Engine struct {
 	root          string
 	exec          provider.Executor
 	ActiveProfile string
-	Force         bool
 }
 
 type PlanResult struct {
@@ -73,6 +72,26 @@ func (s ActionStatus) MarshalJSON() ([]byte, error) {
 type ActionOutcome struct {
 	Action *state.PlanAction `json:"action"`
 	Status ActionStatus      `json:"status"`
+}
+
+// ApplyOption configures Apply behavior.
+type ApplyOption func(*applyOptions)
+
+type applyOptions struct {
+	Force bool
+}
+
+func applyDefaults(opts []ApplyOption) applyOptions {
+	var o applyOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// WithForce bypasses budget enforcement.
+func WithForce(force bool) ApplyOption {
+	return func(o *applyOptions) { o.Force = force }
 }
 
 type ApplyResult struct {
@@ -171,8 +190,9 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 	}, nil
 }
 
-func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, error) {
-	logging.Logger.Debug("apply:start", "path", beaconPath, "force", e.Force, "simulated", e.exec.IsDryRun())
+func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOption) (*ApplyResult, error) {
+	o := applyDefaults(opts)
+	logging.Logger.Debug("apply:start", "path", beaconPath, "force", o.Force, "simulated", e.exec.IsDryRun())
 	abs, err := filepath.Abs(beaconPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve path %q: %w", beaconPath, err)
@@ -215,7 +235,7 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string) (*ApplyResult, er
 		}
 	}
 	costReport := cost.Evaluate(p, g, st, budget)
-	if costReport.BudgetExceeded && !e.Force {
+	if costReport.BudgetExceeded && !o.Force {
 		return nil, fmt.Errorf("estimated cost $%.0f/mo exceeds budget $%.0f/mo (use --force to override)",
 			costReport.TotalMonthlyCost, budget.MonthlyAmount())
 	}
@@ -391,6 +411,21 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 		return nil, err
 	}
 
+	// Compute cost estimates for approved actions (same as Apply path).
+	var budget *cost.Budget
+	if g.Domain != nil && g.Domain.Budget != "" {
+		budget, _ = cost.ParseBudget(g.Domain.Budget)
+	}
+	costReport := cost.Evaluate(&resolver.Plan{Actions: func() []*state.PlanAction {
+		actions := make([]*state.PlanAction, 0, len(req.ActionIDs))
+		for _, id := range req.ActionIDs {
+			if a, ok := st.Actions[id]; ok {
+				actions = append(actions, a)
+			}
+		}
+		return actions
+	}()}, g, st, budget)
+
 	executed := 0
 	outcomes := make([]ActionOutcome, 0, len(req.ActionIDs))
 	for _, actionID := range req.ActionIDs {
@@ -401,21 +436,45 @@ func (e *Engine) Approve(ctx context.Context, requestID, approver string) (*Appl
 		if err := applyAction(ctx, e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
 			run.Status = state.RunFailed
 			run.Error = err.Error()
+			// Mark approval as failed and clear ApprovalBlocked on un-executed resources.
+			now := time.Now().UTC()
+			req.Status = state.ApprovalRejected
+			req.ResolvedBy = "system"
+			req.ResolvedAt = &now
+			for _, aid := range req.ActionIDs {
+				if act, ok := st.Actions[aid]; ok {
+					if rec := st.Resources[act.NodeID]; rec != nil {
+						rec.ApprovalBlocked = false
+					}
+				}
+			}
+			addAudit(st, run.ID, "APPROVAL_FAILED", "", fmt.Sprintf("approval %s failed during execution: %v", requestID, err), nil)
 			if commitErr := tx.Commit(); commitErr != nil {
 				return nil, fmt.Errorf("%w (also failed to save state: %v)", err, commitErr)
 			}
-			return nil, err
+			return &ApplyResult{
+				RunID:     run.ID,
+				Executed:  executed,
+				Actions:   outcomes,
+				Simulated: e.exec.IsDryRun(),
+			}, err
 		}
 		run.ExecutedActions = append(run.ExecutedActions, actionID)
 		executed++
 		outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionExecuted})
-		// Store wiring metadata (same as Apply path)
+		// Store wiring metadata and cost estimate (same as Apply path)
 		if rec := st.Resources[a.NodeID]; rec != nil {
 			if wm := wiring.BuildMetadata(a.NodeID, wiringResult); wm != nil {
 				rec.Wiring = &state.WiringMetadata{
 					InferredEnvVars: wm.InferredEnvVars,
 					InferredPolicy:  wm.InferredPolicy,
 					InferredSGRules: wm.InferredSGRules,
+				}
+			}
+			for _, est := range costReport.Estimates {
+				if est.NodeID == a.NodeID {
+					rec.EstimatedCost = est.MonthlyCost
+					break
 				}
 			}
 		}
@@ -638,6 +697,9 @@ func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, 
 // Import imports an existing cloud resource into beecon state by observing it.
 // Returns the resource ID of the imported resource.
 func (e *Engine) Import(ctx context.Context, providerName, resourceType, providerID, region string) (string, error) {
+	if strings.TrimSpace(providerID) == "" {
+		return "", fmt.Errorf("provider-id must not be empty")
+	}
 	// Extract a short name from the provider ID for the node ID.
 	// AWS ARNs use colons and slashes; use the last segment as the name.
 	shortName := providerID
@@ -1069,10 +1131,13 @@ func expireApprovalsInline(st *state.State) bool {
 func (e *Engine) runExpireApprovals() {
 	tx, err := e.store.LoadForUpdate()
 	if err != nil {
+		logging.Logger.Warn("expire approvals: load failed", "error", err)
 		return
 	}
 	if expireApprovalsInline(tx.State) {
-		_ = tx.Commit()
+		if err := tx.Commit(); err != nil {
+			logging.Logger.Warn("expire approvals: commit failed", "error", err)
+		}
 	} else {
 		tx.Rollback()
 	}

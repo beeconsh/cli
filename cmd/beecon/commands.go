@@ -233,7 +233,7 @@ var applyCmd = &cobra.Command{
 	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := beaconPathArg(args)
-		res, err := eng.Apply(cmd.Context(), path)
+		res, err := eng.Apply(cmd.Context(), path, engine.WithForce(forceFlag))
 		if err != nil {
 			if res != nil {
 				// Partial failure — show what was executed before the error
@@ -246,7 +246,7 @@ var applyCmd = &cobra.Command{
 					}
 				}
 				out.Blank()
-				return nil // error already displayed
+				return err // return error for proper exit code
 			}
 			return err
 		}
@@ -731,8 +731,8 @@ var watchCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("invalid interval %q: %w", watchInterval, err)
 		}
-		if interval <= 0 {
-			return fmt.Errorf("interval must be positive, got %s", watchInterval)
+		if interval < 10*time.Second {
+			return fmt.Errorf("interval must be at least 10s, got %s", watchInterval)
 		}
 		out.Blank()
 		out.Line(out.Dot(), "Watching %s every %s (Ctrl+C to stop)", path, interval)
@@ -876,7 +876,11 @@ var serveCmd = &cobra.Command{
 			out.Summary("API base: http://localhost%s/api", addr)
 		}
 		if apiKey != "" {
-			out.Line(out.Dim("  API key:"), "%s", apiKey)
+			masked := "****"
+			if len(apiKey) > 4 {
+				masked = "****" + apiKey[len(apiKey)-4:]
+			}
+			out.Line(out.Dim("  API key:"), "%s", masked)
 		}
 		out.Blank()
 

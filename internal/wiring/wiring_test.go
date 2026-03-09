@@ -284,13 +284,19 @@ func TestNormalizeModeInvalid(t *testing.T) {
 	}
 }
 
-func TestIsValidModeDeniesUnknownTargets(t *testing.T) {
-	if IsValidMode("unknown_type", ModeRead) {
-		t.Error("expected unknown targets to be denied by default")
+func TestIsValidModeAllowsUnknownTargets(t *testing.T) {
+	// Unknown targets are allowed to support needs declarations on targets
+	// not yet in the ValidModes registry (e.g., alb, vpc, eks).
+	if !IsValidMode("unknown_type", ModeRead) {
+		t.Error("expected unknown targets to be allowed")
 	}
 	// Empty target (unclassified) should be allowed
 	if !IsValidMode("", ModeRead) {
 		t.Error("expected empty target to be allowed")
+	}
+	// Known target with invalid mode should still be denied
+	if IsValidMode("rds", ModePublish) {
+		t.Error("expected invalid mode on known target to be denied")
 	}
 }
 

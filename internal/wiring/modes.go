@@ -52,14 +52,15 @@ var ValidModes = map[string][]Mode{
 }
 
 // IsValidMode checks whether a mode is valid for a given AWS target.
-// Unknown target types are denied by default to prevent silent misconfiguration.
+// Unknown target types are allowed (returns true) to support dependency
+// declarations on targets not yet in the ValidModes registry.
 func IsValidMode(target string, mode Mode) bool {
 	if target == "" {
 		return true // unclassified nodes skip mode validation
 	}
 	valid, ok := ValidModes[target]
 	if !ok {
-		return false // unknown targets: deny by default
+		return true // unknown targets: allow to avoid blocking valid needs declarations
 	}
 	for _, v := range valid {
 		if v == mode {

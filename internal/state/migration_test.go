@@ -47,7 +47,9 @@ func TestNewStateUsesCurrentVersion(t *testing.T) {
 
 func TestRunMigrationsIdempotent(t *testing.T) {
 	st := &State{Version: CurrentVersion}
-	runMigrations(st)
+	if err := runMigrations(st); err != nil {
+		t.Fatal(err)
+	}
 	if st.Version != CurrentVersion {
 		t.Errorf("expected version %d after idempotent migration, got %d", CurrentVersion, st.Version)
 	}

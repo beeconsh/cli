@@ -200,6 +200,9 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	for _, rec := range st.Resources {
 		rec.IntentSnapshot = security.ScrubMap(rec.IntentSnapshot)
 		rec.LiveState = security.ScrubMap(rec.LiveState)
+		if rec.Wiring != nil {
+			rec.Wiring.InferredEnvVars = security.ScrubStringMap(rec.Wiring.InferredEnvVars)
+		}
 	}
 	for _, a := range st.Actions {
 		a.Changes = security.ScrubChanges(a.Changes)
@@ -377,12 +380,7 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	// Note: Force is set temporarily on the shared engine. This is safe because
-	// state mutations are serialized by the store mutex.
-	prevForce := s.engine.Force
-	s.engine.Force = req.Force
-	defer func() { s.engine.Force = prevForce }()
-	res, err := s.engine.Apply(r.Context(), req.BeaconPath)
+	res, err := s.engine.Apply(r.Context(), req.BeaconPath, engine.WithForce(req.Force))
 	if err != nil {
 		if res != nil {
 			scrubOutcomes(res.Actions)

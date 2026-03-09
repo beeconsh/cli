@@ -304,7 +304,9 @@ func (s *Store) loadLocked() (*State, error) {
 		return nil, fmt.Errorf("state.json version %d is newer than this beecon (supports up to %d); upgrade beecon", st.Version, CurrentVersion)
 	}
 	if st.Version < CurrentVersion {
-		runMigrations(&st)
+		if err := runMigrations(&st); err != nil {
+			return nil, fmt.Errorf("state migration failed: %w", err)
+		}
 	}
 	return &st, nil
 }
@@ -338,8 +340,10 @@ func newState() *State {
 	}
 }
 
+var pidSuffix = fmt.Sprintf("%d", os.Getpid())
+
 func NewID(prefix string) string {
-	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UTC().UnixNano(), atomic.AddUint64(&idCounter, 1))
+	return fmt.Sprintf("%s-%d-%s-%d", prefix, time.Now().UTC().UnixNano(), pidSuffix, atomic.AddUint64(&idCounter, 1))
 }
 
 func HashMap(m map[string]interface{}) string {
