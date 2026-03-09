@@ -3,10 +3,12 @@ package engine
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 
 	"github.com/terracotta-ai/beecon/internal/ir"
 	"github.com/terracotta-ai/beecon/internal/logging"
+	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
 
@@ -190,7 +192,29 @@ func compareSnapshots(old, new map[string]interface{}) map[string]FieldDiff {
 // valuesEqual compares two interface{} values, normalizing numeric types
 // to handle JSON round-trip differences (float64 vs int vs string).
 func valuesEqual(a, b interface{}) bool {
-	return fmt.Sprintf("%v", normalizeForDiff(a)) == fmt.Sprintf("%v", normalizeForDiff(b))
+	return reflect.DeepEqual(normalizeForDiff(a), normalizeForDiff(b))
+}
+
+// ScrubDiffResult replaces sensitive field values in a DiffResult with
+// "**REDACTED**" so that passwords, API keys, etc. are never leaked in output.
+func ScrubDiffResult(r *DiffResult) {
+	for i := range r.Modified {
+		for k, fd := range r.Modified[i].Changes {
+			if security.IsSensitiveKey(k) {
+				r.Modified[i].Changes[k] = FieldDiff{
+					Old: redactIfNotNil(fd.Old),
+					New: redactIfNotNil(fd.New),
+				}
+			}
+		}
+	}
+}
+
+func redactIfNotNil(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	return "**REDACTED**"
 }
 
 // normalizeForDiff converts float64 values that are whole numbers to int64

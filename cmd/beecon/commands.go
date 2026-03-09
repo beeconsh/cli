@@ -909,6 +909,9 @@ var diffCmd = &cobra.Command{
 			return err
 		}
 
+		// Scrub sensitive fields before any output path.
+		engine.ScrubDiffResult(result)
+
 		if formatFlag == "json" {
 			return cli.WriteJSON(os.Stdout, result)
 		}

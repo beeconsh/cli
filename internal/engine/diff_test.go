@@ -360,6 +360,77 @@ func TestComputeDiff_Pure(t *testing.T) {
 	})
 }
 
+func TestScrubDiffResult_RedactsSensitiveFields(t *testing.T) {
+	result := &DiffResult{
+		Added:   []DiffEntry{},
+		Removed: []DiffEntry{},
+		Modified: []DiffEntry{
+			{
+				NodeName: "my-db",
+				NodeType: "STORE",
+				Changes: map[string]FieldDiff{
+					"intent.instance_class": {Old: "db.t3.micro", New: "db.t3.large"},
+					"intent.password":       {Old: "oldpass", New: "newpass"},
+					"intent.api_key":        {Old: "key123", New: "key456"},
+					"intent.secret":         {Old: nil, New: "newsecret"},
+					"intent.token":          {Old: "oldtoken", New: nil},
+				},
+			},
+		},
+	}
+
+	ScrubDiffResult(result)
+
+	changes := result.Modified[0].Changes
+
+	// Non-sensitive field should be untouched.
+	if changes["intent.instance_class"].Old != "db.t3.micro" ||
+		changes["intent.instance_class"].New != "db.t3.large" {
+		t.Fatal("non-sensitive field was incorrectly scrubbed")
+	}
+
+	// Sensitive fields should be redacted.
+	for _, k := range []string{"intent.password", "intent.api_key"} {
+		fd := changes[k]
+		if fd.Old != "**REDACTED**" || fd.New != "**REDACTED**" {
+			t.Fatalf("sensitive field %q not scrubbed: old=%v new=%v", k, fd.Old, fd.New)
+		}
+	}
+
+	// Sensitive field added (Old was nil) should preserve nil.
+	secretFD := changes["intent.secret"]
+	if secretFD.Old != nil {
+		t.Fatalf("expected nil Old for added sensitive field, got %v", secretFD.Old)
+	}
+	if secretFD.New != "**REDACTED**" {
+		t.Fatalf("expected redacted New for added sensitive field, got %v", secretFD.New)
+	}
+
+	// Sensitive field removed (New was nil) should preserve nil.
+	tokenFD := changes["intent.token"]
+	if tokenFD.Old != "**REDACTED**" {
+		t.Fatalf("expected redacted Old for removed sensitive field, got %v", tokenFD.Old)
+	}
+	if tokenFD.New != nil {
+		t.Fatalf("expected nil New for removed sensitive field, got %v", tokenFD.New)
+	}
+}
+
+func TestValuesEqual_MapOrdering(t *testing.T) {
+	// Maps with the same keys/values but different insertion order must be equal.
+	a := map[string]interface{}{"x": "1", "y": "2", "z": "3"}
+	b := map[string]interface{}{"z": "3", "x": "1", "y": "2"}
+	if !valuesEqual(a, b) {
+		t.Fatal("valuesEqual should return true for maps with same content regardless of order")
+	}
+
+	// Maps with different values must not be equal.
+	c := map[string]interface{}{"x": "1", "y": "99"}
+	if valuesEqual(a, c) {
+		t.Fatal("valuesEqual should return false for maps with different values")
+	}
+}
+
 func TestCompareSnapshots(t *testing.T) {
 	tests := []struct {
 		name     string
