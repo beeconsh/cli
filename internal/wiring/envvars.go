@@ -129,3 +129,65 @@ func gcpEnvPrefix(depName, engine, targetType string) string {
 
 	return strings.ToUpper(depName) + "_"
 }
+
+// InferAzureEnvVars generates environment variable names for an Azure dependency
+// based on the dependency name and the Azure target type. Follows the same prefix
+// conventions as InferEnvVars but uses Azure-appropriate variable names.
+func InferAzureEnvVars(depName, targetType string, targetIntent map[string]string) EnvVarSet {
+	engine := strings.ToLower(classify.FieldVal(targetIntent, "engine"))
+	prefix := azureEnvPrefix(depName, engine, targetType)
+
+	vars := make(map[string]string)
+
+	switch targetType {
+	case "postgres_flexible":
+		vars[prefix+"DATABASE_URL"] = "${" + depName + ".url}"
+		vars[prefix+"DB_HOST"] = "${" + depName + ".host}"
+		vars[prefix+"DB_PORT"] = "${" + depName + ".port}"
+	case "mysql_flexible":
+		vars[prefix+"DATABASE_URL"] = "${" + depName + ".url}"
+		vars[prefix+"DB_HOST"] = "${" + depName + ".host}"
+		vars[prefix+"DB_PORT"] = "${" + depName + ".port}"
+	case "azure_cache_redis":
+		vars[prefix+"REDIS_URL"] = "${" + depName + ".url}"
+		vars[prefix+"REDIS_HOST"] = "${" + depName + ".host}"
+		vars[prefix+"REDIS_PORT"] = "${" + depName + ".port}"
+	case "blob_storage":
+		vars[prefix+"STORAGE_ACCOUNT_URL"] = "${" + depName + ".storage_account_url}"
+		vars[prefix+"CONTAINER_NAME"] = "${" + depName + ".container_name}"
+	case "key_vault_secret":
+		vars[prefix+"KEY_VAULT_URL"] = "${" + depName + ".key_vault_url}"
+		vars[prefix+"SECRET_NAME"] = "${" + depName + ".secret_name}"
+	case "service_bus":
+		vars[prefix+"SERVICE_BUS_CONNECTION_STRING"] = "${" + depName + ".connection_string}"
+	case "container_apps":
+		vars[prefix+"SERVICE_URL"] = "${" + depName + ".url}"
+	case "functions":
+		vars[prefix+"FUNCTION_URL"] = "${" + depName + ".url}"
+	}
+
+	return EnvVarSet{Vars: vars}
+}
+
+// azureEnvPrefix determines the env var prefix for Azure dependencies. If the dep
+// name matches the engine type, use no prefix for a cleaner developer experience.
+func azureEnvPrefix(depName, engine, targetType string) string {
+	depLower := strings.ToLower(depName)
+
+	if depLower == engine {
+		return ""
+	}
+	if depLower == targetType {
+		return ""
+	}
+	switch depLower {
+	case "postgres", "mysql", "redis", "blob", "servicebus":
+		if strings.Contains(engine, depLower) || targetType == depLower ||
+			targetType == "postgres_flexible" || targetType == "mysql_flexible" ||
+			targetType == "azure_cache_redis" {
+			return ""
+		}
+	}
+
+	return strings.ToUpper(depName) + "_"
+}

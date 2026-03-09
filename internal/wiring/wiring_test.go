@@ -1057,3 +1057,363 @@ func TestParsePortBoundsCheck(t *testing.T) {
 		}
 	}
 }
+
+// --- Azure Wiring Tests ---
+
+func TestWireGraphAzureInfersEnvVars(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store postgres {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    postgres = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	// Azure should infer DATABASE_URL, DB_HOST, DB_PORT
+	if apiNode.Env["DATABASE_URL"] == "" {
+		t.Error("expected DATABASE_URL env var for Azure postgres_flexible dependency")
+	}
+	if apiNode.Env["DB_HOST"] == "" {
+		t.Error("expected DB_HOST env var for Azure postgres_flexible dependency")
+	}
+	if len(result.InferredEnvVars["service.api"]) == 0 {
+		t.Error("expected inferred env vars in result")
+	}
+}
+
+func TestWireGraphAzureInfersIAMRoles(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store mydb {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    mydb = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	// Azure should set iam_roles (not inline_policy)
+	if apiNode.Intent["iam_roles"] == "" {
+		t.Error("expected iam_roles to be set for Azure")
+	}
+	if apiNode.Intent["inline_policy"] != "" {
+		t.Error("Azure should NOT set inline_policy (that's AWS)")
+	}
+	if !strings.Contains(apiNode.Intent["iam_roles"], "Contributor") {
+		t.Errorf("expected Contributor in iam_roles, got %q", apiNode.Intent["iam_roles"])
+	}
+	if len(result.InferredPolicies) == 0 {
+		t.Error("expected inferred policies in result")
+	}
+}
+
+func TestWireGraphAzureNSGRules(t *testing.T) {
+	// container_apps (VNet-resident) → postgres_flexible (VNet-resident)
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store db {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    db = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+	if len(result.InferredSGRules) == 0 {
+		t.Error("expected NSG rules for Azure VNet-resident resources")
+	}
+	for _, rule := range result.InferredSGRules {
+		if rule.Port != 5432 {
+			t.Errorf("expected port 5432, got %d", rule.Port)
+		}
+	}
+}
+
+func TestWireGraphAzureExplicitEnvWins(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store postgres {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    postgres = read_write
+  }
+  env {
+    DATABASE_URL = my-custom-url
+  }
+}
+`)
+	_, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	if apiNode.Env["DATABASE_URL"] != "my-custom-url" {
+		t.Errorf("explicit env should win on Azure, got %q", apiNode.Env["DATABASE_URL"])
+	}
+}
+
+func TestWireGraphAzureInvalidMode(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store db {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    db = publish
+  }
+}
+`)
+	_, err := WireGraph(g)
+	if err == nil {
+		t.Fatal("expected error for invalid mode 'publish' on postgres_flexible target")
+	}
+	if !strings.Contains(err.Error(), "invalid mode") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestWireGraphAzureBlobStorageDependency(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store uploads {
+  engine = blob
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    uploads = read_write
+  }
+}
+`)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	if apiNode.Env["UPLOADS_STORAGE_ACCOUNT_URL"] == "" {
+		t.Error("expected UPLOADS_STORAGE_ACCOUNT_URL env var for blob_storage dependency")
+	}
+	if !strings.Contains(apiNode.Intent["iam_roles"], "Storage Blob Data Contributor") {
+		t.Errorf("expected Storage Blob Data Contributor in iam_roles, got %q", apiNode.Intent["iam_roles"])
+	}
+	// No NSG rules for blob_storage (not VNet-resident)
+	if len(result.InferredSGRules) != 0 {
+		t.Error("expected no NSG rules for blob_storage")
+	}
+}
+
+func TestWireGraphAzureKeyVaultDependency(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store credentials {
+  engine = secret
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    credentials = read
+  }
+}
+`)
+	_, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var apiNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "api" {
+			apiNode = &g.Nodes[i]
+			break
+		}
+	}
+	if apiNode == nil {
+		t.Fatal("api node not found")
+	}
+	if apiNode.Env["CREDENTIALS_KEY_VAULT_URL"] == "" {
+		t.Error("expected CREDENTIALS_KEY_VAULT_URL env var for key_vault_secret dependency")
+	}
+	if !strings.Contains(apiNode.Intent["iam_roles"], "Key Vault Secrets User") {
+		t.Errorf("expected Key Vault Secrets User in iam_roles, got %q", apiNode.Intent["iam_roles"])
+	}
+}
+
+func TestWireGraphAzureServiceBusDependency(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+store events {
+  engine = servicebus
+}
+service worker {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    events = subscribe
+  }
+}
+`)
+	_, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+
+	var workerNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "worker" {
+			workerNode = &g.Nodes[i]
+			break
+		}
+	}
+	if workerNode == nil {
+		t.Fatal("worker node not found")
+	}
+	if workerNode.Env["EVENTS_SERVICE_BUS_CONNECTION_STRING"] == "" {
+		t.Error("expected EVENTS_SERVICE_BUS_CONNECTION_STRING env var for service_bus dependency")
+	}
+	if !strings.Contains(workerNode.Intent["iam_roles"], "Azure Service Bus Data Receiver") {
+		t.Errorf("expected Azure Service Bus Data Receiver in iam_roles, got %q", workerNode.Intent["iam_roles"])
+	}
+}
+
+func TestIsValidAzureMode(t *testing.T) {
+	// Known target with valid mode
+	if !IsValidAzureMode("postgres_flexible", ModeRead) {
+		t.Error("expected postgres_flexible:read to be valid")
+	}
+	// Known target with invalid mode
+	if IsValidAzureMode("postgres_flexible", ModePublish) {
+		t.Error("expected postgres_flexible:publish to be invalid")
+	}
+	// Unknown target should be allowed
+	if !IsValidAzureMode("unknown_target", ModeRead) {
+		t.Error("expected unknown targets to be allowed")
+	}
+	// Empty target should be allowed
+	if !IsValidAzureMode("", ModeRead) {
+		t.Error("expected empty target to be allowed")
+	}
+}
+
+func TestAzureIAMRolesFor(t *testing.T) {
+	cases := []struct {
+		target string
+		mode   Mode
+		want   string // expected role name
+	}{
+		{"postgres_flexible", ModeRead, "Reader"},
+		{"postgres_flexible", ModeReadWrite, "Contributor"},
+		{"blob_storage", ModeRead, "Storage Blob Data Reader"},
+		{"blob_storage", ModeWrite, "Storage Blob Data Contributor"},
+		{"key_vault_secret", ModeRead, "Key Vault Secrets User"},
+		{"service_bus", ModePublish, "Azure Service Bus Data Sender"},
+		{"service_bus", ModeSubscribe, "Azure Service Bus Data Receiver"},
+		{"container_apps", ModeInvoke, "Contributor"},
+		{"aks", ModeInvoke, "Azure Kubernetes Service Cluster User Role"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.target+":"+string(tc.mode), func(t *testing.T) {
+			roles, err := AzureIAMRolesFor(tc.target, tc.mode)
+			if err != nil {
+				t.Fatalf("AzureIAMRolesFor(%q, %q) error: %v", tc.target, tc.mode, err)
+			}
+			found := false
+			for _, r := range roles {
+				if r == tc.want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("AzureIAMRolesFor(%q, %q) = %v, expected to contain %q", tc.target, tc.mode, roles, tc.want)
+			}
+		})
+	}
+}
+
+func TestAzureIAMRolesForUnknown(t *testing.T) {
+	_, err := AzureIAMRolesFor("unknown_target", ModeRead)
+	if err == nil {
+		t.Error("expected error for unknown target")
+	}
+}

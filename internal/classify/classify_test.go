@@ -186,3 +186,109 @@ func TestGCPDefaultPortForEngine(t *testing.T) {
 		t.Error("expected unknown port 0")
 	}
 }
+
+// --- Azure Classification Tests ---
+
+func TestClassifyAzureNode(t *testing.T) {
+	cases := []struct {
+		name     string
+		nodeType string
+		intent   map[string]string
+		want     string
+	}{
+		{"STORE postgres → postgres_flexible", "STORE", map[string]string{"engine": "postgres"}, "postgres_flexible"},
+		{"STORE mysql → mysql_flexible", "STORE", map[string]string{"engine": "mysql"}, "mysql_flexible"},
+		{"STORE postgres_flexible → postgres_flexible", "STORE", map[string]string{"engine": "postgres_flexible"}, "postgres_flexible"},
+		{"STORE redis → azure_cache_redis", "STORE", map[string]string{"engine": "redis"}, "azure_cache_redis"},
+		{"STORE blob → blob_storage", "STORE", map[string]string{"engine": "blob"}, "blob_storage"},
+		{"STORE s3 → blob_storage", "STORE", map[string]string{"engine": "s3"}, "blob_storage"},
+		{"STORE bucket → blob_storage", "STORE", map[string]string{"engine": "bucket"}, "blob_storage"},
+		{"STORE secret → key_vault_secret", "STORE", map[string]string{"engine": "secret"}, "key_vault_secret"},
+		{"STORE keyvault → key_vault_secret", "STORE", map[string]string{"engine": "keyvault"}, "key_vault_secret"},
+		{"STORE key_vault → key_vault_secret", "STORE", map[string]string{"engine": "key_vault"}, "key_vault_secret"},
+		{"STORE servicebus → service_bus", "STORE", map[string]string{"engine": "servicebus"}, "service_bus"},
+		{"STORE service_bus → service_bus", "STORE", map[string]string{"engine": "service_bus"}, "service_bus"},
+		{"STORE sqs → service_bus", "STORE", map[string]string{"engine": "sqs"}, "service_bus"},
+		{"STORE sns → service_bus", "STORE", map[string]string{"engine": "sns"}, "service_bus"},
+		{"NETWORK vpc → vnet", "NETWORK", map[string]string{"engine": "vpc"}, "vnet"},
+		{"NETWORK vnet → vnet", "NETWORK", map[string]string{"engine": "vnet"}, "vnet"},
+		{"NETWORK subnet → subnet", "NETWORK", map[string]string{"engine": "subnet"}, "subnet"},
+		{"NETWORK nsg → nsg", "NETWORK", map[string]string{"engine": "nsg"}, "nsg"},
+		{"NETWORK security_group → nsg", "NETWORK", map[string]string{"engine": "security_group"}, "nsg"},
+		{"NETWORK sg → nsg", "NETWORK", map[string]string{"engine": "sg"}, "nsg"},
+		{"NETWORK front_door → front_door", "NETWORK", map[string]string{"engine": "front_door"}, "front_door"},
+		{"NETWORK frontdoor → front_door", "NETWORK", map[string]string{"engine": "frontdoor"}, "front_door"},
+		{"NETWORK cdn → cdn", "NETWORK", map[string]string{"engine": "cdn"}, "cdn"},
+		{"NETWORK dns → dns", "NETWORK", map[string]string{"engine": "dns"}, "dns"},
+		{"SERVICE container → container_apps", "SERVICE", map[string]string{"engine": "container"}, "container_apps"},
+		{"SERVICE lambda → functions", "SERVICE", map[string]string{"engine": "lambda"}, "functions"},
+		{"SERVICE function → functions", "SERVICE", map[string]string{"engine": "function"}, "functions"},
+		{"SERVICE aks → aks", "SERVICE", map[string]string{"engine": "aks"}, "aks"},
+		{"SERVICE eks → aks", "SERVICE", map[string]string{"engine": "eks"}, "aks"},
+		{"SERVICE kubernetes → aks", "SERVICE", map[string]string{"engine": "kubernetes"}, "aks"},
+		{"SERVICE identity → entra_id", "SERVICE", map[string]string{"engine": "identity"}, "entra_id"},
+		{"SERVICE entra → entra_id", "SERVICE", map[string]string{"engine": "entra"}, "entra_id"},
+		{"SERVICE apim → api_management", "SERVICE", map[string]string{"engine": "apim"}, "api_management"},
+		{"COMPUTE event_grid → event_grid", "COMPUTE", map[string]string{"engine": "event_grid"}, "event_grid"},
+		{"COMPUTE eventgrid → event_grid", "COMPUTE", map[string]string{"engine": "eventgrid"}, "event_grid"},
+		{"COMPUTE vm → vm", "COMPUTE", map[string]string{"engine": "vm"}, "vm"},
+		{"COMPUTE compute → vm", "COMPUTE", map[string]string{"engine": "compute"}, "vm"},
+		{"COMPUTE monitor → monitor", "COMPUTE", map[string]string{"engine": "monitor"}, "monitor"},
+		{"COMPUTE monitoring → monitor", "COMPUTE", map[string]string{"engine": "monitoring"}, "monitor"},
+		{"unknown → empty", "STORE", map[string]string{"engine": "unknown"}, ""},
+		{"lowercase nodeType", "store", map[string]string{"engine": "postgres"}, "postgres_flexible"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClassifyAzureNode(tc.nodeType, tc.intent)
+			if got != tc.want {
+				t.Errorf("ClassifyAzureNode(%q, %v) = %q, want %q", tc.nodeType, tc.intent, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsAzureVPCResident(t *testing.T) {
+	residents := []string{"container_apps", "postgres_flexible", "mysql_flexible", "azure_cache_redis", "aks", "vm"}
+	nonResidents := []string{"blob_storage", "key_vault_secret", "service_bus", "functions", "dns", "cdn", "front_door"}
+	for _, r := range residents {
+		if !IsAzureVPCResident(r) {
+			t.Errorf("expected %q to be VNet-resident", r)
+		}
+	}
+	for _, r := range nonResidents {
+		if IsAzureVPCResident(r) {
+			t.Errorf("expected %q to NOT be VNet-resident", r)
+		}
+	}
+}
+
+func TestAzureDefaultPort(t *testing.T) {
+	if AzureDefaultPort("postgres_flexible") != 5432 {
+		t.Error("expected postgres_flexible default port 5432")
+	}
+	if AzureDefaultPort("mysql_flexible") != 3306 {
+		t.Error("expected mysql_flexible default port 3306")
+	}
+	if AzureDefaultPort("azure_cache_redis") != 6380 {
+		t.Error("expected azure_cache_redis default port 6380")
+	}
+	if AzureDefaultPort("blob_storage") != 0 {
+		t.Error("expected blob_storage default port 0")
+	}
+}
+
+func TestAzureDefaultPortForEngine(t *testing.T) {
+	if AzureDefaultPortForEngine("mysql") != 3306 {
+		t.Error("expected mysql port 3306")
+	}
+	if AzureDefaultPortForEngine("postgres") != 5432 {
+		t.Error("expected postgres port 5432")
+	}
+	if AzureDefaultPortForEngine("redis") != 6380 {
+		t.Error("expected redis port 6380")
+	}
+	if AzureDefaultPortForEngine("unknown") != 0 {
+		t.Error("expected unknown port 0")
+	}
+}

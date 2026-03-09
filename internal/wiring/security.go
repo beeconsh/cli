@@ -90,6 +90,43 @@ func InferGCPFirewallRules(sourceNodeID, targetNodeID, sourceTarget, targetTarge
 	}
 }
 
+// InferAzureNSGRules generates NSG rules for a dependency between two
+// Azure VNet-resident resources. Returns nil if either resource is not VNet-resident.
+func InferAzureNSGRules(sourceNodeID, targetNodeID, sourceTarget, targetTarget string, targetIntent map[string]string) []SGRule {
+	if !classify.IsAzureVPCResident(sourceTarget) || !classify.IsAzureVPCResident(targetTarget) {
+		return nil
+	}
+
+	engine := classify.FieldVal(targetIntent, "engine")
+	port := classify.AzureDefaultPortForEngine(engine)
+	if port == 0 {
+		port = classify.AzureDefaultPort(targetTarget)
+	}
+
+	// For Container Apps targets, use the container_port if specified
+	if targetTarget == "container_apps" {
+		if cp := classify.FieldVal(targetIntent, "container_port"); cp != "" {
+			if p := parsePort(cp); p > 0 {
+				port = p
+			}
+		}
+	}
+
+	if port == 0 {
+		return nil
+	}
+
+	return []SGRule{
+		{
+			SourceNodeID: sourceNodeID,
+			TargetNodeID: targetNodeID,
+			Port:         port,
+			Protocol:     "tcp",
+			Description:  fmt.Sprintf("Allow %s → %s on port %d", sourceNodeID, targetNodeID, port),
+		},
+	}
+}
+
 func parsePort(s string) int {
 	var p int
 	for _, ch := range s {

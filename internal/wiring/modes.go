@@ -194,3 +194,85 @@ var gcpIAMRoleMatrix = map[string][]string{
 	// GKE
 	"gke:invoke": {"roles/container.developer"},
 }
+
+// AzureValidModes defines which modes are valid for each Azure target type.
+var AzureValidModes = map[string][]Mode{
+	"postgres_flexible":  {ModeRead, ModeWrite, ModeReadWrite, ModeAdmin},
+	"mysql_flexible":     {ModeRead, ModeWrite, ModeReadWrite, ModeAdmin},
+	"azure_cache_redis":  {ModeRead, ModeWrite, ModeReadWrite},
+	"blob_storage":       {ModeRead, ModeWrite, ModeReadWrite, ModeAdmin},
+	"key_vault_secret":   {ModeRead, ModeWrite, ModeReadWrite},
+	"service_bus":        {ModeRead, ModeWrite, ModeReadWrite, ModePublish, ModeSubscribe},
+	"container_apps":     {ModeInvoke},
+	"functions":          {ModeInvoke, ModeAdmin},
+	"aks":                {ModeInvoke},
+}
+
+// IsValidAzureMode checks whether a mode is valid for a given Azure target.
+// Unknown target types are allowed (returns true) to support dependency
+// declarations on targets not yet in the AzureValidModes registry.
+func IsValidAzureMode(target string, mode Mode) bool {
+	if target == "" {
+		return true // unclassified nodes skip mode validation
+	}
+	valid, ok := AzureValidModes[target]
+	if !ok {
+		return true // unknown targets: allow to avoid blocking valid needs declarations
+	}
+	for _, v := range valid {
+		if v == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// AzureIAMRolesFor returns the Azure RBAC built-in role names required for a
+// given target+mode combination.
+func AzureIAMRolesFor(target string, mode Mode) ([]string, error) {
+	key := target + ":" + string(mode)
+	roles, ok := azureRBACRoleMatrix[key]
+	if !ok {
+		return nil, fmt.Errorf("no Azure RBAC roles defined for %s with mode %s", target, mode)
+	}
+	return roles, nil
+}
+
+var azureRBACRoleMatrix = map[string][]string{
+	// Postgres Flexible Server
+	"postgres_flexible:read":       {"Reader"},
+	"postgres_flexible:write":      {"Contributor"},
+	"postgres_flexible:read_write": {"Contributor"},
+	"postgres_flexible:admin":      {"Owner"},
+	// MySQL Flexible Server
+	"mysql_flexible:read":       {"Reader"},
+	"mysql_flexible:write":      {"Contributor"},
+	"mysql_flexible:read_write": {"Contributor"},
+	"mysql_flexible:admin":      {"Owner"},
+	// Azure Cache for Redis
+	"azure_cache_redis:read":       {"Reader"},
+	"azure_cache_redis:write":      {"Contributor"},
+	"azure_cache_redis:read_write": {"Contributor"},
+	// Blob Storage
+	"blob_storage:read":       {"Storage Blob Data Reader"},
+	"blob_storage:write":      {"Storage Blob Data Contributor"},
+	"blob_storage:read_write": {"Storage Blob Data Contributor"},
+	"blob_storage:admin":      {"Storage Blob Data Owner"},
+	// Key Vault Secret
+	"key_vault_secret:read":       {"Key Vault Secrets User"},
+	"key_vault_secret:write":      {"Key Vault Secrets Officer"},
+	"key_vault_secret:read_write": {"Key Vault Secrets Officer"},
+	// Service Bus
+	"service_bus:read":       {"Azure Service Bus Data Receiver"},
+	"service_bus:write":      {"Azure Service Bus Data Sender"},
+	"service_bus:read_write": {"Azure Service Bus Data Sender", "Azure Service Bus Data Receiver"},
+	"service_bus:publish":    {"Azure Service Bus Data Sender"},
+	"service_bus:subscribe":  {"Azure Service Bus Data Receiver"},
+	// Container Apps
+	"container_apps:invoke": {"Contributor"},
+	// Functions
+	"functions:invoke": {"Contributor"},
+	"functions:admin":  {"Owner"},
+	// AKS
+	"aks:invoke": {"Azure Kubernetes Service Cluster User Role"},
+}
