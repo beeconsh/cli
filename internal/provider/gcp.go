@@ -17,8 +17,10 @@ import (
 	"github.com/terracotta-ai/beecon/internal/classify"
 	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/state"
+	"google.golang.org/api/cloudfunctions/v2"
 	"google.golang.org/api/cloudresourcemanager/v1"
 	"google.golang.org/api/compute/v1"
+	"google.golang.org/api/container/v1"
 	"google.golang.org/api/dns/v1"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iam/v1"
@@ -102,7 +104,11 @@ func (e *DefaultExecutor) applyGCP(ctx context.Context, req ApplyRequest) (*Appl
 		result, applyErr = applyGCPComputeEngine(ctx, req)
 	case "cloud_dns":
 		result, applyErr = applyGCPCloudDNS(ctx, req)
-	case "cloud_functions", "api_gateway", "cloud_cdn", "cloud_monitoring", "gke", "eventarc", "identity_platform":
+	case "cloud_functions":
+		result, applyErr = applyGCPCloudFunctions(ctx, req)
+	case "gke":
+		result, applyErr = applyGCPGKE(ctx, req)
+	case "api_gateway", "cloud_cdn", "cloud_monitoring", "eventarc", "identity_platform":
 		result, applyErr = applyGCPProjectScopedGeneric(ctx, target, req)
 	default:
 		return nil, fmt.Errorf("gcp target %q is recognized but requires additional adapter implementation for live execution (set BEECON_EXECUTE!=1 for dry-run)", target)
@@ -286,7 +292,11 @@ func (e *DefaultExecutor) observeGCP(ctx context.Context, region string, rec *st
 		return observeGCPComputeEngine(ctx, rec)
 	case "cloud_dns":
 		return observeGCPCloudDNS(ctx, rec)
-	case "cloud_functions", "api_gateway", "cloud_cdn", "cloud_monitoring", "gke", "eventarc", "identity_platform":
+	case "cloud_functions":
+		return observeGCPCloudFunctions(ctx, rec)
+	case "gke":
+		return observeGCPGKE(ctx, rec)
+	case "api_gateway", "cloud_cdn", "cloud_monitoring", "eventarc", "identity_platform":
 		return observeGCPProjectScopedGeneric(ctx, target, rec)
 	default:
 		return &ObserveResult{Exists: rec.Managed, ProviderID: rec.ProviderID, LiveState: rec.LiveState}, nil
@@ -1684,7 +1694,7 @@ func detectGCPRecordTarget(rec *state.ResourceRecord) string {
 		if svc == "cloud_dns" {
 			return "cloud_dns"
 		}
-		if svc == "cloud_functions" || svc == "api_gateway" || svc == "cloud_cdn" || svc == "cloud_monitoring" || svc == "gke" || svc == "eventarc" || svc == "identity_platform" {
+		if svc == "cloud_functions" || svc == "gke" || svc == "api_gateway" || svc == "cloud_cdn" || svc == "cloud_monitoring" || svc == "eventarc" || svc == "identity_platform" {
 			return svc
 		}
 		eng := strings.ToLower(intentString(rec.IntentSnapshot, "intent.engine"))
@@ -1857,7 +1867,23 @@ func validateGCPInput(target string, intentMap map[string]interface{}) error {
 			return fmt.Errorf("cloud_dns requires intent.project_id")
 		}
 		return nil
-	case "cloud_functions", "api_gateway", "cloud_cdn", "cloud_monitoring", "gke", "eventarc", "identity_platform":
+	case "cloud_functions":
+		missing := []string{}
+		for _, k := range []string{"project_id", "runtime"} {
+			if requiredIntent(intentMap, k) == "" {
+				missing = append(missing, "intent."+k)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("cloud_functions missing required fields: %s", strings.Join(missing, ", "))
+		}
+		return nil
+	case "gke":
+		if requiredIntent(intentMap, "project_id") == "" {
+			return fmt.Errorf("gke requires intent.project_id")
+		}
+		return nil
+	case "api_gateway", "cloud_cdn", "cloud_monitoring", "eventarc", "identity_platform":
 		if requiredIntent(intentMap, "project_id") == "" {
 			return fmt.Errorf("%s requires intent.project_id", target)
 		}
@@ -1960,6 +1986,406 @@ func withGCPRetry(ctx context.Context, op string, fn func() error) error {
 
 func requiredIntent(intentMap map[string]interface{}, key string) string {
 	return strings.TrimSpace(intent(intentMap, key))
+}
+
+// ---------------------------------------------------------------------------
+// Cloud Functions (v2) adapter
+// ---------------------------------------------------------------------------
+
+func applyGCPCloudFunctions(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
+	projectID := requiredIntent(req.Intent, "project_id")
+	region := defaultString(intent(req.Intent, "region"), req.Region)
+	if region == "" {
+		region = "us-central1"
+	}
+	runtime := requiredIntent(req.Intent, "runtime")
+	entryPoint := defaultString(intent(req.Intent, "entry_point", "handler"), "")
+	sourceURL := intent(req.Intent, "source_url")
+	memory := defaultString(intent(req.Intent, "memory"), "256Mi")
+	timeout := defaultString(intent(req.Intent, "timeout"), "60s")
+
+	funcName := req.RecordProviderID()
+	if funcName == "" {
+		funcName = strings.TrimPrefix(identifierFor(req.Action.NodeName), "beecon-")
+	}
+	// Strip any existing resource path prefix to get the bare name.
+	if idx := strings.LastIndex(funcName, "/"); idx >= 0 {
+		funcName = funcName[idx+1:]
+	}
+	parent := fmt.Sprintf("projects/%s/locations/%s", projectID, region)
+	fullName := fmt.Sprintf("%s/functions/%s", parent, funcName)
+
+	result := &ApplyResult{
+		ProviderID: fullName,
+		LiveState: map[string]interface{}{
+			"provider":    "gcp",
+			"service":     "cloud_functions",
+			"project":     projectID,
+			"region":      region,
+			"name":        funcName,
+			"runtime":     runtime,
+			"entry_point": entryPoint,
+			"memory":      memory,
+			"timeout":     timeout,
+			"operation":   req.Action.Operation,
+		},
+	}
+
+	svc, err := gcpCloudFunctionsService(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	switch req.Action.Operation {
+	case "CREATE":
+		fn := &cloudfunctions.Function{
+			Name: fullName,
+			BuildConfig: &cloudfunctions.BuildConfig{
+				Runtime:    runtime,
+				EntryPoint: entryPoint,
+				Source: &cloudfunctions.Source{
+					StorageSource: &cloudfunctions.StorageSource{
+						Bucket: sourceURL,
+					},
+				},
+			},
+			ServiceConfig: &cloudfunctions.ServiceConfig{
+				AvailableMemory: memory,
+				TimeoutSeconds:  parseTimeoutSeconds(timeout),
+			},
+		}
+		if err := withGCPRetry(ctx, "cloud_functions_create", func() error {
+			_, err := svc.Projects.Locations.Functions.Create(parent, fn).FunctionId(funcName).Context(ctx).Do()
+			if err != nil && isAlreadyExists(err) {
+				return nil
+			}
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("cloud functions create: %w", err)
+		}
+		// Post-create configuration (e.g., triggers). Failures return partial result.
+		if postErr := cloudFunctionsPostCreate(ctx, svc, fullName, req); postErr != nil {
+			return result, fmt.Errorf("cloud functions post-create: %w", postErr)
+		}
+	case "UPDATE":
+		patch := &cloudfunctions.Function{
+			BuildConfig: &cloudfunctions.BuildConfig{
+				Runtime:    runtime,
+				EntryPoint: entryPoint,
+			},
+			ServiceConfig: &cloudfunctions.ServiceConfig{
+				AvailableMemory: memory,
+				TimeoutSeconds:  parseTimeoutSeconds(timeout),
+			},
+		}
+		if err := withGCPRetry(ctx, "cloud_functions_update", func() error {
+			_, err := svc.Projects.Locations.Functions.Patch(fullName, patch).Context(ctx).Do()
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("cloud functions update: %w", err)
+		}
+	case "DELETE":
+		if err := withGCPRetry(ctx, "cloud_functions_delete", func() error {
+			_, err := svc.Projects.Locations.Functions.Delete(fullName).Context(ctx).Do()
+			if err != nil && !isGCPNotFound(err) {
+				return err
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("cloud functions delete: %w", err)
+		}
+	}
+	return result, nil
+}
+
+// cloudFunctionsPostCreate performs post-creation configuration for a Cloud Function.
+// Currently a placeholder for trigger and IAM configuration.
+// Returns nil on success; callers should return a partial ApplyResult on error.
+func cloudFunctionsPostCreate(_ context.Context, _ *cloudfunctions.Service, _ string, _ ApplyRequest) error {
+	// TODO: configure event triggers when intent.trigger_type is set
+	return nil
+}
+
+func observeGCPCloudFunctions(ctx context.Context, rec *state.ResourceRecord) (*ObserveResult, error) {
+	projectID := intentString(rec.IntentSnapshot, "intent.project_id")
+	region := defaultString(intentString(rec.IntentSnapshot, "intent.region"), "us-central1")
+	// Derive function name using the same logic as apply:
+	// 1. ProviderID (extract short name from full resource path)
+	// 2. Fallback to identifierFor(NodeName) with beecon- prefix stripping
+	var funcName string
+	if rec.ProviderID != "" && strings.Contains(rec.ProviderID, "/functions/") {
+		funcName = rec.ProviderID[strings.LastIndex(rec.ProviderID, "/")+1:]
+	}
+	if funcName == "" {
+		funcName = strings.TrimPrefix(identifierFor(rec.NodeName), "beecon-")
+	}
+	if projectID == "" {
+		return nil, fmt.Errorf("cloud_functions observe requires intent.project_id")
+	}
+	fullName := fmt.Sprintf("projects/%s/locations/%s/functions/%s", projectID, region, funcName)
+
+	svc, err := gcpCloudFunctionsService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fn, err := svc.Projects.Locations.Functions.Get(fullName).Context(ctx).Do()
+	if err != nil {
+		if isGCPNotFound(err) {
+			return &ObserveResult{Exists: false, ProviderID: fullName, LiveState: map[string]interface{}{}}, nil
+		}
+		return nil, fmt.Errorf("cloud functions get: %w", err)
+	}
+
+	live := map[string]interface{}{
+		"provider":    "gcp",
+		"service":     "cloud_functions",
+		"name":        funcName,
+		"region":      region,
+		"state":       fn.State,
+		"environment": fn.Environment,
+		"update_time": fn.UpdateTime,
+	}
+	if fn.ServiceConfig != nil {
+		live["service_url"] = fn.ServiceConfig.Uri
+		live["memory"] = fn.ServiceConfig.AvailableMemory
+		live["timeout"] = fmt.Sprintf("%ds", fn.ServiceConfig.TimeoutSeconds)
+	}
+	if fn.BuildConfig != nil {
+		live["runtime"] = fn.BuildConfig.Runtime
+		live["entry_point"] = fn.BuildConfig.EntryPoint
+	}
+	if len(fn.Labels) > 0 {
+		live["labels"] = fn.Labels
+	}
+	// Scrub env vars: only return keys, never values
+	if fn.ServiceConfig != nil && len(fn.ServiceConfig.EnvironmentVariables) > 0 {
+		envKeys := make([]string, 0, len(fn.ServiceConfig.EnvironmentVariables))
+		for k := range fn.ServiceConfig.EnvironmentVariables {
+			envKeys = append(envKeys, k)
+		}
+		live["env_keys"] = strings.Join(envKeys, ",")
+	}
+
+	return &ObserveResult{Exists: true, ProviderID: fullName, LiveState: live}, nil
+}
+
+// parseTimeoutSeconds converts a timeout string like "60s" or "120" to int64 seconds.
+func parseTimeoutSeconds(s string) int64 {
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, "s")
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
+		return 60
+	}
+	return n
+}
+
+// ---------------------------------------------------------------------------
+// GKE (Google Kubernetes Engine) adapter
+// ---------------------------------------------------------------------------
+
+func applyGCPGKE(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
+	projectID := requiredIntent(req.Intent, "project_id")
+	location := defaultString(intent(req.Intent, "region", "zone"), req.Region)
+	if location == "" {
+		location = "us-central1"
+	}
+	clusterName := req.RecordProviderID()
+	if clusterName == "" {
+		clusterName = strings.TrimPrefix(identifierFor(req.Action.NodeName), "beecon-")
+	}
+	// Strip any existing resource path prefix to get the bare name.
+	if idx := strings.LastIndex(clusterName, "/"); idx >= 0 {
+		clusterName = clusterName[idx+1:]
+	}
+
+	nodeCount, _ := strconv.ParseInt(defaultString(intent(req.Intent, "node_count"), "3"), 10, 64)
+	if nodeCount <= 0 {
+		nodeCount = 3
+	}
+	machineType := defaultString(intent(req.Intent, "machine_type"), "e2-medium")
+	kubeVersion := intent(req.Intent, "version")
+	network := defaultString(intent(req.Intent, "network"), "default")
+
+	parent := fmt.Sprintf("projects/%s/locations/%s", projectID, location)
+	fullName := fmt.Sprintf("%s/clusters/%s", parent, clusterName)
+
+	result := &ApplyResult{
+		ProviderID: fullName,
+		LiveState: map[string]interface{}{
+			"provider":     "gcp",
+			"service":      "gke",
+			"project":      projectID,
+			"location":     location,
+			"name":         clusterName,
+			"node_count":   nodeCount,
+			"machine_type": machineType,
+			"network":      network,
+			"operation":    req.Action.Operation,
+		},
+	}
+	if kubeVersion != "" {
+		result.LiveState["kubernetes_version"] = kubeVersion
+	}
+
+	svc, err := gcpContainerService(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	switch req.Action.Operation {
+	case "CREATE":
+		cluster := &container.Cluster{
+			Name:             clusterName,
+			InitialNodeCount: nodeCount,
+			Network:          network,
+			NodeConfig: &container.NodeConfig{
+				MachineType: machineType,
+			},
+		}
+		if kubeVersion != "" {
+			cluster.InitialClusterVersion = kubeVersion
+		}
+		createReq := &container.CreateClusterRequest{
+			Cluster: cluster,
+		}
+		if err := withGCPRetry(ctx, "gke_create", func() error {
+			op, err := svc.Projects.Locations.Clusters.Create(parent, createReq).Context(ctx).Do()
+			if err != nil {
+				if isAlreadyExists(err) {
+					return nil
+				}
+				return err
+			}
+			// Store the operation name so callers can poll for completion.
+			if op != nil {
+				result.LiveState["operation_name"] = op.Name
+				result.LiveState["operation_status"] = op.Status
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("gke create cluster: %w", err)
+		}
+	case "UPDATE":
+		// GKE node pool update: resize the default pool.
+		updateReq := &container.SetNodePoolSizeRequest{
+			NodeCount: nodeCount,
+		}
+		defaultPoolName := fullName + "/nodePools/default-pool"
+		if err := withGCPRetry(ctx, "gke_update_node_pool", func() error {
+			_, err := svc.Projects.Locations.Clusters.NodePools.SetSize(defaultPoolName, updateReq).Context(ctx).Do()
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("gke update node pool size: %w", err)
+		}
+	case "DELETE":
+		if err := withGCPRetry(ctx, "gke_delete_cluster", func() error {
+			_, err := svc.Projects.Locations.Clusters.Delete(fullName).Context(ctx).Do()
+			if err != nil && !isGCPNotFound(err) {
+				return err
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("gke delete cluster: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func observeGCPGKE(ctx context.Context, rec *state.ResourceRecord) (*ObserveResult, error) {
+	projectID := intentString(rec.IntentSnapshot, "intent.project_id")
+	location := defaultString(intentString(rec.IntentSnapshot, "intent.region"), "us-central1")
+	// Derive cluster name using the same logic as apply:
+	// 1. ProviderID (extract short name from full resource path)
+	// 2. Fallback to identifierFor(NodeName) with beecon- prefix stripping
+	var clusterName string
+	if rec.ProviderID != "" && strings.Contains(rec.ProviderID, "/clusters/") {
+		clusterName = rec.ProviderID[strings.LastIndex(rec.ProviderID, "/")+1:]
+	}
+	if clusterName == "" {
+		clusterName = strings.TrimPrefix(identifierFor(rec.NodeName), "beecon-")
+	}
+	if projectID == "" {
+		return nil, fmt.Errorf("gke observe requires intent.project_id")
+	}
+	fullName := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", projectID, location, clusterName)
+
+	svc, err := gcpContainerService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cl, err := svc.Projects.Locations.Clusters.Get(fullName).Context(ctx).Do()
+	if err != nil {
+		if isGCPNotFound(err) {
+			return &ObserveResult{Exists: false, ProviderID: fullName, LiveState: map[string]interface{}{}}, nil
+		}
+		return nil, fmt.Errorf("gke get cluster: %w", err)
+	}
+
+	live := map[string]interface{}{
+		"provider":               "gcp",
+		"service":                "gke",
+		"name":                   clusterName,
+		"location":               location,
+		"status":                 cl.Status,
+		"current_master_version": cl.CurrentMasterVersion,
+		"current_node_version":   cl.CurrentNodeVersion,
+		"endpoint":               cl.Endpoint,
+		"network":                cl.Network,
+		"subnetwork":             cl.Subnetwork,
+		"services_ipv4_cidr":     cl.ServicesIpv4Cidr,
+		"cluster_ipv4_cidr":      cl.ClusterIpv4Cidr,
+		"create_time":            cl.CreateTime,
+	}
+	if len(cl.ResourceLabels) > 0 {
+		live["labels"] = cl.ResourceLabels
+	}
+	// Extract node count and machine type from the first node pool.
+	if len(cl.NodePools) > 0 {
+		np := cl.NodePools[0]
+		live["node_count"] = np.InitialNodeCount
+		if np.Config != nil {
+			live["machine_type"] = np.Config.MachineType
+		}
+	}
+	// Scrub masterAuth credentials — never expose certs or passwords.
+	// We intentionally do NOT include cl.MasterAuth in LiveState.
+
+	return &ObserveResult{Exists: true, ProviderID: fullName, LiveState: live}, nil
+}
+
+// ---------------------------------------------------------------------------
+// GCP service client constructors for Cloud Functions and GKE
+// ---------------------------------------------------------------------------
+
+func gcpCloudFunctionsService(ctx context.Context) (*cloudfunctions.Service, error) {
+	if creds := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); strings.TrimSpace(creds) != "" {
+		svc, err := cloudfunctions.NewService(ctx, option.WithCredentialsFile(creds))
+		if err != nil {
+			return nil, fmt.Errorf("gcp cloud functions service init: %w", err)
+		}
+		return svc, nil
+	}
+	svc, err := cloudfunctions.NewService(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("gcp cloud functions service init: %w", err)
+	}
+	return svc, nil
+}
+
+func gcpContainerService(ctx context.Context) (*container.Service, error) {
+	if creds := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); strings.TrimSpace(creds) != "" {
+		svc, err := container.NewService(ctx, option.WithCredentialsFile(creds))
+		if err != nil {
+			return nil, fmt.Errorf("gcp container service init: %w", err)
+		}
+		return svc, nil
+	}
+	svc, err := container.NewService(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("gcp container service init: %w", err)
+	}
+	return svc, nil
 }
 
 func cloudSQLVersion(engine string) string {
