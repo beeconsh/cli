@@ -35,6 +35,7 @@ var debugFlag bool
 var yesFlag bool
 var statusFilter string
 var watchInterval string
+var driftPlanFlag bool
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -100,6 +101,9 @@ func init() {
 
 	// Filter flag on status command
 	statusCmd.Flags().StringVar(&statusFilter, "filter", "", "filter by status (DRIFTED,MATCHED,OBSERVED)")
+
+	// Plan flag on drift command
+	driftCmd.Flags().BoolVar(&driftPlanFlag, "plan", false, "show reconciliation plan for drifted resources")
 
 	// Interval flag on watch command
 	watchCmd.Flags().StringVar(&watchInterval, "interval", "5m", "drift check interval (e.g. 30s, 5m, 1h)")

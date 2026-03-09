@@ -442,8 +442,37 @@ var driftCmd = &cobra.Command{
 				out.StatusLine(r.ResourceID, "DRIFTED", "("+strings.ToLower(r.NodeType)+")")
 			}
 			out.Blank()
-			out.Next("run `beecon plan` to generate a reconciliation plan.")
+			if !driftPlanFlag {
+				out.Next("run `beecon plan` to generate a reconciliation plan.")
+			}
 		}
+
+		if driftPlanFlag && len(drifted) > 0 {
+			driftedIDs := make(map[string]bool, len(drifted))
+			for _, r := range drifted {
+				driftedIDs[r.ResourceID] = true
+			}
+			res, err := eng.Plan(cmd.Context(), path)
+			if err != nil {
+				return fmt.Errorf("plan after drift: %w", err)
+			}
+			var filtered []*state.PlanAction
+			for _, a := range res.Plan.Actions {
+				if driftedIDs[a.NodeID] {
+					filtered = append(filtered, a)
+				}
+			}
+			if len(filtered) == 0 {
+				out.Line(out.Dim(out.Dot()), "no reconciliation actions needed")
+			} else {
+				out.Header("Reconciliation plan: %d action(s)", len(filtered))
+				out.Blank()
+				for i, a := range filtered {
+					out.NumberedAction(i+1, a.Operation, a.NodeID, "")
+				}
+			}
+		}
+
 		out.Blank()
 		return nil
 	},
