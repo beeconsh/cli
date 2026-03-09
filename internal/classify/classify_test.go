@@ -233,6 +233,8 @@ func TestClassifyAzureNode(t *testing.T) {
 		{"COMPUTE eventgrid → event_grid", "COMPUTE", map[string]string{"engine": "eventgrid"}, "event_grid"},
 		{"COMPUTE vm → vm", "COMPUTE", map[string]string{"engine": "vm"}, "vm"},
 		{"COMPUTE compute → vm", "COMPUTE", map[string]string{"engine": "compute"}, "vm"},
+		{"COMPUTE function → functions", "COMPUTE", map[string]string{"engine": "function"}, "functions"},
+		{"COMPUTE lambda → functions", "COMPUTE", map[string]string{"engine": "lambda"}, "functions"},
 		{"COMPUTE monitor → monitor", "COMPUTE", map[string]string{"engine": "monitor"}, "monitor"},
 		{"COMPUTE monitoring → monitor", "COMPUTE", map[string]string{"engine": "monitoring"}, "monitor"},
 		{"unknown → empty", "STORE", map[string]string{"engine": "unknown"}, ""},

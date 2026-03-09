@@ -1417,3 +1417,58 @@ func TestAzureIAMRolesForUnknown(t *testing.T) {
 		t.Error("expected error for unknown target")
 	}
 }
+
+func TestWireGraphAzureNSGInjection(t *testing.T) {
+	g := buildGraph(t, `domain acme {
+  cloud = azure(subscription: sub-123, region: eastus)
+  owner = team(platform)
+}
+network mynsg {
+  topology = nsg
+}
+store mydb {
+  engine = postgres_flexible
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+  needs {
+    mydb = read_write
+  }
+}
+`)
+	// Add edges: api and mydb both connected to mynsg
+	g.Edges = append(g.Edges,
+		ir.Edge{From: nodeID(g, "mynsg"), To: nodeID(g, "api")},
+		ir.Edge{From: nodeID(g, "mynsg"), To: nodeID(g, "mydb")},
+	)
+	result, err := WireGraph(g)
+	if err != nil {
+		t.Fatalf("WireGraph failed: %v", err)
+	}
+	if len(result.InferredSGRules) == 0 {
+		t.Fatal("expected NSG rules for VNet-resident resources")
+	}
+	// Verify NSG rules were injected into the nsg node's ingress intent
+	var nsgNode *ir.IntentNode
+	for i := range g.Nodes {
+		if g.Nodes[i].Name == "mynsg" {
+			nsgNode = &g.Nodes[i]
+			break
+		}
+	}
+	if nsgNode == nil {
+		t.Fatal("mynsg node not found")
+	}
+	if nsgNode.Intent["ingress"] == "" {
+		t.Error("expected ingress rules injected into nsg node")
+	}
+}
+
+func nodeID(g *ir.Graph, name string) string {
+	for _, n := range g.Nodes {
+		if n.Name == name {
+			return n.ID
+		}
+	}
+	return ""
+}

@@ -335,6 +335,10 @@ func ClassifyAzureNode(nodeType string, intent map[string]string) string {
 	}
 	if nodeType == "COMPUTE" {
 		switch {
+		case strings.Contains(engine, "lambda"),
+			strings.Contains(engine, "function"),
+			strings.Contains(engine, "functions"):
+			return "functions"
 		case strings.Contains(engine, "eventbridge"),
 			strings.Contains(engine, "eventgrid"),
 			strings.Contains(engine, "event_grid"):

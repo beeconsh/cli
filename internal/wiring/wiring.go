@@ -126,6 +126,9 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 			default:
 				envVars = InferEnvVars(dep.Target, targetTarget, target.Intent)
 			}
+			if node.Env == nil {
+				node.Env = make(map[string]string)
+			}
 			for k, v := range envVars.Vars {
 				if _, exists := node.Env[k]; !exists {
 					node.Env[k] = v

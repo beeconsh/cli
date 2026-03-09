@@ -206,6 +206,10 @@ var AzureValidModes = map[string][]Mode{
 	"container_apps":     {ModeInvoke},
 	"functions":          {ModeInvoke, ModeAdmin},
 	"aks":                {ModeInvoke},
+	"event_grid":         {ModePublish, ModeSubscribe},
+	"vm":                 {ModeAdmin},
+	"monitor":            {ModeRead, ModeWrite},
+	"api_management":     {ModeInvoke, ModeAdmin},
 }
 
 // IsValidAzureMode checks whether a mode is valid for a given Azure target.
@@ -239,20 +243,21 @@ func AzureIAMRolesFor(target string, mode Mode) ([]string, error) {
 }
 
 var azureRBACRoleMatrix = map[string][]string{
-	// Postgres Flexible Server
+	// Postgres Flexible Server — data-plane access uses connection-string auth (username/password),
+	// not Azure RBAC. These roles grant management-plane access for provisioning/monitoring.
 	"postgres_flexible:read":       {"Reader"},
 	"postgres_flexible:write":      {"Contributor"},
 	"postgres_flexible:read_write": {"Contributor"},
 	"postgres_flexible:admin":      {"Owner"},
-	// MySQL Flexible Server
+	// MySQL Flexible Server — same as Postgres: data-plane via connection-string auth.
 	"mysql_flexible:read":       {"Reader"},
 	"mysql_flexible:write":      {"Contributor"},
 	"mysql_flexible:read_write": {"Contributor"},
 	"mysql_flexible:admin":      {"Owner"},
 	// Azure Cache for Redis
-	"azure_cache_redis:read":       {"Reader"},
-	"azure_cache_redis:write":      {"Contributor"},
-	"azure_cache_redis:read_write": {"Contributor"},
+	"azure_cache_redis:read":       {"Redis Cache Contributor"},
+	"azure_cache_redis:write":      {"Redis Cache Contributor"},
+	"azure_cache_redis:read_write": {"Redis Cache Contributor"},
 	// Blob Storage
 	"blob_storage:read":       {"Storage Blob Data Reader"},
 	"blob_storage:write":      {"Storage Blob Data Contributor"},
@@ -268,11 +273,22 @@ var azureRBACRoleMatrix = map[string][]string{
 	"service_bus:read_write": {"Azure Service Bus Data Sender", "Azure Service Bus Data Receiver"},
 	"service_bus:publish":    {"Azure Service Bus Data Sender"},
 	"service_bus:subscribe":  {"Azure Service Bus Data Receiver"},
-	// Container Apps
+	// Container Apps — no dedicated "invoker" role exists; Contributor grants app management.
 	"container_apps:invoke": {"Contributor"},
 	// Functions
-	"functions:invoke": {"Contributor"},
+	"functions:invoke": {"Website Contributor"},
 	"functions:admin":  {"Owner"},
 	// AKS
 	"aks:invoke": {"Azure Kubernetes Service Cluster User Role"},
+	// Event Grid
+	"event_grid:publish":   {"EventGrid Data Sender"},
+	"event_grid:subscribe": {"EventGrid EventSubscription Contributor"},
+	// VM
+	"vm:admin": {"Virtual Machine Contributor"},
+	// Monitor
+	"monitor:read":  {"Monitoring Reader"},
+	"monitor:write": {"Monitoring Contributor"},
+	// API Management
+	"api_management:invoke": {"API Management Service Contributor"},
+	"api_management:admin":  {"API Management Service Contributor"},
 }

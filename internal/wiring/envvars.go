@@ -163,6 +163,7 @@ func InferAzureEnvVars(depName, targetType string, targetIntent map[string]strin
 	case "container_apps":
 		vars[prefix+"SERVICE_URL"] = "${" + depName + ".url}"
 	case "functions":
+		vars[prefix+"FUNCTION_NAME"] = "${" + depName + ".function_name}"
 		vars[prefix+"FUNCTION_URL"] = "${" + depName + ".url}"
 	}
 
