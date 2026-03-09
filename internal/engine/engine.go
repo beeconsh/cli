@@ -23,6 +23,7 @@ import (
 	"github.com/terracotta-ai/beecon/internal/parser"
 	"github.com/terracotta-ai/beecon/internal/provider"
 	"github.com/terracotta-ai/beecon/internal/resolver"
+	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 	"github.com/terracotta-ai/beecon/internal/wiring"
 )
@@ -688,6 +689,331 @@ func (e *Engine) Drift(ctx context.Context, beaconPath string) ([]*state.Resourc
 	}
 	sort.Slice(drifted, func(i, j int) bool { return drifted[i].ResourceID < drifted[j].ResourceID })
 	return drifted, observeErrors, nil
+}
+
+// ReconcileAction describes a single drift reconciliation action and its outcome.
+type ReconcileAction struct {
+	NodeName    string   `json:"node_name"`
+	Target      string   `json:"target"`
+	DriftFields []string `json:"drift_fields"`
+	Status      string   `json:"status"` // "reconciled", "failed", "skipped"
+	Error       string   `json:"error,omitempty"`
+}
+
+// ReconcileResult is the outcome of a drift reconciliation operation.
+type ReconcileResult struct {
+	DriftedCount      int               `json:"drifted_count"`
+	ReconciledCount   int               `json:"reconciled_count"`
+	FailedCount       int               `json:"failed_count"`
+	ForbiddenCount    int               `json:"forbidden_count"`
+	PendingApproval   int               `json:"pending_approval"`
+	ApprovalRequestID string            `json:"approval_request_id,omitempty"`
+	Actions           []ReconcileAction `json:"actions"`
+}
+
+// DriftReconcile detects drifted resources and generates (or executes) reconciliation
+// actions to restore them to their intended state. If apply is true, the UPDATE
+// actions are executed via the provider executor.
+func (e *Engine) DriftReconcile(ctx context.Context, beaconPath string, apply bool) (*ReconcileResult, error) {
+	logging.Logger.Debug("drift-reconcile:start", "path", beaconPath, "apply", apply)
+
+	// Step 1: Run drift detection to get drifted resources.
+	drifted, observeErrors, err := e.Drift(ctx, beaconPath)
+	if err != nil {
+		return nil, fmt.Errorf("drift detection failed: %w", err)
+	}
+	for _, oe := range observeErrors {
+		logging.Logger.Warn("drift-reconcile: observe warning", "error", oe)
+	}
+
+	result := &ReconcileResult{
+		DriftedCount: len(drifted),
+		Actions:      make([]ReconcileAction, 0, len(drifted)),
+	}
+
+	if len(drifted) == 0 {
+		return result, nil
+	}
+
+	// Step 2: Parse and build graph to get current intent for drifted resources.
+	g, err := parseAndBuildGraph(beaconPath, e.ActiveProfile)
+	if err != nil {
+		return nil, fmt.Errorf("parse beacon for reconcile: %w", err)
+	}
+	if _, _, enrichErr := enrichGraph(g); enrichErr != nil {
+		return nil, fmt.Errorf("enrich graph for reconcile: %w", enrichErr)
+	}
+	cloudProvider, cloudRegion, err := parseCloud(g)
+	if err != nil {
+		return nil, err
+	}
+	nodesByID := g.NodesByID()
+
+	// Build a set of drifted resource IDs for quick lookup.
+	driftedSet := make(map[string]*state.ResourceRecord, len(drifted))
+	for _, rec := range drifted {
+		driftedSet[rec.ResourceID] = rec
+	}
+
+	// Step 3: For each drifted resource, compute drift fields and generate a reconcile action.
+	type pendingAction struct {
+		reconcileIdx int
+		planAction   *state.PlanAction
+		node         ir.IntentNode
+	}
+	var pending []pendingAction
+
+	for _, rec := range drifted {
+		n, ok := nodesByID[rec.ResourceID]
+		if !ok {
+			// Resource removed from intent; skip reconciliation (would be a DELETE, not an UPDATE).
+			result.Actions = append(result.Actions, ReconcileAction{
+				NodeName:    rec.NodeName,
+				Target:      rec.ResourceID,
+				DriftFields: nil,
+				Status:      "skipped",
+				Error:       "resource no longer in intent",
+			})
+			continue
+		}
+
+		// Compute which fields drifted.
+		intentSnap := n.Snapshot()
+		driftFields := computeDriftFields(rec.IntentSnapshot, intentSnap, rec.LiveState)
+
+		ra := ReconcileAction{
+			NodeName:    rec.NodeName,
+			Target:      rec.ResourceID,
+			DriftFields: driftFields,
+			Status:      "pending",
+		}
+
+		changes := reconcileDiff(rec.IntentSnapshot, intentSnap)
+		// If intent hasn't changed but live state drifted, the changes map may be empty.
+		// In that case, build changes from live state vs intent.
+		if len(changes) == 0 {
+			changes = reconcileDiff(rec.LiveState, intentSnap)
+		}
+
+		// Determine operation: if the resource was deleted from the cloud
+		// (LiveState is empty), we need CREATE, not UPDATE.
+		operation := "UPDATE"
+		if len(rec.LiveState) == 0 {
+			operation = "CREATE"
+		}
+
+		pa := &state.PlanAction{
+			ID:        state.NewID("act"),
+			NodeID:    rec.ResourceID,
+			NodeType:  rec.NodeType,
+			NodeName:  rec.NodeName,
+			Operation: operation,
+			Reasoning: "drift reconciliation: restoring to intended state",
+			Changes:   changes,
+		}
+
+		result.Actions = append(result.Actions, ra)
+		pending = append(pending, pendingAction{
+			reconcileIdx: len(result.Actions) - 1,
+			planAction:   pa,
+			node:         n,
+		})
+	}
+
+	// Step 3b: Annotate boundary policies (forbid/approve gates) on reconcile actions.
+	// This mirrors the pattern in Engine.Apply to ensure reconciliation respects
+	// the same boundary constraints as normal apply.
+	var forbidden []pendingAction
+	var gated []pendingAction   // actions requiring approval
+	var allowed []pendingAction // actions that can execute immediately
+	for _, p := range pending {
+		tag := boundaryTagFor(p.planAction)
+		if tag != "" {
+			p.planAction.BoundaryTag = tag
+			if g.Domain != nil && contains(g.Domain.Boundary["forbid"], tag) {
+				p.planAction.Operation = "FORBIDDEN"
+				p.planAction.RequiresApproval = false
+				p.planAction.Reasoning += "; forbidden by boundary"
+				result.Actions[p.reconcileIdx].Status = "forbidden"
+				result.Actions[p.reconcileIdx].Error = fmt.Sprintf("forbidden by boundary policy (%s)", tag)
+				result.ForbiddenCount++
+				forbidden = append(forbidden, p)
+				continue
+			}
+			if g.Domain != nil && contains(g.Domain.Boundary["approve"], tag) {
+				p.planAction.RequiresApproval = true
+			}
+		}
+		if p.planAction.RequiresApproval {
+			gated = append(gated, p)
+		} else {
+			allowed = append(allowed, p)
+		}
+	}
+
+	// If not applying, mark non-forbidden actions as "pending" (plan-only mode).
+	if !apply {
+		for _, p := range allowed {
+			result.Actions[p.reconcileIdx].Status = "pending"
+		}
+		for _, p := range gated {
+			result.Actions[p.reconcileIdx].Status = "pending_approval"
+		}
+		result.PendingApproval = len(gated)
+		return result, nil
+	}
+
+	// Step 4: Execute reconciliation actions.
+	tx, err := e.store.LoadForUpdate()
+	if err != nil {
+		return nil, fmt.Errorf("load state for reconcile: %w", err)
+	}
+	defer tx.Rollback()
+	st := tx.State
+	expireApprovalsInline(st)
+
+	runID := state.NewID("run")
+	run := &state.RunRecord{
+		ID:            runID,
+		CreatedAt:     time.Now().UTC(),
+		BeaconPath:    beaconPath,
+		Status:        state.RunApplied,
+		ActiveProfile: e.ActiveProfile,
+	}
+
+	// Register all actions (allowed + gated) in state.
+	allExecutable := append(allowed, gated...)
+	for _, p := range allExecutable {
+		st.Actions[p.planAction.ID] = p.planAction
+		run.ActionIDs = append(run.ActionIDs, p.planAction.ID)
+	}
+
+	// Execute only allowed (non-gated) actions.
+	for _, p := range allowed {
+		if err := applyAction(ctx, e.exec, cloudProvider, cloudRegion, st, runID, p.planAction, g); err != nil {
+			result.Actions[p.reconcileIdx].Status = "failed"
+			result.Actions[p.reconcileIdx].Error = err.Error()
+			result.FailedCount++
+			logging.Logger.Warn("drift-reconcile: action failed", "target", p.planAction.NodeID, "error", err)
+			continue
+		}
+
+		result.Actions[p.reconcileIdx].Status = "reconciled"
+		result.ReconciledCount++
+		run.ExecutedActions = append(run.ExecutedActions, p.planAction.ID)
+	}
+
+	// Create approval request for gated actions (matching the Apply flow).
+	if len(gated) > 0 {
+		run.Status = state.RunPendingApproval
+
+		// Compute intent hash for approval integrity.
+		abs, _ := filepath.Abs(beaconPath)
+		content, readErr := os.ReadFile(abs)
+		intentHash := ""
+		if readErr == nil {
+			intentHash = sha256hex(content)
+		}
+
+		req := &state.ApprovalRequest{
+			ID:            state.NewID("apr"),
+			CreatedAt:     time.Now().UTC(),
+			RunID:         runID,
+			Reason:        "boundary approve gate triggered during drift reconciliation",
+			Status:        state.ApprovalPending,
+			ExpiresAt:     time.Now().UTC().Add(24 * time.Hour),
+			BeaconPath:    abs,
+			IntentHash:    intentHash,
+			BlastRadius:   fmt.Sprintf("%d actions", len(gated)),
+			ActiveProfile: e.ActiveProfile,
+		}
+		for _, p := range gated {
+			req.ActionIDs = append(req.ActionIDs, p.planAction.ID)
+			result.Actions[p.reconcileIdx].Status = "pending_approval"
+			if rec := st.Resources[p.planAction.NodeID]; rec != nil {
+				rec.ApprovalBlocked = true
+			}
+		}
+		st.Approvals[req.ID] = req
+		result.ApprovalRequestID = req.ID
+		result.PendingApproval = len(gated)
+		addAudit(st, runID, "APPROVAL_REQUIRED", "", fmt.Sprintf("reconcile approval %s required for %d actions", req.ID, len(gated)), map[string]interface{}{"request_id": req.ID})
+	}
+
+	if result.FailedCount > 0 && result.ReconciledCount == 0 && len(gated) == 0 {
+		run.Status = state.RunFailed
+		run.Error = "all reconciliation actions failed"
+	} else if result.FailedCount > 0 && len(gated) == 0 {
+		run.Status = state.RunFailed
+		run.Error = fmt.Sprintf("%d of %d reconciliation actions failed", result.FailedCount, len(allowed))
+	}
+
+	st.Runs[runID] = run
+	addAudit(st, runID, "DRIFT_RECONCILE", "", fmt.Sprintf("drift reconciliation: %d reconciled, %d failed, %d pending approval, %d forbidden", result.ReconciledCount, result.FailedCount, result.PendingApproval, result.ForbiddenCount), nil)
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit reconcile state: %w", err)
+	}
+
+	logging.Logger.Debug("drift-reconcile:complete", "reconciled", result.ReconciledCount, "failed", result.FailedCount, "pending_approval", result.PendingApproval, "forbidden", result.ForbiddenCount)
+	return result, nil
+}
+
+// computeDriftFields determines which fields differ between the stored intent,
+// the current intent snapshot, and the live state.
+func computeDriftFields(storedIntent, currentIntent, liveState map[string]interface{}) []string {
+	seen := make(map[string]bool)
+	var fields []string
+
+	// Fields where live state differs from current intent.
+	for k, intended := range currentIntent {
+		live, ok := liveState[k]
+		if !ok || fmt.Sprint(live) != fmt.Sprint(intended) {
+			if !seen[k] {
+				fields = append(fields, k)
+				seen[k] = true
+			}
+		}
+	}
+
+	// Fields where stored intent differs from current intent (intent change caused drift).
+	for k, current := range currentIntent {
+		stored, ok := storedIntent[k]
+		if !ok || fmt.Sprint(stored) != fmt.Sprint(current) {
+			if !seen[k] {
+				fields = append(fields, k)
+				seen[k] = true
+			}
+		}
+	}
+
+	sort.Strings(fields)
+	return fields
+}
+
+// reconcileDiff computes a changes map between two intent snapshots, suitable
+// for populating PlanAction.Changes during reconciliation.
+func reconcileDiff(old, new map[string]interface{}) map[string]string {
+	changes := map[string]string{}
+	for k, n := range new {
+		if o, ok := old[k]; !ok || fmt.Sprint(o) != fmt.Sprint(n) {
+			if security.IsSensitiveKey(k) {
+				changes[k] = "**REDACTED** -> **REDACTED**"
+			} else {
+				changes[k] = fmt.Sprintf("%v -> %v", o, n)
+			}
+		}
+	}
+	for k, o := range old {
+		if _, ok := new[k]; !ok {
+			if security.IsSensitiveKey(k) {
+				changes[k] = "**REDACTED** -> <deleted>"
+			} else {
+				changes[k] = fmt.Sprintf("%v -> <deleted>", o)
+			}
+		}
+	}
+	return changes
 }
 
 // Refresh observes all managed resources and updates LiveState + LastSeen

@@ -435,7 +435,18 @@ var driftCmd = &cobra.Command{
 	Args:        cobra.MaximumNArgs(1),
 	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// --apply requires --reconcile
+		if driftApplyFlag && !driftReconcileFlag {
+			return fmt.Errorf("--apply requires --reconcile")
+		}
+
 		path := beaconPathArg(args)
+
+		// --reconcile mode: use DriftReconcile engine method
+		if driftReconcileFlag {
+			return runDriftReconcile(cmd, path)
+		}
+
 		drifted, observeErrors, err := eng.Drift(cmd.Context(), path)
 		if err != nil {
 			return err
@@ -503,6 +514,67 @@ var driftCmd = &cobra.Command{
 		out.Blank()
 		return nil
 	},
+}
+
+// runDriftReconcile handles the --reconcile (and --reconcile --apply) flow.
+func runDriftReconcile(cmd *cobra.Command, path string) error {
+	result, err := eng.DriftReconcile(cmd.Context(), path, driftApplyFlag)
+	if err != nil {
+		return err
+	}
+
+	if formatFlag == "json" {
+		return cli.WriteJSON(os.Stdout, result)
+	}
+
+	out.Blank()
+	if result.DriftedCount == 0 {
+		out.Line(out.Green(out.OK()), "No drift detected — nothing to reconcile")
+		out.Blank()
+		return nil
+	}
+
+	if driftApplyFlag {
+		out.Header("Drift Reconciliation Report")
+	} else {
+		out.Header("Drift Reconciliation Plan")
+	}
+	out.Blank()
+	out.Summary("Drifted: %d   Reconciled: %d   Failed: %d",
+		result.DriftedCount, result.ReconciledCount, result.FailedCount)
+	out.Blank()
+
+	for _, a := range result.Actions {
+		var icon, label string
+		switch a.Status {
+		case "reconciled":
+			icon = out.Green(out.OK())
+			label = "RECONCILED"
+		case "failed":
+			icon = out.Red(out.Fail())
+			label = "FAILED"
+		case "skipped":
+			icon = out.Dim(out.Dot())
+			label = "SKIPPED"
+		default:
+			icon = out.Yellow(out.Warn())
+			label = "PENDING"
+		}
+		detail := ""
+		if len(a.DriftFields) > 0 {
+			detail = out.Dim("fields: " + strings.Join(a.DriftFields, ", "))
+		}
+		out.ActionLine(icon, label, a.Target, detail)
+		if a.Error != "" {
+			out.Line(" ", "  %s", out.Red(a.Error))
+		}
+	}
+
+	out.Blank()
+	if !driftApplyFlag {
+		out.Next("run `beecon drift --reconcile --apply` to execute the reconciliation.")
+	}
+	return nil
 }
 
 var approveCmd = &cobra.Command{
