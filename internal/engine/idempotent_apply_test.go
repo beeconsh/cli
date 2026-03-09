@@ -433,7 +433,7 @@ func TestPartialRecoveryUsesCompletedSet(t *testing.T) {
 				ID:               "run-1",
 				BeaconPath:       abs,
 				Status:           state.RunFailed,
-				CompletedActions: []string{"postgres:CREATE"},
+				CompletedActions: []string{"store.postgres:CREATE"},
 			},
 		},
 		Actions:     map[string]*state.PlanAction{},
@@ -442,11 +442,11 @@ func TestPartialRecoveryUsesCompletedSet(t *testing.T) {
 	}
 
 	completedSet := findCompletedSetForBeacon(st, abs)
-	if !completedSet["postgres:CREATE"] {
-		t.Fatal("expected postgres:CREATE in completed set")
+	if !completedSet["store.postgres:CREATE"] {
+		t.Fatal("expected store.postgres:CREATE in completed set")
 	}
-	if completedSet["redis:CREATE"] {
-		t.Fatal("unexpected redis:CREATE in completed set")
+	if completedSet["store.redis:CREATE"] {
+		t.Fatal("unexpected store.redis:CREATE in completed set")
 	}
 }
 
@@ -512,7 +512,7 @@ func TestIsAlreadyAppliedUnit(t *testing.T) {
 			name:   "action in completed set is skipped",
 			action: &state.PlanAction{NodeID: "store.pg", NodeName: "pg", Operation: "CREATE"},
 			resources: map[string]*state.ResourceRecord{},
-			completedSet: map[string]bool{"pg:CREATE": true},
+			completedSet: map[string]bool{"store.pg:CREATE": true},
 			wantSkip: true,
 		},
 		{
@@ -530,7 +530,7 @@ func TestIsAlreadyAppliedUnit(t *testing.T) {
 			resources: map[string]*state.ResourceRecord{
 				"store.pg": {ProviderID: "rds-123", Managed: true, Status: state.StatusMatched},
 			},
-			completedSet: map[string]bool{"pg:UPDATE": true},
+			completedSet: map[string]bool{"store.pg:UPDATE": true},
 			wantSkip: true,
 		},
 	}
@@ -546,5 +546,25 @@ func TestIsAlreadyAppliedUnit(t *testing.T) {
 				t.Error("expected non-empty reason when skip=true")
 			}
 		})
+	}
+}
+
+func TestCompletedActionKeyUsesNodeID(t *testing.T) {
+	// Two nodes with the same NodeName but different NodeIDs must produce
+	// distinct keys. Before the fix, both would produce "cache:CREATE".
+	storeAction := &state.PlanAction{NodeID: "store.cache", NodeName: "cache", Operation: "CREATE"}
+	networkAction := &state.PlanAction{NodeID: "network.cache", NodeName: "cache", Operation: "CREATE"}
+
+	k1 := completedActionKey(storeAction)
+	k2 := completedActionKey(networkAction)
+
+	if k1 == k2 {
+		t.Fatalf("completedActionKey collision: both returned %q", k1)
+	}
+	if k1 != "store.cache:CREATE" {
+		t.Errorf("expected store.cache:CREATE, got %q", k1)
+	}
+	if k2 != "network.cache:CREATE" {
+		t.Errorf("expected network.cache:CREATE, got %q", k2)
 	}
 }

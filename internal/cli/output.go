@@ -54,6 +54,13 @@ func (o *Writer) Warn() string {
 	return "!"
 }
 
+func (o *Writer) Skip() string {
+	if o.color {
+		return "⏭"
+	}
+	return "-"
+}
+
 func (o *Writer) Arrow() string {
 	if o.color {
 		return "→"

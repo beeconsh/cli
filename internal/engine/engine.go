@@ -1127,8 +1127,10 @@ func applyAction(ctx context.Context, exec provider.Executor, cloudProvider, clo
 }
 
 // completedActionKey returns a unique key for tracking completed actions in a run.
+// Uses NodeID (e.g. "store.cache") rather than NodeName (e.g. "cache") to avoid
+// collisions when different node types share the same short name.
 func completedActionKey(a *state.PlanAction) string {
-	return a.NodeName + ":" + a.Operation
+	return a.NodeID + ":" + a.Operation
 }
 
 // isAlreadyApplied checks whether an action can be safely skipped because a
