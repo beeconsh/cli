@@ -816,3 +816,125 @@ func TestApplyPartialFailureReturnsResult(t *testing.T) {
 		t.Error("expected non-empty RunID")
 	}
 }
+
+// --- Plan enrichment tests ---
+
+func TestPlanEnrichment_RiskScoring(t *testing.T) {
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store postgres {
+  engine = postgres
+}
+service api {
+  runtime = container(from: ./Dockerfile)
+}
+`)
+	ctx := context.Background()
+	e := New(dir)
+	res, err := e.Plan(ctx, beacon)
+	if err != nil {
+		t.Fatalf("plan failed: %v", err)
+	}
+	if res.Summary == nil {
+		t.Fatal("expected plan summary")
+	}
+	if res.Summary.TotalActions != 2 {
+		t.Fatalf("expected 2 actions, got %d", res.Summary.TotalActions)
+	}
+	if res.Summary.Creates != 2 {
+		t.Fatalf("expected 2 creates, got %d", res.Summary.Creates)
+	}
+
+	// Every action should have risk scoring.
+	for _, a := range res.Plan.Actions {
+		if a.RiskScore == 0 {
+			t.Errorf("action %s has zero risk score", a.NodeID)
+		}
+		if a.RiskLevel == "" {
+			t.Errorf("action %s has empty risk level", a.NodeID)
+		}
+		if a.RollbackFeasibility == "" {
+			t.Errorf("action %s has empty rollback feasibility", a.NodeID)
+		}
+	}
+}
+
+func TestScoreRisk(t *testing.T) {
+	tests := []struct {
+		op, nodeType string
+		wantMin      int
+		wantLevel    string
+	}{
+		{"CREATE", "service", 2, "low"},
+		{"CREATE", "store", 4, "medium"},
+		{"UPDATE", "service", 4, "medium"},
+		{"UPDATE", "store", 6, "high"},
+		{"DELETE", "service", 7, "high"},
+		{"DELETE", "store", 9, "critical"},
+		{"FORBIDDEN", "service", 1, "low"},
+	}
+	for _, tt := range tests {
+		score, level := scoreRisk(tt.op, tt.nodeType)
+		if score < tt.wantMin {
+			t.Errorf("scoreRisk(%s, %s) = %d, want >= %d", tt.op, tt.nodeType, score, tt.wantMin)
+		}
+		if level != tt.wantLevel {
+			t.Errorf("scoreRisk(%s, %s) level = %s, want %s", tt.op, tt.nodeType, level, tt.wantLevel)
+		}
+	}
+}
+
+func TestRollbackFeasibility(t *testing.T) {
+	tests := []struct {
+		op, nodeType, want string
+	}{
+		{"CREATE", "service", "safe"},
+		{"CREATE", "store", "safe"},
+		{"UPDATE", "service", "safe"},
+		{"UPDATE", "store", "risky"},
+		{"DELETE", "service", "risky"},
+		{"DELETE", "store", "impossible"},
+		{"FORBIDDEN", "store", "safe"},
+	}
+	for _, tt := range tests {
+		got := rollbackFeasibility(tt.op, tt.nodeType)
+		if got != tt.want {
+			t.Errorf("rollbackFeasibility(%s, %s) = %s, want %s", tt.op, tt.nodeType, got, tt.want)
+		}
+	}
+}
+
+func TestPlanEnrichment_Summary(t *testing.T) {
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store postgres {
+  engine = postgres
+}
+`)
+	ctx := context.Background()
+	e := New(dir)
+	res, err := e.Plan(ctx, beacon)
+	if err != nil {
+		t.Fatalf("plan failed: %v", err)
+	}
+	if res.Summary == nil {
+		t.Fatal("expected summary")
+	}
+	if res.Summary.AggregateRisk == "" {
+		t.Error("expected non-empty aggregate risk")
+	}
+	// CREATE store has risk ~4 (CREATE=2 + store=2), level=medium
+	for _, a := range res.Plan.Actions {
+		if a.NodeType == "store" && a.Operation == "CREATE" {
+			if a.RollbackFeasibility != "safe" {
+				t.Errorf("CREATE store should be safe, got %s", a.RollbackFeasibility)
+			}
+		}
+	}
+}

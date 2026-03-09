@@ -115,3 +115,29 @@ func TestScrubChangesNil(t *testing.T) {
 		t.Fatal("expected nil for nil input")
 	}
 }
+
+func TestSafePath(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name      string
+		requested string
+		wantErr   bool
+	}{
+		{"valid relative", "infra.beecon", false},
+		{"valid subdir", "envs/prod.beecon", false},
+		{"traversal attack", "../../etc/passwd", true},
+		{"dot-dot in middle", "envs/../../etc/passwd", true},
+		{"root itself", ".", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := SafePath(root, tc.requested)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for %q, got nil", tc.requested)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error for %q: %v", tc.requested, err)
+			}
+		})
+	}
+}

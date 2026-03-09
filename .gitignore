@@ -39,5 +39,8 @@ coverage.html
 UPDATED_DESIGN.md
 GCP_AZURE_PARITY_PLAN.md
 
+# Internal documentation (local reference, not committed)
+docs/PHASE3_AGENT_INTERFACE.md
+
 # Build
 tmp/

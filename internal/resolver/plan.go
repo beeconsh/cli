@@ -12,7 +12,7 @@ import (
 
 // Plan is an ordered, executable set of actions.
 type Plan struct {
-	Actions []*state.PlanAction
+	Actions []*state.PlanAction `json:"actions"`
 }
 
 // BuildPlan builds a topologically sorted execution plan from graph and existing state.

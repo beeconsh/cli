@@ -1,6 +1,27 @@
 package security
 
-import "strings"
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// SafePath validates that requested is contained within root, preventing
+// path traversal attacks. Both paths are resolved to absolute before comparison.
+func SafePath(root, requested string) error {
+	abs, err := filepath.Abs(filepath.Join(root, requested))
+	if err != nil {
+		return fmt.Errorf("invalid path")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("invalid root")
+	}
+	if !strings.HasPrefix(abs, absRoot+string(filepath.Separator)) && abs != absRoot {
+		return fmt.Errorf("path escapes project root")
+	}
+	return nil
+}
 
 // sensitiveKeys is the canonical set of key base-names that must never appear
 // in API responses, audit logs, or UI output.
