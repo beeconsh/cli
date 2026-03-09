@@ -777,6 +777,49 @@ var watchCmd = &cobra.Command{
 	},
 }
 
+var restoreListFlag bool
+
+var restoreCmd = &cobra.Command{
+	Use:   "restore [timestamp]",
+	Short: "List or restore state backups",
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(_ *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		store := state.NewStore(cwd)
+
+		if restoreListFlag || len(args) == 0 {
+			backups, err := store.ListBackups()
+			if err != nil {
+				return err
+			}
+			out.Blank()
+			if len(backups) == 0 {
+				out.Line(out.Dim(out.Dot()), "No backups found")
+			} else {
+				out.Header("Available backups")
+				out.Blank()
+				for _, b := range backups {
+					out.Line(out.Dot(), "%s  %s", b.Timestamp.Format("2006-01-02 15:04:05 UTC"), out.Dim(b.Path))
+				}
+			}
+			out.Blank()
+			return nil
+		}
+
+		timestamp := args[0]
+		if err := store.RestoreBackup(timestamp); err != nil {
+			return err
+		}
+		out.Blank()
+		out.Line(out.Green(out.OK()), "Restored state from backup %s", timestamp)
+		out.Blank()
+		return nil
+	},
+}
+
 // sortedKeys returns the keys of a map sorted alphabetically.
 func sortedKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))

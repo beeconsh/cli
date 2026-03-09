@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/terracotta-ai/beecon/internal/logging"
 )
 
 var idCounter uint64
@@ -219,6 +221,9 @@ func (s *Store) LoadForUpdate() (*StateTransaction, error) {
 		releaseFileLock(f)
 		s.mu.Unlock()
 		return nil, err
+	}
+	if err := s.backupIfNeeded(); err != nil {
+		logging.Logger.Warn("state backup failed, continuing with apply", "error", err)
 	}
 	return &StateTransaction{State: st, store: s, lockFile: f}, nil
 }
