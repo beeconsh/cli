@@ -299,7 +299,9 @@ func (s *Store) loadLocked() (*State, error) {
 		return nil, fmt.Errorf("state.json version %d is newer than this beecon (supports up to %d); upgrade beecon", st.Version, CurrentVersion)
 	}
 	if st.Version < CurrentVersion {
-		runMigrations(&st)
+		if err := runMigrations(&st); err != nil {
+			return nil, fmt.Errorf("state migration failed: %w", err)
+		}
 	}
 	return &st, nil
 }

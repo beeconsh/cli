@@ -702,8 +702,8 @@ var watchCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("invalid interval %q: %w", watchInterval, err)
 		}
-		if interval <= 0 {
-			return fmt.Errorf("interval must be positive, got %s", watchInterval)
+		if interval < 10*time.Second {
+			return fmt.Errorf("interval must be at least 10s, got %s", watchInterval)
 		}
 		out.Blank()
 		out.Line(out.Dot(), "Watching %s every %s (Ctrl+C to stop)", path, interval)

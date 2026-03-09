@@ -697,6 +697,9 @@ func (e *Engine) Refresh(ctx context.Context, beaconPath string) (int, []error, 
 // Import imports an existing cloud resource into beecon state by observing it.
 // Returns the resource ID of the imported resource.
 func (e *Engine) Import(ctx context.Context, providerName, resourceType, providerID, region string) (string, error) {
+	if strings.TrimSpace(providerID) == "" {
+		return "", fmt.Errorf("provider-id must not be empty")
+	}
 	// Extract a short name from the provider ID for the node ID.
 	// AWS ARNs use colons and slashes; use the last segment as the name.
 	shortName := providerID
@@ -1128,10 +1131,13 @@ func expireApprovalsInline(st *state.State) bool {
 func (e *Engine) runExpireApprovals() {
 	tx, err := e.store.LoadForUpdate()
 	if err != nil {
+		logging.Logger.Warn("expire approvals: load failed", "error", err)
 		return
 	}
 	if expireApprovalsInline(tx.State) {
-		_ = tx.Commit()
+		if err := tx.Commit(); err != nil {
+			logging.Logger.Warn("expire approvals: commit failed", "error", err)
+		}
 	} else {
 		tx.Rollback()
 	}

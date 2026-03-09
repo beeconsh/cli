@@ -42,8 +42,8 @@ func IsSensitiveKey(key string) bool {
 	return sensitiveKeys[strings.ToLower(base)]
 }
 
-// ScrubMap returns a shallow copy of m with sensitive values replaced by
-// "**REDACTED**". Nil input returns nil.
+// ScrubMap returns a deep copy of m with sensitive values replaced by
+// "**REDACTED**". Recurses into nested maps. Nil input returns nil.
 func ScrubMap(m map[string]interface{}) map[string]interface{} {
 	if m == nil {
 		return nil
@@ -52,6 +52,8 @@ func ScrubMap(m map[string]interface{}) map[string]interface{} {
 	for k, v := range m {
 		if IsSensitiveKey(k) {
 			out[k] = "**REDACTED**"
+		} else if nested, ok := v.(map[string]interface{}); ok {
+			out[k] = ScrubMap(nested)
 		} else {
 			out[k] = v
 		}
