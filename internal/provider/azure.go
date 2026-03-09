@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -15,6 +17,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
 
@@ -257,7 +260,7 @@ func applyAzureBlobStorage(ctx context.Context, req ApplyRequest) (*ApplyResult,
 	switch req.Action.Operation {
 	case "CREATE":
 		_, err = container.Create(ctx, nil)
-		if err != nil && azureStatusCode(err) != 409 {
+		if err != nil && !isAzureConflict(err) {
 			return nil, fmt.Errorf("blob container create: %w", err)
 		}
 	case "UPDATE":
@@ -267,7 +270,7 @@ func applyAzureBlobStorage(ctx context.Context, req ApplyRequest) (*ApplyResult,
 		}
 	case "DELETE":
 		_, err = container.Delete(ctx, nil)
-		if err != nil && azureStatusCode(err) != 404 {
+		if err != nil && !isAzureNotFound(err) {
 			return nil, fmt.Errorf("blob container delete: %w", err)
 		}
 	}
@@ -297,23 +300,39 @@ func observeAzureBlobStorage(ctx context.Context, rec *state.ResourceRecord) (*O
 	if err != nil {
 		return nil, fmt.Errorf("blob service client init: %w", err)
 	}
-	_, err = svc.NewContainerClient(containerName).GetProperties(ctx, nil)
+	containerClient := svc.NewContainerClient(containerName)
+	props, err := containerClient.GetProperties(ctx, nil)
 	if err != nil {
-		if azureStatusCode(err) == 404 {
+		if isAzureNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: fmt.Sprintf("%s/%s", accountURL, containerName), LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("blob container get properties: %w", err)
 	}
+	// Extract account_name from the URL (https://<account>.blob.core.windows.net)
+	accountName := ""
+	if parts := strings.Split(strings.TrimPrefix(strings.TrimPrefix(accountURL, "https://"), "http://"), "."); len(parts) > 0 {
+		accountName = parts[0]
+	}
 	providerID := fmt.Sprintf("%s/%s", accountURL, containerName)
+	live := map[string]interface{}{
+		"provider":    "azure",
+		"service":     "blob_storage",
+		"account_url": accountURL,
+		"container":   containerName,
+	}
+	if accountName != "" {
+		live["account_name"] = accountName
+	}
+	if props.LeaseStatus != nil {
+		live["lease_status"] = string(*props.LeaseStatus)
+	}
+	if props.LastModified != nil {
+		live["last_modified"] = props.LastModified.UTC().Format(time.RFC3339)
+	}
 	return &ObserveResult{
 		Exists:     true,
 		ProviderID: providerID,
-		LiveState: map[string]interface{}{
-			"provider":    "azure",
-			"service":     "blob_storage",
-			"account_url": accountURL,
-			"container":   containerName,
-		},
+		LiveState:  live,
 	}, nil
 }
 
@@ -349,7 +368,7 @@ func applyAzureKeyVaultSecret(ctx context.Context, req ApplyRequest) (*ApplyResu
 		}
 	case "DELETE":
 		_, err = client.DeleteSecret(ctx, secretName, nil)
-		if err != nil && azureStatusCode(err) != 404 {
+		if err != nil && !isAzureNotFound(err) {
 			return nil, fmt.Errorf("key vault delete secret: %w", err)
 		}
 	}
@@ -395,7 +414,7 @@ func observeAzureKeyVaultSecret(ctx context.Context, rec *state.ResourceRecord) 
 	}
 	resp, err := client.GetSecret(ctx, secretName, "", nil)
 	if err != nil {
-		if azureStatusCode(err) == 404 {
+		if isAzureNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: fmt.Sprintf("%s/secrets/%s", vaultURL, secretName), LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("key vault get secret: %w", err)
@@ -409,6 +428,24 @@ func observeAzureKeyVaultSecret(ctx context.Context, rec *state.ResourceRecord) 
 	}
 	if resp.ID != nil {
 		live["id"] = *resp.ID
+	}
+	if resp.ContentType != nil {
+		live["content_type"] = *resp.ContentType
+	}
+	// Scrub secret value — never include in LiveState
+	if resp.Attributes != nil {
+		if resp.Attributes.Enabled != nil {
+			live["enabled"] = *resp.Attributes.Enabled
+		}
+		if resp.Attributes.Expires != nil {
+			live["expires"] = resp.Attributes.Expires.UTC().Format(time.RFC3339)
+		}
+		if resp.Attributes.Created != nil {
+			live["created"] = resp.Attributes.Created.UTC().Format(time.RFC3339)
+		}
+		if resp.Attributes.Updated != nil {
+			live["updated"] = resp.Attributes.Updated.UTC().Format(time.RFC3339)
+		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: providerID, LiveState: live}, nil
 }
@@ -457,12 +494,12 @@ func applyAzureVNet(ctx context.Context, req ApplyRequest) (*ApplyResult, error)
 	case "DELETE":
 		poller, err := client.BeginDelete(ctx, rg, name, nil)
 		if err != nil {
-			if azureStatusCode(err) == 404 {
+			if isAzureNotFound(err) {
 				return &ApplyResult{ProviderID: name, LiveState: map[string]interface{}{"provider": "azure", "service": "vnet", "name": name, "operation": req.Action.Operation}}, nil
 			}
 			return nil, fmt.Errorf("azure vnet delete: %w", err)
 		}
-		if _, err := poller.PollUntilDone(ctx, nil); err != nil && azureStatusCode(err) != 404 {
+		if _, err := poller.PollUntilDone(ctx, nil); err != nil && !isAzureNotFound(err) {
 			return nil, fmt.Errorf("azure vnet delete poll: %w", err)
 		}
 		return &ApplyResult{ProviderID: name, LiveState: map[string]interface{}{"provider": "azure", "service": "vnet", "name": name, "operation": req.Action.Operation}}, nil
@@ -482,7 +519,7 @@ func observeAzureVNet(ctx context.Context, rec *state.ResourceRecord) (*ObserveR
 	}
 	out, err := factory.NewVirtualNetworksClient().Get(ctx, rg, name, nil)
 	if err != nil {
-		if azureStatusCode(err) == 404 {
+		if isAzureNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("azure vnet get: %w", err)
@@ -490,6 +527,23 @@ func observeAzureVNet(ctx context.Context, rec *state.ResourceRecord) (*ObserveR
 	live := map[string]interface{}{"provider": "azure", "service": "vnet", "name": name}
 	if out.Location != nil {
 		live["location"] = *out.Location
+	}
+	if out.Properties != nil {
+		if out.Properties.ProvisioningState != nil {
+			live["provisioning_state"] = string(*out.Properties.ProvisioningState)
+		}
+		if out.Properties.AddressSpace != nil && out.Properties.AddressSpace.AddressPrefixes != nil {
+			prefixes := make([]string, 0, len(out.Properties.AddressSpace.AddressPrefixes))
+			for _, p := range out.Properties.AddressSpace.AddressPrefixes {
+				if p != nil {
+					prefixes = append(prefixes, *p)
+				}
+			}
+			live["address_space"] = prefixes
+		}
+		if out.Properties.Subnets != nil {
+			live["subnets_count"] = len(out.Properties.Subnets)
+		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: defaultString(valueOrEmpty(out.ID), name), LiveState: live}, nil
 }
@@ -535,12 +589,12 @@ func applyAzureSubnet(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 	case "DELETE":
 		poller, err := client.BeginDelete(ctx, rg, vnetName, subnetName, nil)
 		if err != nil {
-			if azureStatusCode(err) == 404 {
+			if isAzureNotFound(err) {
 				return &ApplyResult{ProviderID: subnetName, LiveState: map[string]interface{}{"provider": "azure", "service": "subnet", "name": subnetName, "operation": req.Action.Operation}}, nil
 			}
 			return nil, fmt.Errorf("azure subnet delete: %w", err)
 		}
-		if _, err := poller.PollUntilDone(ctx, nil); err != nil && azureStatusCode(err) != 404 {
+		if _, err := poller.PollUntilDone(ctx, nil); err != nil && !isAzureNotFound(err) {
 			return nil, fmt.Errorf("azure subnet delete poll: %w", err)
 		}
 		return &ApplyResult{ProviderID: subnetName, LiveState: map[string]interface{}{"provider": "azure", "service": "subnet", "name": subnetName, "operation": req.Action.Operation}}, nil
@@ -561,14 +615,22 @@ func observeAzureSubnet(ctx context.Context, rec *state.ResourceRecord) (*Observ
 	}
 	out, err := factory.NewSubnetsClient().Get(ctx, rg, vnetName, subnetName, nil)
 	if err != nil {
-		if azureStatusCode(err) == 404 {
+		if isAzureNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: subnetName, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("azure subnet get: %w", err)
 	}
 	live := map[string]interface{}{"provider": "azure", "service": "subnet", "name": subnetName, "vnet": vnetName}
-	if out.Properties != nil && out.Properties.AddressPrefix != nil {
-		live["address_prefix"] = *out.Properties.AddressPrefix
+	if out.Properties != nil {
+		if out.Properties.AddressPrefix != nil {
+			live["address_prefix"] = *out.Properties.AddressPrefix
+		}
+		if out.Properties.ProvisioningState != nil {
+			live["provisioning_state"] = string(*out.Properties.ProvisioningState)
+		}
+		if out.Properties.NetworkSecurityGroup != nil && out.Properties.NetworkSecurityGroup.ID != nil {
+			live["nsg_id"] = *out.Properties.NetworkSecurityGroup.ID
+		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: defaultString(valueOrEmpty(out.ID), subnetName), LiveState: live}, nil
 }
@@ -607,12 +669,12 @@ func applyAzureNSG(ctx context.Context, req ApplyRequest) (*ApplyResult, error) 
 	case "DELETE":
 		poller, err := client.BeginDelete(ctx, rg, name, nil)
 		if err != nil {
-			if azureStatusCode(err) == 404 {
+			if isAzureNotFound(err) {
 				return &ApplyResult{ProviderID: name, LiveState: map[string]interface{}{"provider": "azure", "service": "nsg", "name": name, "operation": req.Action.Operation}}, nil
 			}
 			return nil, fmt.Errorf("azure nsg delete: %w", err)
 		}
-		if _, err := poller.PollUntilDone(ctx, nil); err != nil && azureStatusCode(err) != 404 {
+		if _, err := poller.PollUntilDone(ctx, nil); err != nil && !isAzureNotFound(err) {
 			return nil, fmt.Errorf("azure nsg delete poll: %w", err)
 		}
 		return &ApplyResult{ProviderID: name, LiveState: map[string]interface{}{"provider": "azure", "service": "nsg", "name": name, "operation": req.Action.Operation}}, nil
@@ -632,7 +694,7 @@ func observeAzureNSG(ctx context.Context, rec *state.ResourceRecord) (*ObserveRe
 	}
 	out, err := factory.NewSecurityGroupsClient().Get(ctx, rg, name, nil)
 	if err != nil {
-		if azureStatusCode(err) == 404 {
+		if isAzureNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("azure nsg get: %w", err)
@@ -640,6 +702,14 @@ func observeAzureNSG(ctx context.Context, rec *state.ResourceRecord) (*ObserveRe
 	live := map[string]interface{}{"provider": "azure", "service": "nsg", "name": name}
 	if out.Location != nil {
 		live["location"] = *out.Location
+	}
+	if out.Properties != nil {
+		if out.Properties.ProvisioningState != nil {
+			live["provisioning_state"] = string(*out.Properties.ProvisioningState)
+		}
+		if out.Properties.SecurityRules != nil {
+			live["security_rules_count"] = len(out.Properties.SecurityRules)
+		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: defaultString(valueOrEmpty(out.ID), name), LiveState: live}, nil
 }
@@ -675,7 +745,7 @@ func applyAzureManagedIdentity(ctx context.Context, req ApplyRequest) (*ApplyRes
 		}, nil
 	case "DELETE":
 		_, err := client.Delete(ctx, rg, name, nil)
-		if err != nil && azureStatusCode(err) != 404 {
+		if err != nil && !isAzureNotFound(err) {
 			return nil, fmt.Errorf("azure managed identity delete: %w", err)
 		}
 		return &ApplyResult{
@@ -698,7 +768,7 @@ func observeAzureManagedIdentity(ctx context.Context, rec *state.ResourceRecord)
 	}
 	resp, err := factory.NewUserAssignedIdentitiesClient().Get(ctx, rg, name, nil)
 	if err != nil {
-		if azureStatusCode(err) == 404 {
+		if isAzureNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("azure managed identity get: %w", err)
@@ -708,8 +778,16 @@ func observeAzureManagedIdentity(ctx context.Context, rec *state.ResourceRecord)
 		"service":  "managed_identity",
 		"name":     name,
 	}
-	if resp.Properties != nil && resp.Properties.PrincipalID != nil {
-		live["principal_id"] = *resp.Properties.PrincipalID
+	if resp.Properties != nil {
+		if resp.Properties.PrincipalID != nil {
+			live["principal_id"] = *resp.Properties.PrincipalID
+		}
+		if resp.Properties.ClientID != nil {
+			live["client_id"] = *resp.Properties.ClientID
+		}
+		if resp.Properties.TenantID != nil {
+			live["tenant_id"] = *resp.Properties.TenantID
+		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: defaultString(valueOrEmpty(resp.ID), name), LiveState: live}, nil
 }
@@ -859,12 +937,112 @@ func parseAzureKeyVaultProviderID(id string) (vaultURL, secretName string, ok bo
 	return vaultURL, secretName, true
 }
 
+// Deprecated: azureStatusCode is retained for backward compatibility. Use
+// isAzureNotFound or isAzureTransient instead.
 func azureStatusCode(err error) int {
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
 		return respErr.StatusCode
 	}
 	return 0
+}
+
+// isAzureNotFound checks whether an Azure error indicates that the target
+// resource does not exist.
+func isAzureNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		if respErr.StatusCode == 404 {
+			return true
+		}
+		switch respErr.ErrorCode {
+		case "ResourceNotFound", "ResourceGroupNotFound",
+			"ContainerNotFound", "SecretNotFound", "BlobNotFound",
+			"ParentResourceNotFound", "NotFound":
+			return true
+		}
+	}
+	return false
+}
+
+// isAzureConflict checks whether an Azure error indicates a 409 Conflict
+// (e.g., resource already exists on CREATE).
+func isAzureConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == 409
+	}
+	return false
+}
+
+// isAzureTransient checks whether an Azure error is transient and safe to retry.
+func isAzureTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		switch respErr.StatusCode {
+		case 429, 500, 502, 503, 504:
+			return true
+		}
+		switch respErr.ErrorCode {
+		case "ServerBusy", "TooManyRequests":
+			return true
+		}
+	}
+	// String matching fallback
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "temporarily unavailable") || strings.Contains(s, "rate limit")
+}
+
+// withAzureRetry retries an Azure operation up to 3 times with exponential
+// backoff and jitter when isAzureTransient returns true. Non-transient errors
+// are returned immediately.
+// TODO: Wire into individual applyAzure*/observeAzure* API call sites to
+// provide retry resilience for Azure operations (mirrors GCP withGCPRetry usage).
+func withAzureRetry(ctx context.Context, op string, fn func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	const maxRetries = 3
+	baseDelay := 500 * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if !isAzureTransient(lastErr) {
+			return lastErr
+		}
+		if attempt == maxRetries {
+			break
+		}
+		// Exponential backoff: 500ms, 1s, 2s + jitter up to 25%
+		delay := baseDelay << uint(attempt)
+		jitter := time.Duration(rand.Int63n(int64(delay / 4)))
+		delay += jitter
+
+		logging.Logger.Warn("azure:retry", "op", op, "attempt", attempt+1, "delay", delay.String(), "error", lastErr.Error())
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return lastErr
 }
 
 func azureNetworkFactory(ctx context.Context, intentMap map[string]interface{}) (*armnetwork.ClientFactory, string, string, string, error) {
@@ -994,11 +1172,11 @@ func applyAzureGenericResource(ctx context.Context, target string, req ApplyRequ
 		}, nil
 	case "DELETE":
 		poller, err := client.BeginDeleteByID(ctx, resourceID, def.APIVersion, nil)
-		if err != nil && azureStatusCode(err) != 404 {
+		if err != nil && !isAzureNotFound(err) {
 			return nil, fmt.Errorf("azure %s delete: %w", target, err)
 		}
 		if err == nil {
-			if _, err := poller.PollUntilDone(ctx, nil); err != nil && azureStatusCode(err) != 404 {
+			if _, err := poller.PollUntilDone(ctx, nil); err != nil && !isAzureNotFound(err) {
 				return nil, fmt.Errorf("azure %s delete poll: %w", target, err)
 			}
 		}
@@ -1027,7 +1205,7 @@ func observeAzureGenericResource(ctx context.Context, target string, rec *state.
 	}
 	out, err := factory.NewClient().GetByID(ctx, resourceID, def.APIVersion, nil)
 	if err != nil {
-		if azureStatusCode(err) == 404 {
+		if isAzureNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: resourceID, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("azure %s get: %w", target, err)
