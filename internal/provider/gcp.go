@@ -104,11 +104,17 @@ func (e *DefaultExecutor) applyGCP(ctx context.Context, req ApplyRequest) (*Appl
 		result, applyErr = applyGCPComputeEngine(ctx, req)
 	case "cloud_dns":
 		result, applyErr = applyGCPCloudDNS(ctx, req)
-	case "cloud_functions":
+case "cloud_functions":
 		result, applyErr = applyGCPCloudFunctions(ctx, req)
 	case "gke":
 		result, applyErr = applyGCPGKE(ctx, req)
-	case "api_gateway", "cloud_cdn", "cloud_monitoring", "eventarc", "identity_platform":
+	case "cloud_cdn":
+		result, applyErr = applyGCPCloudCDN(ctx, req)
+	case "cloud_monitoring":
+		result, applyErr = applyGCPCloudMonitoring(ctx, req)
+	case "eventarc":
+		result, applyErr = applyGCPEventarc(ctx, req)
+	case "api_gateway", "identity_platform":
 		result, applyErr = applyGCPProjectScopedGeneric(ctx, target, req)
 	default:
 		return nil, fmt.Errorf("gcp target %q is recognized but requires additional adapter implementation for live execution (set BEECON_EXECUTE!=1 for dry-run)", target)
@@ -292,11 +298,17 @@ func (e *DefaultExecutor) observeGCP(ctx context.Context, region string, rec *st
 		return observeGCPComputeEngine(ctx, rec)
 	case "cloud_dns":
 		return observeGCPCloudDNS(ctx, rec)
-	case "cloud_functions":
+case "cloud_functions":
 		return observeGCPCloudFunctions(ctx, rec)
 	case "gke":
 		return observeGCPGKE(ctx, rec)
-	case "api_gateway", "cloud_cdn", "cloud_monitoring", "eventarc", "identity_platform":
+	case "cloud_cdn":
+		return observeGCPCloudCDN(ctx, rec)
+	case "cloud_monitoring":
+		return observeGCPCloudMonitoring(ctx, rec)
+	case "eventarc":
+		return observeGCPEventarc(ctx, rec)
+	case "api_gateway", "identity_platform":
 		return observeGCPProjectScopedGeneric(ctx, target, rec)
 	default:
 		return &ObserveResult{Exists: rec.Managed, ProviderID: rec.ProviderID, LiveState: rec.LiveState}, nil
@@ -1867,7 +1879,7 @@ func validateGCPInput(target string, intentMap map[string]interface{}) error {
 			return fmt.Errorf("cloud_dns requires intent.project_id")
 		}
 		return nil
-	case "cloud_functions":
+case "cloud_functions":
 		missing := []string{}
 		for _, k := range []string{"project_id", "runtime"} {
 			if requiredIntent(intentMap, k) == "" {
@@ -1883,7 +1895,22 @@ func validateGCPInput(target string, intentMap map[string]interface{}) error {
 			return fmt.Errorf("gke requires intent.project_id")
 		}
 		return nil
-	case "api_gateway", "cloud_cdn", "cloud_monitoring", "eventarc", "identity_platform":
+	case "cloud_cdn":
+		if requiredIntent(intentMap, "project_id") == "" {
+			return fmt.Errorf("cloud_cdn requires intent.project_id")
+		}
+		return nil
+	case "cloud_monitoring":
+		if requiredIntent(intentMap, "project_id") == "" {
+			return fmt.Errorf("cloud_monitoring requires intent.project_id")
+		}
+		return nil
+	case "eventarc":
+		if requiredIntent(intentMap, "project_id") == "" {
+			return fmt.Errorf("eventarc requires intent.project_id")
+		}
+		return nil
+	case "api_gateway", "identity_platform":
 		if requiredIntent(intentMap, "project_id") == "" {
 			return fmt.Errorf("%s requires intent.project_id", target)
 		}
