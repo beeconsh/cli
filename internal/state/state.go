@@ -82,6 +82,13 @@ type PlanAction struct {
 	Changes          map[string]string `json:"changes,omitempty"`
 	BoundaryTag      string            `json:"boundary_tag,omitempty"`
 	RequiresApproval bool              `json:"requires_approval"`
+
+	// Phase 3: Plan enrichment fields for agent consumption.
+	EstimatedCost       float64 `json:"estimated_cost,omitempty"`
+	RiskScore           int     `json:"risk_score,omitempty"`
+	RiskLevel           string  `json:"risk_level,omitempty"`
+	RollbackFeasibility string  `json:"rollback_feasibility,omitempty"`
+	ComplianceMutations int     `json:"compliance_mutations,omitempty"`
 }
 
 type RunStatus string

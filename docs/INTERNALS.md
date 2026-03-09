@@ -311,15 +311,35 @@ refresh_token, passphrase, encryption_key, signing_key, tls_key, certificate, be
 
 Matching is case-insensitive on the key's base name (after last `.`).
 
+### Path Traversal Protection
+
+`SafePath(root, requested)` in `internal/security/redact.go` validates that a requested path stays within the project root. Used by API and MCP handlers to prevent `../` attacks on `beacon_file` parameters.
+
 ### Scrubbing Functions
 
 | Function | Input type | Used by |
 |----------|-----------|---------|
-| `ScrubMap` | `map[string]interface{}` | API responses, live state |
-| `ScrubStringMap` | `map[string]string` | Intent fields, env maps |
+| `ScrubMap` | `map[string]interface{}` | API responses, live state, audit event data |
+| `ScrubStringMap` | `map[string]string` | Intent fields, env maps, wiring env vars |
 | `ScrubChanges` | `map[string]string` | Plan action diffs |
 
 All scrubbing replaces values with `**REDACTED**`.
+
+### Three-Surface Scrubbing Parity
+
+All three output surfaces (CLI, API, MCP) apply consistent scrubbing:
+
+| Data | Scrub Action |
+|------|-------------|
+| ResourceRecord.IntentSnapshot | `ScrubMap` |
+| ResourceRecord.LiveState | `ScrubMap` |
+| ResourceRecord.Wiring.InferredEnvVars | `ScrubStringMap` |
+| PlanAction.Changes | `ScrubChanges` |
+| IntentNode.Intent / Env | `ScrubStringMap` |
+| AuditEvent.Data | `ScrubMap` |
+| RunRecord.BeaconPath | `filepath.Base` (truncate to filename) |
+| ApprovalRequest.BeaconPath | `filepath.Base` (truncate to filename) |
+| WiringResult.InferredEnvVars | Set to `nil` |
 
 ### API Authentication
 
@@ -356,6 +376,31 @@ API strips ARNs and AWS account IDs from drift error messages before returning t
 
 Auth column: required when `BEECON_API_KEY` is set.
 
+## MCP Server
+
+Model Context Protocol server for AI agent integration (`internal/mcp/server.go`).
+
+**Entry point:** `beecon mcp` — starts stdio JSON-RPC 2.0 server via mcp-go SDK.
+
+### Tool Catalog (13 tools)
+
+**Read:** `validate_beacon`, `plan`, `show_status`, `detect_drift`, `list_runs`, `list_approvals`, `get_history`, `discover_beacons`
+
+**Write:** `apply`, `approve`, `reject`, `rollback`
+
+**Manage:** `connect_provider`
+
+### Concurrency
+
+mcp-go dispatches tool calls via goroutine worker pool. `Server.mu` mutex guards `ActiveProfile` mutation + engine call atomicity in `handlePlan` and `handleApply`.
+
+### Security
+
+- Path traversal protection via `security.SafePath` on all `beacon_file` params
+- Full scrubbing parity with API (intent, live state, wiring, audit events, beacon paths)
+- Partial failure results returned (not discarded) for orphaned resource recovery
+- Tool errors use `isError: true` responses, never protocol errors
+
 ## Mission Control UI
 
 Embedded single-page app served at `/` by `internal/ui/handler.go`:
@@ -379,7 +424,7 @@ Operations: `==`, `!=`, `contains`. Evaluated against `PlanResult`.
 
 ## Testing
 
-245 test functions across the codebase covering:
+473 test functions across the codebase covering:
 
 - Parser syntax and semantic validation
 - Resolver dependency ordering and boundary gates
@@ -391,8 +436,9 @@ Operations: `==`, `!=`, `contains`. Evaluated against `PlanResult`.
 - Compliance framework enforcement
 - Cost budget parsing and validation
 - API endpoint behavior
+- MCP tool handlers (input validation, happy paths, path traversal, scrubbing, nil safety)
 - UI handler output
-- Security key registry
+- Security key registry and path traversal protection
 
 ## Known Gaps
 
@@ -400,3 +446,6 @@ Operations: `==`, `!=`, `contains`. Evaluated against `PlanResult`.
 - GCP/Azure generic adapters lack resource-specific lifecycle depth
 - No background approval expiry processor (expiry enforced inline on access)
 - Drift observation depth varies by provider and target type
+- MCP ActiveProfile mutex is a stopgap; Phase 4 should pass profile as a parameter
+- No MCP integration tests with a real MCP client over stdio
+- PlanSummary.CostDelta declared but not yet populated

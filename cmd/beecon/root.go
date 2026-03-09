@@ -12,6 +12,7 @@ import (
 	"github.com/terracotta-ai/beecon/internal/cli"
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/logging"
+	bmcp "github.com/terracotta-ai/beecon/internal/mcp"
 	"github.com/terracotta-ai/beecon/internal/state"
 	"gopkg.in/yaml.v3"
 )
@@ -131,6 +132,7 @@ func init() {
 		watchCmd,
 		serveCmd,
 		restoreCmd,
+		mcpCmd,
 	)
 }
 
@@ -158,6 +160,17 @@ func resolveProfile(cwd string) (string, error) {
 		return "", fmt.Errorf("parse %s: %w", configPath, err)
 	}
 	return cfg.Profile, nil
+}
+
+var mcpCmd = &cobra.Command{
+	Use:         "mcp",
+	Short:       "Start MCP server on stdio for AI agent integration",
+	Args:        cobra.NoArgs,
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		s := bmcp.New(eng, version)
+		return s.Serve()
+	},
 }
 
 func beaconPathArg(args []string) string {

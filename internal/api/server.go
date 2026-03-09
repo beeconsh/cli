@@ -61,18 +61,7 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 }
 
 func safePath(root, requested string) error {
-	abs, err := filepath.Abs(filepath.Join(root, requested))
-	if err != nil {
-		return fmt.Errorf("invalid path")
-	}
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		return fmt.Errorf("invalid root")
-	}
-	if !strings.HasPrefix(abs, absRoot+string(filepath.Separator)) && abs != absRoot {
-		return fmt.Errorf("path escapes project root")
-	}
-	return nil
+	return security.SafePath(root, requested)
 }
 
 func (s *Server) beacons(w http.ResponseWriter, r *http.Request) {

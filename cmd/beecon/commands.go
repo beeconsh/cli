@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -63,6 +64,12 @@ var validateCmd = &cobra.Command{
 		if err := eng.Validate(path); err != nil {
 			return err
 		}
+		if formatFlag == "json" {
+			return cli.WriteJSON(os.Stdout, struct {
+				Valid bool   `json:"valid"`
+				Path  string `json:"path"`
+			}{true, path})
+		}
 		out.Blank()
 		out.Line(out.Green(out.OK()), "%s is valid", path)
 		out.Blank()
@@ -84,12 +91,16 @@ var planCmd = &cobra.Command{
 		}
 
 		if formatFlag == "json" {
-			for i := range res.Graph.Nodes {
-				res.Graph.Nodes[i].Intent = security.ScrubStringMap(res.Graph.Nodes[i].Intent)
-				res.Graph.Nodes[i].Env = security.ScrubStringMap(res.Graph.Nodes[i].Env)
+			if res.Graph != nil {
+				for i := range res.Graph.Nodes {
+					res.Graph.Nodes[i].Intent = security.ScrubStringMap(res.Graph.Nodes[i].Intent)
+					res.Graph.Nodes[i].Env = security.ScrubStringMap(res.Graph.Nodes[i].Env)
+				}
 			}
-			for _, a := range res.Plan.Actions {
-				a.Changes = security.ScrubChanges(a.Changes)
+			if res.Plan != nil {
+				for _, a := range res.Plan.Actions {
+					a.Changes = security.ScrubChanges(a.Changes)
+				}
 			}
 			if res.WiringResult != nil {
 				res.WiringResult.InferredEnvVars = nil
@@ -327,9 +338,21 @@ var statusCmd = &cobra.Command{
 			for _, rec := range st.Resources {
 				rec.IntentSnapshot = security.ScrubMap(rec.IntentSnapshot)
 				rec.LiveState = security.ScrubMap(rec.LiveState)
+				if rec.Wiring != nil {
+					rec.Wiring.InferredEnvVars = security.ScrubStringMap(rec.Wiring.InferredEnvVars)
+				}
 			}
 			for _, a := range st.Actions {
 				a.Changes = security.ScrubChanges(a.Changes)
+			}
+			for _, r := range st.Runs {
+				r.BeaconPath = filepath.Base(r.BeaconPath)
+			}
+			for _, a := range st.Approvals {
+				a.BeaconPath = filepath.Base(a.BeaconPath)
+			}
+			for i := range st.Audit {
+				st.Audit[i].Data = security.ScrubMap(st.Audit[i].Data)
 			}
 			return cli.WriteJSON(os.Stdout, st)
 		}
@@ -492,6 +515,12 @@ var approveCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if formatFlag == "json" {
+			for i := range res.Actions {
+				res.Actions[i].Action.Changes = security.ScrubChanges(res.Actions[i].Action.Changes)
+			}
+			return cli.WriteJSON(os.Stdout, res)
+		}
 		out.Blank()
 		out.Line(out.Green(out.OK()), "Approved %s", args[0])
 		out.Blank()
@@ -528,6 +557,13 @@ var rejectCmd = &cobra.Command{
 		if err := eng.Reject(cmd.Context(), args[0], approver, reason); err != nil {
 			return err
 		}
+		if formatFlag == "json" {
+			return cli.WriteJSON(os.Stdout, struct {
+				Rejected  bool   `json:"rejected"`
+				RequestID string `json:"request_id"`
+				Approver  string `json:"approver"`
+			}{true, args[0], approver})
+		}
 		out.Blank()
 		out.Line(out.Green(out.OK()), "Rejected %s by %s", args[0], approver)
 		out.Blank()
@@ -544,6 +580,15 @@ var historyCmd = &cobra.Command{
 		events, err := eng.History(cmd.Context(), args[0])
 		if err != nil {
 			return err
+		}
+		if formatFlag == "json" {
+			for i := range events {
+				events[i].Data = security.ScrubMap(events[i].Data)
+			}
+			return cli.WriteJSON(os.Stdout, struct {
+				ResourceID string             `json:"resource_id"`
+				Events     []state.AuditEvent `json:"events"`
+			}{args[0], events})
 		}
 		out.Blank()
 		if len(events) == 0 {
@@ -571,6 +616,12 @@ var rollbackCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		if formatFlag == "json" {
+			return cli.WriteJSON(os.Stdout, struct {
+				OriginalRunID string `json:"original_run_id"`
+				RollbackRunID string `json:"rollback_run_id"`
+			}{args[0], id})
+		}
 		out.Blank()
 		out.Line(out.Green(out.OK()), "Rolled back %s", args[0])
 		out.Summary("Rollback run: %s", id)
@@ -589,6 +640,16 @@ var refreshCmd = &cobra.Command{
 		refreshed, observeErrors, err := eng.Refresh(cmd.Context(), path)
 		if err != nil {
 			return err
+		}
+		if formatFlag == "json" {
+			errStrs := make([]string, len(observeErrors))
+			for i, e := range observeErrors {
+				errStrs[i] = e.Error()
+			}
+			return cli.WriteJSON(os.Stdout, struct {
+				Refreshed int      `json:"refreshed"`
+				Errors    []string `json:"errors,omitempty"`
+			}{refreshed, errStrs})
 		}
 		for _, e := range observeErrors {
 			fmt.Fprintln(os.Stderr, "warning:", e)
@@ -615,6 +676,13 @@ var connectCmd = &cobra.Command{
 		}
 		if err := eng.Connect(cmd.Context(), args[0], region); err != nil {
 			return err
+		}
+		if formatFlag == "json" {
+			return cli.WriteJSON(os.Stdout, struct {
+				Status   string `json:"status"`
+				Provider string `json:"provider"`
+				Region   string `json:"region,omitempty"`
+			}{"connected", args[0], region})
 		}
 		out.Blank()
 		connMsg := args[0]
@@ -669,6 +737,12 @@ var importCmd = &cobra.Command{
 		resourceID, err := eng.Import(cmd.Context(), args[0], args[1], args[2], region)
 		if err != nil {
 			return err
+		}
+		if formatFlag == "json" {
+			return cli.WriteJSON(os.Stdout, struct {
+				ProviderID string `json:"provider_id"`
+				ResourceID string `json:"resource_id"`
+			}{args[2], resourceID})
 		}
 		out.Blank()
 		out.Line(out.Green(out.OK()), "Imported %s as %s", args[2], out.Bold(resourceID))

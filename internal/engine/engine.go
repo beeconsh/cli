@@ -42,6 +42,21 @@ type PlanResult struct {
 	ComplianceReport *compliance.ComplianceReport `json:"compliance_report,omitempty"`
 	CostReport       *cost.CostReport             `json:"cost_report,omitempty"`
 	WiringResult     *wiring.WiringResult         `json:"wiring_result,omitempty"`
+	Summary          *PlanSummary                 `json:"summary,omitempty"`
+}
+
+// PlanSummary provides an aggregate view of plan actions for agent decision-making.
+type PlanSummary struct {
+	TotalActions     int     `json:"total_actions"`
+	Creates          int     `json:"creates"`
+	Updates          int     `json:"updates"`
+	Deletes          int     `json:"deletes"`
+	Forbidden        int     `json:"forbidden"`
+	PendingApproval  int     `json:"pending_approval"`
+	AggregateRisk    string  `json:"aggregate_risk"`
+	TotalMonthlyCost float64 `json:"total_monthly_cost"`
+	CostDelta        float64 `json:"cost_delta,omitempty"`
+	BudgetRemaining  float64 `json:"budget_remaining,omitempty"`
 }
 
 type ActionStatus int
@@ -177,6 +192,7 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 		}
 	}
 	costReport := cost.Evaluate(p, g, st, budget)
+	summary := enrichPlanActions(p, costReport, compReport)
 
 	logging.Logger.Debug("plan:complete", "actions", len(p.Actions), "provider", cloudProvider, "region", cloudRegion)
 	return &PlanResult{
@@ -187,6 +203,7 @@ func (e *Engine) Plan(ctx context.Context, beaconPath string) (*PlanResult, erro
 		ComplianceReport: compReport,
 		CostReport:       costReport,
 		WiringResult:     wiringResult,
+		Summary:          summary,
 	}, nil
 }
 
@@ -1295,5 +1312,142 @@ func maskIdentity(id string) string {
 		return "****"
 	}
 	return "****" + id[len(id)-4:]
+}
+
+// enrichPlanActions annotates each PlanAction with cost, risk, rollback feasibility,
+// and compliance mutation count, then builds an aggregate PlanSummary.
+func enrichPlanActions(p *resolver.Plan, cr *cost.CostReport, compReport *compliance.ComplianceReport) *PlanSummary {
+	if p == nil {
+		return nil
+	}
+
+	// Build lookup maps for cost and compliance joins.
+	costByNode := map[string]float64{}
+	if cr != nil {
+		for _, est := range cr.Estimates {
+			costByNode[est.NodeID] = est.MonthlyCost
+		}
+	}
+	mutationsByNode := map[string]int{}
+	if compReport != nil {
+		for _, m := range compReport.Mutations {
+			mutationsByNode[m.NodeID]++
+		}
+	}
+
+	summary := &PlanSummary{}
+	highestRisk := 0
+
+	for _, a := range p.Actions {
+		// Cost per action.
+		a.EstimatedCost = costByNode[a.NodeID]
+
+		// Compliance mutations per action.
+		a.ComplianceMutations = mutationsByNode[a.NodeID]
+
+		// Risk scoring: operation type × node type.
+		a.RiskScore, a.RiskLevel = scoreRisk(a.Operation, a.NodeType)
+		if a.RiskScore > highestRisk {
+			highestRisk = a.RiskScore
+		}
+
+		// Rollback feasibility.
+		a.RollbackFeasibility = rollbackFeasibility(a.Operation, a.NodeType)
+
+		// Aggregate summary counts.
+		summary.TotalActions++
+		switch a.Operation {
+		case "CREATE":
+			summary.Creates++
+		case "UPDATE":
+			summary.Updates++
+		case "DELETE":
+			summary.Deletes++
+		case "FORBIDDEN":
+			summary.Forbidden++
+		}
+		if a.RequiresApproval {
+			summary.PendingApproval++
+		}
+	}
+
+	summary.AggregateRisk = riskLevelFromScore(highestRisk)
+	if cr != nil {
+		summary.TotalMonthlyCost = cr.TotalMonthlyCost
+		if cr.Budget != nil {
+			summary.BudgetRemaining = cr.Budget.MonthlyAmount() - cr.TotalMonthlyCost
+		}
+	}
+
+	return summary
+}
+
+// scoreRisk returns a 1-10 risk score and level based on operation and node type.
+func scoreRisk(operation, nodeType string) (int, string) {
+	base := 0
+	switch operation {
+	case "CREATE":
+		base = 2
+	case "UPDATE":
+		base = 4
+	case "DELETE":
+		base = 7
+	case "FORBIDDEN":
+		base = 1
+	default:
+		base = 1
+	}
+
+	// Data-bearing resources are higher risk.
+	switch strings.ToLower(nodeType) {
+	case "store":
+		base += 2
+	case "network":
+		base += 1
+	case "compute":
+		base += 1
+	case "service":
+		// No additional risk.
+	}
+
+	if base > 10 {
+		base = 10
+	}
+	return base, riskLevelFromScore(base)
+}
+
+func riskLevelFromScore(score int) string {
+	switch {
+	case score <= 2:
+		return "low"
+	case score <= 5:
+		return "medium"
+	case score <= 7:
+		return "high"
+	default:
+		return "critical"
+	}
+}
+
+// rollbackFeasibility assesses whether an action can be safely undone.
+func rollbackFeasibility(operation, nodeType string) string {
+	switch operation {
+	case "CREATE":
+		return "safe"
+	case "UPDATE":
+		// Store updates (schema changes, encryption) may be lossy.
+		if strings.ToLower(nodeType) == "store" {
+			return "risky"
+		}
+		return "safe"
+	case "DELETE":
+		// Deleting data stores means data loss.
+		if strings.ToLower(nodeType) == "store" {
+			return "impossible"
+		}
+		return "risky"
+	default:
+		return "safe"
+	}
 }
 
