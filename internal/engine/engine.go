@@ -675,10 +675,13 @@ type ReconcileAction struct {
 
 // ReconcileResult is the outcome of a drift reconciliation operation.
 type ReconcileResult struct {
-	DriftedCount    int               `json:"drifted_count"`
-	ReconciledCount int               `json:"reconciled_count"`
-	FailedCount     int               `json:"failed_count"`
-	Actions         []ReconcileAction `json:"actions"`
+	DriftedCount      int               `json:"drifted_count"`
+	ReconciledCount   int               `json:"reconciled_count"`
+	FailedCount       int               `json:"failed_count"`
+	ForbiddenCount    int               `json:"forbidden_count"`
+	PendingApproval   int               `json:"pending_approval"`
+	ApprovalRequestID string            `json:"approval_request_id,omitempty"`
+	Actions           []ReconcileAction `json:"actions"`
 }
 
 // DriftReconcile detects drifted resources and generates (or executes) reconciliation
@@ -765,12 +768,19 @@ func (e *Engine) DriftReconcile(ctx context.Context, beaconPath string, apply bo
 			changes = reconcileDiff(rec.LiveState, intentSnap)
 		}
 
+		// Determine operation: if the resource was deleted from the cloud
+		// (LiveState is empty), we need CREATE, not UPDATE.
+		operation := "UPDATE"
+		if len(rec.LiveState) == 0 {
+			operation = "CREATE"
+		}
+
 		pa := &state.PlanAction{
 			ID:        state.NewID("act"),
 			NodeID:    rec.ResourceID,
 			NodeType:  rec.NodeType,
 			NodeName:  rec.NodeName,
-			Operation: "UPDATE",
+			Operation: operation,
 			Reasoning: "drift reconciliation: restoring to intended state",
 			Changes:   changes,
 		}
@@ -783,11 +793,46 @@ func (e *Engine) DriftReconcile(ctx context.Context, beaconPath string, apply bo
 		})
 	}
 
-	// If not applying, mark all pending as "pending" (plan-only mode).
+	// Step 3b: Annotate boundary policies (forbid/approve gates) on reconcile actions.
+	// This mirrors the pattern in Engine.Apply to ensure reconciliation respects
+	// the same boundary constraints as normal apply.
+	var forbidden []pendingAction
+	var gated []pendingAction   // actions requiring approval
+	var allowed []pendingAction // actions that can execute immediately
+	for _, p := range pending {
+		tag := boundaryTagFor(p.planAction)
+		if tag != "" {
+			p.planAction.BoundaryTag = tag
+			if g.Domain != nil && contains(g.Domain.Boundary["forbid"], tag) {
+				p.planAction.Operation = "FORBIDDEN"
+				p.planAction.RequiresApproval = false
+				p.planAction.Reasoning += "; forbidden by boundary"
+				result.Actions[p.reconcileIdx].Status = "forbidden"
+				result.Actions[p.reconcileIdx].Error = fmt.Sprintf("forbidden by boundary policy (%s)", tag)
+				result.ForbiddenCount++
+				forbidden = append(forbidden, p)
+				continue
+			}
+			if g.Domain != nil && contains(g.Domain.Boundary["approve"], tag) {
+				p.planAction.RequiresApproval = true
+			}
+		}
+		if p.planAction.RequiresApproval {
+			gated = append(gated, p)
+		} else {
+			allowed = append(allowed, p)
+		}
+	}
+
+	// If not applying, mark non-forbidden actions as "pending" (plan-only mode).
 	if !apply {
-		for _, p := range pending {
+		for _, p := range allowed {
 			result.Actions[p.reconcileIdx].Status = "pending"
 		}
+		for _, p := range gated {
+			result.Actions[p.reconcileIdx].Status = "pending_approval"
+		}
+		result.PendingApproval = len(gated)
 		return result, nil
 	}
 
@@ -809,10 +854,15 @@ func (e *Engine) DriftReconcile(ctx context.Context, beaconPath string, apply bo
 		ActiveProfile: e.ActiveProfile,
 	}
 
-	for _, p := range pending {
+	// Register all actions (allowed + gated) in state.
+	allExecutable := append(allowed, gated...)
+	for _, p := range allExecutable {
 		st.Actions[p.planAction.ID] = p.planAction
 		run.ActionIDs = append(run.ActionIDs, p.planAction.ID)
+	}
 
+	// Execute only allowed (non-gated) actions.
+	for _, p := range allowed {
 		if err := applyAction(ctx, e.exec, cloudProvider, cloudRegion, st, runID, p.planAction, g); err != nil {
 			result.Actions[p.reconcileIdx].Status = "failed"
 			result.Actions[p.reconcileIdx].Error = err.Error()
@@ -826,22 +876,59 @@ func (e *Engine) DriftReconcile(ctx context.Context, beaconPath string, apply bo
 		run.ExecutedActions = append(run.ExecutedActions, p.planAction.ID)
 	}
 
-	if result.FailedCount > 0 && result.ReconciledCount == 0 {
+	// Create approval request for gated actions (matching the Apply flow).
+	if len(gated) > 0 {
+		run.Status = state.RunPendingApproval
+
+		// Compute intent hash for approval integrity.
+		abs, _ := filepath.Abs(beaconPath)
+		content, readErr := os.ReadFile(abs)
+		intentHash := ""
+		if readErr == nil {
+			intentHash = sha256hex(content)
+		}
+
+		req := &state.ApprovalRequest{
+			ID:            state.NewID("apr"),
+			CreatedAt:     time.Now().UTC(),
+			RunID:         runID,
+			Reason:        "boundary approve gate triggered during drift reconciliation",
+			Status:        state.ApprovalPending,
+			ExpiresAt:     time.Now().UTC().Add(24 * time.Hour),
+			BeaconPath:    abs,
+			IntentHash:    intentHash,
+			BlastRadius:   fmt.Sprintf("%d actions", len(gated)),
+			ActiveProfile: e.ActiveProfile,
+		}
+		for _, p := range gated {
+			req.ActionIDs = append(req.ActionIDs, p.planAction.ID)
+			result.Actions[p.reconcileIdx].Status = "pending_approval"
+			if rec := st.Resources[p.planAction.NodeID]; rec != nil {
+				rec.ApprovalBlocked = true
+			}
+		}
+		st.Approvals[req.ID] = req
+		result.ApprovalRequestID = req.ID
+		result.PendingApproval = len(gated)
+		addAudit(st, runID, "APPROVAL_REQUIRED", "", fmt.Sprintf("reconcile approval %s required for %d actions", req.ID, len(gated)), map[string]interface{}{"request_id": req.ID})
+	}
+
+	if result.FailedCount > 0 && result.ReconciledCount == 0 && len(gated) == 0 {
 		run.Status = state.RunFailed
 		run.Error = "all reconciliation actions failed"
-	} else if result.FailedCount > 0 {
+	} else if result.FailedCount > 0 && len(gated) == 0 {
 		run.Status = state.RunFailed
-		run.Error = fmt.Sprintf("%d of %d reconciliation actions failed", result.FailedCount, len(pending))
+		run.Error = fmt.Sprintf("%d of %d reconciliation actions failed", result.FailedCount, len(allowed))
 	}
 
 	st.Runs[runID] = run
-	addAudit(st, runID, "DRIFT_RECONCILE", "", fmt.Sprintf("drift reconciliation: %d reconciled, %d failed", result.ReconciledCount, result.FailedCount), nil)
+	addAudit(st, runID, "DRIFT_RECONCILE", "", fmt.Sprintf("drift reconciliation: %d reconciled, %d failed, %d pending approval, %d forbidden", result.ReconciledCount, result.FailedCount, result.PendingApproval, result.ForbiddenCount), nil)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit reconcile state: %w", err)
 	}
 
-	logging.Logger.Debug("drift-reconcile:complete", "reconciled", result.ReconciledCount, "failed", result.FailedCount)
+	logging.Logger.Debug("drift-reconcile:complete", "reconciled", result.ReconciledCount, "failed", result.FailedCount, "pending_approval", result.PendingApproval, "forbidden", result.ForbiddenCount)
 	return result, nil
 }
 

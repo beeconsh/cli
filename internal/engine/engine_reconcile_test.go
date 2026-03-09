@@ -14,10 +14,18 @@ import (
 // driftTestExecutor simulates drift by returning modified LiveState from Observe.
 type driftTestExecutor struct {
 	provider.Executor
-	driftedNodes map[string]map[string]interface{} // nodeID -> modified live state
+	driftedNodes  map[string]map[string]interface{} // nodeID -> modified live state
+	deletedNodes  map[string]bool                   // nodeID -> true if resource was deleted from cloud
+	appliedOps    []string                          // track operations passed to Apply
 }
 
 func (e *driftTestExecutor) Observe(_ context.Context, _, _ string, rec *state.ResourceRecord) (*provider.ObserveResult, error) {
+	if e.deletedNodes[rec.ResourceID] {
+		return &provider.ObserveResult{
+			Exists:     false,
+			ProviderID: rec.ProviderID,
+		}, nil
+	}
 	if ls, ok := e.driftedNodes[rec.ResourceID]; ok {
 		return &provider.ObserveResult{
 			Exists:     true,
@@ -34,6 +42,7 @@ func (e *driftTestExecutor) Observe(_ context.Context, _, _ string, rec *state.R
 }
 
 func (e *driftTestExecutor) Apply(_ context.Context, req provider.ApplyRequest) (*provider.ApplyResult, error) {
+	e.appliedOps = append(e.appliedOps, req.Action.Operation)
 	return &provider.ApplyResult{ProviderID: req.Record.ProviderID}, nil
 }
 
@@ -316,5 +325,287 @@ func TestReconcileApplyWithNoDrift(t *testing.T) {
 	}
 	if result.DriftedCount != 0 {
 		t.Fatalf("expected 0 drifted, got %d", result.DriftedCount)
+	}
+}
+
+// reconcileBeaconWithBoundaryApprove has a boundary policy requiring approval for new_store.
+const reconcileBeaconWithBoundaryApprove = `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+  boundary {
+    approve = [new_store]
+  }
+}
+
+store postgres {
+  engine = postgres
+}
+`
+
+// reconcileBeaconWithBoundaryForbid has a boundary policy forbidding new_store.
+const reconcileBeaconWithBoundaryForbid = `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+  boundary {
+    forbid = [new_store]
+  }
+}
+
+store postgres {
+  engine = postgres
+}
+`
+
+func TestReconcileDeletedResourceGetsCREATE(t *testing.T) {
+	// When a resource exists in state but was deleted from the cloud,
+	// reconcile should generate a CREATE operation, not UPDATE.
+	dir := t.TempDir()
+	beacon := filepath.Join(dir, "infra.beecon")
+	if err := os.WriteFile(beacon, []byte(reconcileBeacon), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(dir)
+	ctx := context.Background()
+
+	// Apply once to establish state.
+	_, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("initial apply failed: %v", err)
+	}
+
+	// Replace executor: simulate that store.postgres was deleted from cloud.
+	exec := &driftTestExecutor{
+		deletedNodes: map[string]bool{"store.postgres": true},
+	}
+	e.exec = exec
+
+	// Run reconcile with apply=true.
+	result, err := e.DriftReconcile(ctx, beacon, true)
+	if err != nil {
+		t.Fatalf("DriftReconcile failed: %v", err)
+	}
+	if result.DriftedCount == 0 {
+		t.Fatal("expected drifted resources")
+	}
+	if result.ReconciledCount == 0 {
+		t.Fatal("expected at least one reconciled resource")
+	}
+
+	// The executor should have received a CREATE operation, not UPDATE.
+	foundCreate := false
+	for _, op := range exec.appliedOps {
+		if op == "CREATE" {
+			foundCreate = true
+		}
+		if op == "UPDATE" {
+			t.Fatal("expected CREATE for deleted resource, got UPDATE")
+		}
+	}
+	if !foundCreate {
+		t.Fatalf("expected CREATE operation for deleted resource, got ops: %v", exec.appliedOps)
+	}
+}
+
+func TestReconcileDeletedResourcePlanOnly(t *testing.T) {
+	// In plan-only mode, a deleted resource should still show as pending
+	// but the internal PlanAction should have CREATE operation.
+	dir := t.TempDir()
+	beacon := filepath.Join(dir, "infra.beecon")
+	if err := os.WriteFile(beacon, []byte(reconcileBeacon), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(dir)
+	ctx := context.Background()
+
+	_, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("initial apply failed: %v", err)
+	}
+
+	e.exec = &driftTestExecutor{
+		deletedNodes: map[string]bool{"store.postgres": true},
+	}
+
+	result, err := e.DriftReconcile(ctx, beacon, false)
+	if err != nil {
+		t.Fatalf("DriftReconcile failed: %v", err)
+	}
+	if result.DriftedCount == 0 {
+		t.Fatal("expected drifted resources")
+	}
+	// Actions should be pending in plan-only mode.
+	for _, a := range result.Actions {
+		if a.Status != "pending" && a.Status != "skipped" {
+			t.Fatalf("expected pending or skipped status, got %q", a.Status)
+		}
+	}
+}
+
+func TestReconcileBoundaryForbidBlocksExecution(t *testing.T) {
+	// When a boundary policy forbids new_store, reconciling a deleted
+	// store resource (which needs CREATE) should be forbidden.
+	dir := t.TempDir()
+	beacon := filepath.Join(dir, "infra.beecon")
+	// Initial apply with no boundary policies so the resource gets created.
+	if err := os.WriteFile(beacon, []byte(reconcileBeacon), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(dir)
+	ctx := context.Background()
+
+	_, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("initial apply failed: %v", err)
+	}
+
+	// Now switch to a beacon with forbid boundary and simulate deletion.
+	if err := os.WriteFile(beacon, []byte(reconcileBeaconWithBoundaryForbid), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := &driftTestExecutor{
+		deletedNodes: map[string]bool{"store.postgres": true},
+	}
+	e.exec = exec
+
+	result, err := e.DriftReconcile(ctx, beacon, true)
+	if err != nil {
+		t.Fatalf("DriftReconcile failed: %v", err)
+	}
+	if result.ForbiddenCount == 0 {
+		t.Fatal("expected at least one forbidden action")
+	}
+
+	// The forbidden action should not have been executed.
+	if len(exec.appliedOps) > 0 {
+		t.Fatalf("expected no executed operations, got %v", exec.appliedOps)
+	}
+
+	// Check that the action has forbidden status.
+	foundForbidden := false
+	for _, a := range result.Actions {
+		if a.Status == "forbidden" {
+			foundForbidden = true
+		}
+	}
+	if !foundForbidden {
+		t.Fatal("expected at least one action with 'forbidden' status")
+	}
+}
+
+func TestReconcileBoundaryApproveGatesExecution(t *testing.T) {
+	// When a boundary policy requires approval for new_store, reconciling
+	// a deleted store resource should create an approval request.
+	dir := t.TempDir()
+	beacon := filepath.Join(dir, "infra.beecon")
+	// Initial apply with no boundary policies.
+	if err := os.WriteFile(beacon, []byte(reconcileBeacon), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(dir)
+	ctx := context.Background()
+
+	_, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("initial apply failed: %v", err)
+	}
+
+	// Switch to beacon with approve boundary and simulate deletion.
+	if err := os.WriteFile(beacon, []byte(reconcileBeaconWithBoundaryApprove), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := &driftTestExecutor{
+		deletedNodes: map[string]bool{"store.postgres": true},
+	}
+	e.exec = exec
+
+	result, err := e.DriftReconcile(ctx, beacon, true)
+	if err != nil {
+		t.Fatalf("DriftReconcile failed: %v", err)
+	}
+	if result.PendingApproval == 0 {
+		t.Fatal("expected at least one action pending approval")
+	}
+	if result.ApprovalRequestID == "" {
+		t.Fatal("expected an approval request ID")
+	}
+
+	// The gated action should not have been executed.
+	if len(exec.appliedOps) > 0 {
+		t.Fatalf("expected no executed operations for gated actions, got %v", exec.appliedOps)
+	}
+
+	// Verify approval request was persisted in state.
+	st, err := e.store.Load()
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	req, ok := st.Approvals[result.ApprovalRequestID]
+	if !ok {
+		t.Fatalf("approval request %s not found in state", result.ApprovalRequestID)
+	}
+	if req.Status != state.ApprovalPending {
+		t.Fatalf("expected approval status PENDING, got %s", req.Status)
+	}
+	if len(req.ActionIDs) == 0 {
+		t.Fatal("expected approval request to have action IDs")
+	}
+
+	// Check the action status is pending_approval.
+	foundPending := false
+	for _, a := range result.Actions {
+		if a.Status == "pending_approval" {
+			foundPending = true
+		}
+	}
+	if !foundPending {
+		t.Fatal("expected at least one action with 'pending_approval' status")
+	}
+}
+
+func TestReconcileBoundaryApprovalPlanOnlyMode(t *testing.T) {
+	// In plan-only mode, boundary approve gates should still be annotated.
+	dir := t.TempDir()
+	beacon := filepath.Join(dir, "infra.beecon")
+	// Initial apply with no boundary policies.
+	if err := os.WriteFile(beacon, []byte(reconcileBeacon), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(dir)
+	ctx := context.Background()
+
+	_, err := e.Apply(ctx, beacon)
+	if err != nil {
+		t.Fatalf("initial apply failed: %v", err)
+	}
+
+	// Switch to beacon with approve boundary and simulate deletion.
+	if err := os.WriteFile(beacon, []byte(reconcileBeaconWithBoundaryApprove), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.exec = &driftTestExecutor{
+		deletedNodes: map[string]bool{"store.postgres": true},
+	}
+
+	result, err := e.DriftReconcile(ctx, beacon, false)
+	if err != nil {
+		t.Fatalf("DriftReconcile failed: %v", err)
+	}
+	if result.PendingApproval == 0 {
+		t.Fatal("expected pending approval count > 0 in plan mode")
+	}
+
+	foundApproval := false
+	for _, a := range result.Actions {
+		if a.Status == "pending_approval" {
+			foundApproval = true
+		}
+	}
+	if !foundApproval {
+		t.Fatal("expected at least one action with 'pending_approval' status in plan mode")
 	}
 }
