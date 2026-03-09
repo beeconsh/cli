@@ -17,6 +17,7 @@ import (
 	"github.com/terracotta-ai/beecon/internal/cost"
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/logging"
+	"github.com/terracotta-ai/beecon/internal/provider"
 	"github.com/terracotta-ai/beecon/internal/scaffold"
 	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
@@ -1071,6 +1072,69 @@ func parseFilter(filter string) map[string]bool {
 		}
 	}
 	return set
+}
+
+var providerFilterFlag string
+
+var providersCmd = &cobra.Command{
+	Use:   "providers",
+	Short: "List supported providers and their target capabilities",
+	Args:  cobra.NoArgs,
+	RunE: func(_ *cobra.Command, _ []string) error {
+		var caps []*provider.ProviderCapability
+
+		if providerFilterFlag != "" {
+			cap := provider.GetProviderCapabilities(providerFilterFlag)
+			if cap == nil {
+				return fmt.Errorf("unknown provider %q (supported: aws, gcp, azure)", providerFilterFlag)
+			}
+			caps = []*provider.ProviderCapability{cap}
+		} else {
+			caps = provider.GetAllProviderCapabilities()
+		}
+
+		if formatFlag == "json" {
+			if len(caps) == 1 {
+				return cli.WriteJSON(os.Stdout, caps[0])
+			}
+			return cli.WriteJSON(os.Stdout, caps)
+		}
+
+		out.Blank()
+		for i, cap := range caps {
+			if i > 0 {
+				out.Blank()
+			}
+			out.Header("Provider: %s  (%d real, %d generic)",
+				out.Bold(cap.Provider), cap.TotalReal, cap.TotalGeneric)
+			out.Blank()
+
+			// Table header
+			out.Line(" ", "%-25s %-8s %-10s %-10s %-8s",
+				"TARGET", "TIER", "ADAPTER", "OBSERVE", "WIRING")
+
+			for _, tc := range cap.Targets {
+				observe := "-"
+				if tc.HasObserve {
+					observe = "yes"
+				}
+				wiring := "-"
+				if tc.HasWiring {
+					wiring = "yes"
+				}
+				adapterDisplay := tc.Adapter
+				if tc.Adapter == "real" {
+					adapterDisplay = out.Green(tc.Adapter)
+				} else {
+					adapterDisplay = out.Dim(tc.Adapter)
+				}
+				out.Line(" ", "%-25s %-8s %-10s %-10s %-8s",
+					tc.Target, tc.Tier, adapterDisplay, observe, wiring)
+			}
+		}
+		out.Blank()
+		return nil
+	},
 }
 
 var serveCmd = &cobra.Command{
