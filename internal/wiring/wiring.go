@@ -98,6 +98,14 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 					result.Warnings = append(result.Warnings,
 						fmt.Sprintf("node %q: no GCP IAM roles defined for %s with mode %s; service may lack permissions", node.Name, targetTarget, mode))
 				}
+			case "azure":
+				roles, err := AzureIAMRolesFor(targetTarget, mode)
+				if err == nil {
+					allRoles = append(allRoles, roles...)
+				} else if targetTarget != "" {
+					result.Warnings = append(result.Warnings,
+						fmt.Sprintf("node %q: no Azure RBAC roles defined for %s with mode %s; service may lack permissions", node.Name, targetTarget, mode))
+				}
 			default: // aws
 				actions, err := IAMActionsFor(targetTarget, mode)
 				if err == nil {
@@ -113,8 +121,13 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 			switch cloud {
 			case "gcp":
 				envVars = InferGCPEnvVars(dep.Target, targetTarget, target.Intent)
+			case "azure":
+				envVars = InferAzureEnvVars(dep.Target, targetTarget, target.Intent)
 			default:
 				envVars = InferEnvVars(dep.Target, targetTarget, target.Intent)
+			}
+			if node.Env == nil {
+				node.Env = make(map[string]string)
 			}
 			for k, v := range envVars.Vars {
 				if _, exists := node.Env[k]; !exists {
@@ -131,6 +144,9 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 			case "gcp":
 				fwRules := InferGCPFirewallRules(node.ID, target.ID, sourceTarget, targetTarget, target.Intent)
 				result.InferredSGRules = append(result.InferredSGRules, fwRules...)
+			case "azure":
+				nsgRules := InferAzureNSGRules(node.ID, target.ID, sourceTarget, targetTarget, target.Intent)
+				result.InferredSGRules = append(result.InferredSGRules, nsgRules...)
 			default:
 				sgRules := InferSGRules(node.ID, target.ID, sourceTarget, targetTarget, target.Intent)
 				result.InferredSGRules = append(result.InferredSGRules, sgRules...)
@@ -158,6 +174,20 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 				result.Warnings = append(result.Warnings,
 					fmt.Sprintf("node %q: GCP IAM roles inferred; review role bindings before deploying", node.Name))
 			}
+		case "azure":
+			if len(allRoles) > 0 {
+				sort.Strings(allRoles)
+				allRoles = dedup(allRoles)
+				assignment := buildAzureRoleAssignment(node.Name, allRoles)
+				assignmentJSON, err := json.Marshal(assignment)
+				if err != nil {
+					return nil, fmt.Errorf("marshal Azure role assignment for %s: %w", node.Name, err)
+				}
+				node.Intent["iam_roles"] = string(assignmentJSON)
+				result.InferredPolicies[node.ID] = string(assignmentJSON)
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("node %q: Azure RBAC roles inferred; review role assignments before deploying", node.Name))
+			}
 		default: // aws
 			if len(allActions) > 0 {
 				sort.Strings(allActions)
@@ -182,12 +212,15 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 	if len(result.InferredSGRules) > 0 {
 		sgNodesByID := make(map[string]*ir.IntentNode)
 		fwTopology := "security_group"
-		if cloud == "gcp" {
+		switch cloud {
+		case "gcp":
 			fwTopology = "firewall"
+		case "azure":
+			fwTopology = "nsg"
 		}
 		for i := range g.Nodes {
 			topo := g.Nodes[i].Intent["topology"]
-			if g.Nodes[i].Type == ir.NodeNetwork && (topo == "security_group" || topo == "firewall") && topo == fwTopology {
+			if g.Nodes[i].Type == ir.NodeNetwork && (topo == "security_group" || topo == "firewall" || topo == "nsg") && topo == fwTopology {
 				sgNodesByID[g.Nodes[i].ID] = &g.Nodes[i]
 			}
 		}
@@ -342,6 +375,8 @@ func classifyNode(cloud, nodeType string, intent map[string]string) string {
 	switch cloud {
 	case "gcp":
 		return classify.ClassifyGCPNode(nodeType, intent)
+	case "azure":
+		return classify.ClassifyAzureNode(nodeType, intent)
 	default:
 		return classify.ClassifyNode(nodeType, intent)
 	}
@@ -352,6 +387,8 @@ func isValidMode(cloud, target string, mode Mode) bool {
 	switch cloud {
 	case "gcp":
 		return IsValidGCPMode(target, mode)
+	case "azure":
+		return IsValidAzureMode(target, mode)
 	default:
 		return IsValidMode(target, mode)
 	}
@@ -364,5 +401,14 @@ type gcpRoleBinding struct {
 
 func buildGCPRoleBinding(nodeName string, roles []string) gcpRoleBinding {
 	return gcpRoleBinding{Roles: roles}
+}
+
+// azureRoleAssignment represents a set of Azure RBAC roles to assign to a managed identity.
+type azureRoleAssignment struct {
+	Roles []string `json:"roles"`
+}
+
+func buildAzureRoleAssignment(nodeName string, roles []string) azureRoleAssignment {
+	return azureRoleAssignment{Roles: roles}
 }
 
