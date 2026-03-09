@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/terracotta-ai/beecon/internal/ir"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
@@ -17,6 +18,7 @@ type Plan struct {
 
 // BuildPlan builds a topologically sorted execution plan from graph and existing state.
 func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
+	logging.Logger.Debug("resolver:plan:start", "nodes", len(g.Nodes))
 	orderedIDs, dependsOn, err := orderByDependencies(g)
 	if err != nil {
 		return nil, err
@@ -32,6 +34,7 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 		nodeIntent := n.Snapshot()
 		rec, ok := managed[id]
 		if !ok {
+			logging.Logger.Debug("resolver:action", "node", n.Name, "operation", "CREATE")
 			actions = append(actions, &state.PlanAction{
 				ID:        state.NewID("act"),
 				NodeID:    id,
@@ -50,6 +53,7 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 				// Performance breach set DRIFTED without changing intent — skip phantom UPDATE
 				continue
 			}
+			logging.Logger.Debug("resolver:action", "node", n.Name, "operation", "UPDATE")
 			actions = append(actions, &state.PlanAction{
 				ID:        state.NewID("act"),
 				NodeID:    id,
@@ -68,6 +72,7 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 		if intentIDs[nodeID] {
 			continue
 		}
+		logging.Logger.Debug("resolver:action", "node", rec.NodeName, "operation", "DELETE")
 		actions = append(actions, &state.PlanAction{
 			ID:        state.NewID("act"),
 			NodeID:    nodeID,
@@ -103,6 +108,7 @@ func BuildPlan(g *ir.Graph, st *state.State) (*Plan, error) {
 		return actions[i].NodeID < actions[j].NodeID
 	})
 
+	logging.Logger.Debug("resolver:plan:complete", "actions", len(actions))
 	return &Plan{Actions: actions}, nil
 }
 

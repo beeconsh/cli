@@ -4,7 +4,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/terracotta-ai/beecon/internal/engine"
 	"github.com/terracotta-ai/beecon/internal/ir"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
@@ -51,7 +51,7 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 			auth := r.Header.Get("Authorization")
 			provided := strings.TrimPrefix(auth, "Bearer ")
 			if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
-				log.Printf("auth: rejected request from %s", r.RemoteAddr)
+				logging.Logger.Warn("auth: rejected request", "remote_addr", r.RemoteAddr)
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or missing API key"})
 				return
 			}

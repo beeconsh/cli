@@ -43,6 +43,7 @@ func main() {
 	defer cancel()
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
+		logging.Logger.Error("command failed", "error", err)
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}

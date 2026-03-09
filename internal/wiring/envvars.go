@@ -2,6 +2,8 @@ package wiring
 
 import (
 	"strings"
+
+	"github.com/terracotta-ai/beecon/internal/classify"
 )
 
 // EnvVarSet holds inferred environment variables for a dependency.
@@ -17,7 +19,7 @@ type EnvVarSet struct {
 //   - Multi-word or non-matching → prefix with uppercase dep name (POSTGRES_DATABASE_URL)
 //   - Explicit env{} always wins (caller checks before calling this)
 func InferEnvVars(depName, targetType string, targetIntent map[string]string) EnvVarSet {
-	engine := strings.ToLower(fieldVal(targetIntent, "engine"))
+	engine := strings.ToLower(classify.FieldVal(targetIntent, "engine"))
 	prefix := envPrefix(depName, engine, targetType)
 
 	vars := make(map[string]string)
@@ -73,9 +75,57 @@ func envPrefix(depName, engine, targetType string) string {
 	return strings.ToUpper(depName) + "_"
 }
 
-func fieldVal(intent map[string]string, key string) string {
-	if v, ok := intent[key]; ok {
-		return v
+// InferGCPEnvVars generates environment variable names for a GCP dependency
+// based on the dependency name and the GCP target type. Follows the same prefix
+// conventions as InferEnvVars but uses GCP-appropriate variable names.
+func InferGCPEnvVars(depName, targetType string, targetIntent map[string]string) EnvVarSet {
+	engine := strings.ToLower(classify.FieldVal(targetIntent, "engine"))
+	prefix := gcpEnvPrefix(depName, engine, targetType)
+
+	vars := make(map[string]string)
+
+	switch targetType {
+	case "cloud_sql":
+		vars[prefix+"DATABASE_URL"] = "${" + depName + ".url}"
+		vars[prefix+"DB_HOST"] = "${" + depName + ".host}"
+		vars[prefix+"DB_PORT"] = "${" + depName + ".port}"
+		vars[prefix+"INSTANCE_CONNECTION_NAME"] = "${" + depName + ".connection_name}"
+	case "memorystore_redis":
+		vars[prefix+"REDIS_URL"] = "${" + depName + ".url}"
+		vars[prefix+"REDIS_HOST"] = "${" + depName + ".host}"
+		vars[prefix+"REDIS_PORT"] = "${" + depName + ".port}"
+	case "gcs":
+		vars[prefix+"BUCKET_NAME"] = "${" + depName + ".bucket_name}"
+	case "pubsub":
+		vars[prefix+"TOPIC_NAME"] = "${" + depName + ".topic_name}"
+		vars[prefix+"PROJECT_ID"] = "${" + depName + ".project_id}"
+	case "secret_manager":
+		vars[prefix+"SECRET_NAME"] = "${" + depName + ".secret_name}"
+	case "cloud_functions":
+		vars[prefix+"FUNCTION_NAME"] = "${" + depName + ".function_name}"
+		vars[prefix+"FUNCTION_URL"] = "${" + depName + ".url}"
+	case "cloud_run":
+		vars[prefix+"SERVICE_URL"] = "${" + depName + ".url}"
 	}
-	return ""
+
+	return EnvVarSet{Vars: vars}
+}
+
+func gcpEnvPrefix(depName, engine, targetType string) string {
+	depLower := strings.ToLower(depName)
+
+	if depLower == engine {
+		return ""
+	}
+	if depLower == targetType {
+		return ""
+	}
+	switch depLower {
+	case "postgres", "mysql", "redis", "gcs", "pubsub":
+		if strings.Contains(engine, depLower) || targetType == depLower || targetType == "cloud_sql" || targetType == "memorystore_redis" {
+			return ""
+		}
+	}
+
+	return strings.ToUpper(depName) + "_"
 }

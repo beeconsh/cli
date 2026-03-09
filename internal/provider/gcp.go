@@ -11,6 +11,8 @@ import (
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	secretmanagerpb "cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"cloud.google.com/go/storage"
+	"github.com/terracotta-ai/beecon/internal/classify"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/state"
 	"google.golang.org/api/cloudresourcemanager/v1"
 	"google.golang.org/api/compute/v1"
@@ -52,75 +54,186 @@ func (e *DefaultExecutor) applyGCP(ctx context.Context, req ApplyRequest) (*Appl
 	if e.dryRun {
 		return simulatedApply(req, target), nil
 	}
+
+	if err := validateGCPInput(target, req.Intent); err != nil {
+		return nil, err
+	}
+
+	logging.Logger.Debug("gcp:apply", "target", target, "operation", req.Action.Operation, "node", req.Action.NodeName)
+
+	var result *ApplyResult
+	var applyErr error
+
 	switch target {
 	case "gcs":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPGCS(ctx, req)
+		result, applyErr = applyGCPGCS(ctx, req)
 	case "cloud_sql":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPCloudSQL(ctx, req)
+		result, applyErr = applyGCPCloudSQL(ctx, req)
 	case "pubsub":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPPubSub(ctx, req)
+		result, applyErr = applyGCPPubSub(ctx, req)
 	case "secret_manager":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPSecretManager(ctx, req)
+		result, applyErr = applyGCPSecretManager(ctx, req)
 	case "vpc":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPVPC(ctx, req)
+		result, applyErr = applyGCPVPC(ctx, req)
 	case "subnet":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPSubnet(ctx, req)
+		result, applyErr = applyGCPSubnet(ctx, req)
 	case "firewall":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPFirewall(ctx, req)
+		result, applyErr = applyGCPFirewall(ctx, req)
 	case "cloud_run":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPCloudRun(ctx, req)
+		result, applyErr = applyGCPCloudRun(ctx, req)
 	case "memorystore_redis":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPMemorystoreRedis(ctx, req)
+		result, applyErr = applyGCPMemorystoreRedis(ctx, req)
 	case "iam":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPIAM(ctx, req)
+		result, applyErr = applyGCPIAM(ctx, req)
 	case "compute_engine":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPComputeEngine(ctx, req)
+		result, applyErr = applyGCPComputeEngine(ctx, req)
 	case "cloud_dns":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPCloudDNS(ctx, req)
+		result, applyErr = applyGCPCloudDNS(ctx, req)
 	case "cloud_functions", "api_gateway", "cloud_cdn", "cloud_monitoring", "gke", "eventarc", "identity_platform":
-		if err := validateGCPInput(target, req.Intent); err != nil {
-			return nil, err
-		}
-		return applyGCPProjectScopedGeneric(ctx, target, req)
+		result, applyErr = applyGCPProjectScopedGeneric(ctx, target, req)
 	default:
 		return nil, fmt.Errorf("gcp target %q is recognized but requires additional adapter implementation for live execution (set BEECON_EXECUTE!=1 for dry-run)", target)
 	}
+	if applyErr != nil {
+		return result, applyErr
+	}
+
+	// --- Post-apply cross-cutting concerns ---
+	if result.LiveState == nil {
+		result.LiveState = map[string]interface{}{}
+	}
+	gcpPostApplyCrossCutting(ctx, target, req, result)
+
+	logging.Logger.Debug("gcp:apply:complete", "target", target, "provider_id", result.ProviderID)
+	return result, nil
+}
+
+// gcpAlarmTargets lists GCP targets that emit Cloud Monitoring metrics.
+var gcpAlarmTargets = map[string]bool{
+	"cloud_sql":         true,
+	"cloud_run":         true,
+	"memorystore_redis": true,
+	"compute_engine":    true,
+	"cloud_functions":   true,
+	"gke":               true,
+}
+
+// gcpPostApplyCrossCutting applies post-apply automation (alarm_on, log_retention,
+// iam_roles binding) for GCP resources. Non-fatal — stores errors in LiveState.
+func gcpPostApplyCrossCutting(ctx context.Context, target string, req ApplyRequest, result *ApplyResult) {
+	if req.Action.Operation == "DELETE" {
+		return
+	}
+
+	// Log retention: store intent for GCP Cloud Logging retention.
+	// GCP log retention is configured at the log bucket level, not per-resource.
+	// We store the intent for the user/agent to configure via Cloud Logging API.
+	if retRaw := intent(req.Intent, "log_retention"); retRaw != "" {
+		switch target {
+		case "cloud_run", "cloud_functions":
+			days := parseDurationDays(retRaw)
+			if days > 0 {
+				result.LiveState["log_retention_days"] = days
+				result.LiveState["log_retention_note"] = "GCP log retention requires Cloud Logging bucket configuration"
+			}
+		}
+	}
+
+	// alarm_on: store parsed alarm intent for GCP Cloud Monitoring.
+	// GCP alerting policies require a notification channel; we store the parsed
+	// condition so agents can create an AlertPolicy via the Monitoring API.
+	if alarmRaw := intent(req.Intent, "alarm_on"); alarmRaw != "" && gcpAlarmTargets[target] {
+		cond, err := parseAlarmOn(alarmRaw)
+		if err == nil && cond != nil {
+			metricType, metricResource := gcpAlarmMetricForTarget(target, cond.Metric)
+			// If the metric type equals the raw input, it wasn't recognized — warn.
+			if metricType == cond.Metric {
+				logging.Logger.Warn("gcp:alarm:unrecognized_metric", "target", target, "metric", cond.Metric)
+				result.LiveState["alarm_warning"] = fmt.Sprintf("metric %q is not a recognized alias for %s; using raw value", cond.Metric, target)
+			}
+			_ = metricResource
+			resourceName := identifierFor(req.Action.NodeName)
+			alarmName := resourceName + "-" + strings.ToLower(cond.Metric)
+			logging.Logger.Debug("gcp:alarm:stored", "target", target, "alarm_name", alarmName, "metric", metricType)
+			result.LiveState["alarm_name"] = alarmName
+			result.LiveState["alarm_metric"] = metricType
+			result.LiveState["alarm_threshold"] = cond.Threshold
+			result.LiveState["alarm_operator"] = cond.Operator
+			result.LiveState["alarm_note"] = "GCP alarm stored; create AlertPolicy via Cloud Monitoring API"
+		} else {
+			result.LiveState["alarm_error"] = "failed to parse alarm condition"
+		}
+	}
+
+	// IAM role binding: apply inferred IAM roles from wiring layer.
+	if rolesJSON := intent(req.Intent, "iam_roles"); rolesJSON != "" {
+		result.LiveState["iam_roles_inferred"] = rolesJSON
+		result.LiveState["iam_roles_note"] = "GCP IAM roles inferred; bind to service account via IAM API"
+	}
+}
+
+// gcpAlarmMetricForTarget maps user-facing metric names to GCP Cloud Monitoring
+// metric types and resource types.
+func gcpAlarmMetricForTarget(target, metric string) (string, string) {
+	metric = strings.ToLower(metric)
+	switch target {
+	case "cloud_sql":
+		switch metric {
+		case "cpu":
+			return "cloudsql.googleapis.com/database/cpu/utilization", "cloudsql_database"
+		case "memory":
+			return "cloudsql.googleapis.com/database/memory/utilization", "cloudsql_database"
+		case "connections":
+			return "cloudsql.googleapis.com/database/network/connections", "cloudsql_database"
+		case "disk":
+			return "cloudsql.googleapis.com/database/disk/utilization", "cloudsql_database"
+		}
+	case "cloud_run":
+		switch metric {
+		case "cpu":
+			return "run.googleapis.com/container/cpu/utilizations", "cloud_run_revision"
+		case "memory":
+			return "run.googleapis.com/container/memory/utilizations", "cloud_run_revision"
+		case "latency":
+			return "run.googleapis.com/request_latencies", "cloud_run_revision"
+		case "errors":
+			return "run.googleapis.com/request_count", "cloud_run_revision" // filter by response_code_class=5xx
+		}
+	case "memorystore_redis":
+		switch metric {
+		case "cpu":
+			return "redis.googleapis.com/stats/cpu_utilization", "redis_instance"
+		case "memory":
+			return "redis.googleapis.com/stats/memory/usage_ratio", "redis_instance"
+		case "connections":
+			return "redis.googleapis.com/clients/connected", "redis_instance"
+		}
+	case "compute_engine":
+		switch metric {
+		case "cpu":
+			return "compute.googleapis.com/instance/cpu/utilization", "gce_instance"
+		case "memory":
+			return "compute.googleapis.com/instance/memory/balloon/ram_used", "gce_instance"
+		case "disk":
+			return "compute.googleapis.com/instance/disk/read_bytes_count", "gce_instance"
+		}
+	case "cloud_functions":
+		switch metric {
+		case "errors":
+			return "cloudfunctions.googleapis.com/function/execution_count", "cloud_function" // filter by status!=ok
+		case "duration":
+			return "cloudfunctions.googleapis.com/function/execution_times", "cloud_function"
+		}
+	case "gke":
+		switch metric {
+		case "cpu":
+			return "kubernetes.io/container/cpu/core_usage_time", "k8s_container"
+		case "memory":
+			return "kubernetes.io/container/memory/used_bytes", "k8s_container"
+		}
+	}
+	// Fallback: return the metric as-is (allows advanced users to pass exact metric types)
+	return metric, target
 }
 
 func (e *DefaultExecutor) observeGCP(ctx context.Context, region string, rec *state.ResourceRecord) (*ObserveResult, error) {
@@ -134,6 +247,7 @@ func (e *DefaultExecutor) observeGCP(ctx context.Context, region string, rec *st
 		return &ObserveResult{Exists: false, LiveState: map[string]interface{}{}}, nil
 	}
 	target := detectGCPRecordTarget(rec)
+	logging.Logger.Debug("gcp:observe", "target", target, "provider_id", rec.ProviderID)
 	switch target {
 	case "gcs":
 		return observeGCPGCS(ctx, rec)
@@ -1290,61 +1404,28 @@ func verifyGCPProject(ctx context.Context, projectID string) error {
 }
 
 func detectGCPTarget(req ApplyRequest) string {
-	nodeType := strings.ToUpper(req.Action.NodeType)
+	// Convert map[string]interface{} to map[string]string for the classifier.
+	// Strip the "intent." prefix that the provider layer adds, since the
+	// classifier expects bare keys (e.g., "engine" not "intent.engine").
+	intentStr := make(map[string]string, len(req.Intent))
+	for k, v := range req.Intent {
+		key := strings.TrimPrefix(k, "intent.")
+		intentStr[key] = fmt.Sprint(v)
+	}
+
+	// Delegate to the canonical classifier used by wiring, so both layers agree.
+	target := classify.ClassifyGCPNode(req.Action.NodeType, intentStr)
+	if target != "" {
+		return target
+	}
+
+	// Additional provider-only targets not in the wiring classifier.
 	engine := strings.ToLower(intent(req.Intent, "engine", "type", "runtime", "service", "topology", "resource"))
-	expose := strings.ToLower(intent(req.Intent, "expose"))
-	if nodeType == "STORE" {
-		switch {
-		case strings.Contains(engine, "postgres"), strings.Contains(engine, "mysql"), strings.Contains(engine, "cloud_sql"):
-			return "cloud_sql"
-		case strings.Contains(engine, "redis"):
-			return "memorystore_redis"
-		case strings.Contains(engine, "gcs"), strings.Contains(engine, "storage"), strings.Contains(engine, "bucket"):
-			return "gcs"
-		case strings.Contains(engine, "secret"):
-			return "secret_manager"
-		case strings.Contains(engine, "iam"):
-			return "iam"
-		}
+	if strings.ToUpper(req.Action.NodeType) == "STORE" && strings.Contains(engine, "iam") {
+		return "iam"
 	}
-	if nodeType == "NETWORK" {
-		switch {
-		case strings.Contains(engine, "vpc"):
-			return "vpc"
-		case strings.Contains(engine, "subnet"):
-			return "subnet"
-		case strings.Contains(engine, "firewall"):
-			return "firewall"
-		case strings.Contains(engine, "api_gateway"):
-			return "api_gateway"
-		case strings.Contains(engine, "cdn"):
-			return "cloud_cdn"
-		case strings.Contains(engine, "dns"):
-			return "cloud_dns"
-		}
-	}
-	if nodeType == "SERVICE" {
-		switch {
-		case strings.Contains(engine, "cloud_run"):
-			return "cloud_run"
-		case strings.Contains(engine, "pubsub"):
-			return "pubsub"
-		case strings.Contains(engine, "gke"):
-			return "gke"
-		case strings.Contains(engine, "function"):
-			return "cloud_functions"
-		case strings.Contains(expose, "api"):
-			return "api_gateway"
-		}
-	}
-	if nodeType == "COMPUTE" {
-		switch {
-		case strings.Contains(engine, "eventarc"):
-			return "eventarc"
-		case strings.Contains(engine, "compute"):
-			return "compute_engine"
-		}
-	}
+
+	// Fallback: scan all intent values for a known GCP target name.
 	for _, v := range req.Intent {
 		s := strings.ToLower(fmt.Sprint(v))
 		for target := range GCPSupportMatrix {

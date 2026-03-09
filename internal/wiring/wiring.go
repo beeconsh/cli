@@ -8,6 +8,7 @@ import (
 
 	"github.com/terracotta-ai/beecon/internal/classify"
 	"github.com/terracotta-ai/beecon/internal/ir"
+	"github.com/terracotta-ai/beecon/internal/logging"
 )
 
 // WiringResult contains artifacts produced by WireGraph.
@@ -18,14 +19,35 @@ type WiringResult struct {
 	Warnings          []string                     // non-fatal warnings surfaced during wiring
 }
 
-// WireGraph infers IAM policies, environment variables, and security group rules
-// from dependency declarations in the intent graph. It mutates IntentNode.Env
-// and IntentNode.Intent in-place.
+// detectCloudProvider extracts the cloud provider from the domain's cloud field.
+// Returns "aws", "gcp", "azure", or "aws" as default.
+func detectCloudProvider(g *ir.Graph) string {
+	if g.Domain == nil || g.Domain.Cloud == "" {
+		return "aws"
+	}
+	cloud := strings.ToLower(g.Domain.Cloud)
+	switch {
+	case strings.HasPrefix(cloud, "gcp"):
+		return "gcp"
+	case strings.HasPrefix(cloud, "azure"):
+		return "azure"
+	default:
+		return "aws"
+	}
+}
+
+// WireGraph infers IAM policies, environment variables, and security group / firewall
+// rules from dependency declarations in the intent graph. It detects the cloud provider
+// from g.Domain.Cloud and routes to provider-specific classification and inference.
+// It mutates IntentNode.Env and IntentNode.Intent in-place.
 func WireGraph(g *ir.Graph) (*WiringResult, error) {
 	result := &WiringResult{
 		InferredEnvVars:  make(map[string]map[string]string),
 		InferredPolicies: make(map[string]string),
 	}
+
+	cloud := detectCloudProvider(g)
+	logging.Logger.Debug("wiring:start", "cloud", cloud, "nodes", len(g.Nodes))
 
 	nodeByName := make(map[string]*ir.IntentNode, len(g.Nodes))
 	for i := range g.Nodes {
@@ -38,8 +60,9 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 			continue
 		}
 
-		sourceTarget := classify.ClassifyNode(string(node.Type), node.Intent)
-		var allActions []string
+		sourceTarget := classifyNode(cloud, string(node.Type), node.Intent)
+		var allActions []string // AWS IAM actions
+		var allRoles []string  // GCP IAM roles
 
 		for _, dep := range node.Needs {
 			target, ok := nodeByName[dep.Target]
@@ -47,7 +70,7 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 				return nil, fmt.Errorf("node %q declares dependency on %q but no such node exists in the graph", node.Name, dep.Target)
 			}
 
-			targetTarget := classify.ClassifyNode(string(target.Type), target.Intent)
+			targetTarget := classifyNode(cloud, string(target.Type), target.Intent)
 
 			// Validate and normalize mode
 			mode, err := NormalizeMode(dep.Mode)
@@ -55,7 +78,7 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 				return nil, fmt.Errorf("node %q needs %q: %w", node.Name, dep.Target, err)
 			}
 
-			if !IsValidMode(targetTarget, mode) {
+			if !isValidMode(cloud, targetTarget, mode) {
 				return nil, fmt.Errorf("node %q: invalid mode %q for %s target %q",
 					node.Name, mode, targetTarget, dep.Target)
 			}
@@ -65,18 +88,34 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 					fmt.Sprintf("node %q: admin mode on %q grants wildcard IAM actions; review before deploying", node.Name, dep.Target))
 			}
 
-			// Infer IAM actions
-			actions, err := IAMActionsFor(targetTarget, mode)
-			if err == nil {
-				allActions = append(allActions, actions...)
-			} else if targetTarget != "" {
-				// Known target type with no IAM mapping — surface as warning
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("node %q: no IAM actions defined for %s with mode %s; service may lack permissions", node.Name, targetTarget, mode))
+			// Infer IAM actions/roles
+			switch cloud {
+			case "gcp":
+				roles, err := GCPIAMRolesFor(targetTarget, mode)
+				if err == nil {
+					allRoles = append(allRoles, roles...)
+				} else if targetTarget != "" {
+					result.Warnings = append(result.Warnings,
+						fmt.Sprintf("node %q: no GCP IAM roles defined for %s with mode %s; service may lack permissions", node.Name, targetTarget, mode))
+				}
+			default: // aws
+				actions, err := IAMActionsFor(targetTarget, mode)
+				if err == nil {
+					allActions = append(allActions, actions...)
+				} else if targetTarget != "" {
+					result.Warnings = append(result.Warnings,
+						fmt.Sprintf("node %q: no IAM actions defined for %s with mode %s; service may lack permissions", node.Name, targetTarget, mode))
+				}
 			}
 
 			// Infer env vars (only if not already explicitly set)
-			envVars := InferEnvVars(dep.Target, targetTarget, target.Intent)
+			var envVars EnvVarSet
+			switch cloud {
+			case "gcp":
+				envVars = InferGCPEnvVars(dep.Target, targetTarget, target.Intent)
+			default:
+				envVars = InferEnvVars(dep.Target, targetTarget, target.Intent)
+			}
 			for k, v := range envVars.Vars {
 				if _, exists := node.Env[k]; !exists {
 					node.Env[k] = v
@@ -87,35 +126,68 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 				}
 			}
 
-			// Infer SG rules
-			sgRules := InferSGRules(node.ID, target.ID, sourceTarget, targetTarget, target.Intent)
-			result.InferredSGRules = append(result.InferredSGRules, sgRules...)
+			// Infer SG / firewall rules
+			switch cloud {
+			case "gcp":
+				fwRules := InferGCPFirewallRules(node.ID, target.ID, sourceTarget, targetTarget, target.Intent)
+				result.InferredSGRules = append(result.InferredSGRules, fwRules...)
+			default:
+				sgRules := InferSGRules(node.ID, target.ID, sourceTarget, targetTarget, target.Intent)
+				result.InferredSGRules = append(result.InferredSGRules, sgRules...)
+			}
 		}
 
-		// Build inline policy from collected IAM actions
-		if len(allActions) > 0 {
-			sort.Strings(allActions)
-			allActions = dedup(allActions)
-			policy := buildInlinePolicy(node.Name, allActions)
-			policyJSON, err := json.Marshal(policy)
-			if err != nil {
-				return nil, fmt.Errorf("marshal inline policy for %s: %w", node.Name, err)
+		logging.Logger.Debug("wiring:iam", "node", node.Name, "cloud", cloud, "count", len(allActions)+len(allRoles))
+		if envVarsForNode := result.InferredEnvVars[node.ID]; len(envVarsForNode) > 0 {
+			logging.Logger.Debug("wiring:env", "node", node.Name, "vars", len(envVarsForNode))
+		}
+
+		// Build inline policy / role binding from collected IAM artifacts
+		switch cloud {
+		case "gcp":
+			if len(allRoles) > 0 {
+				sort.Strings(allRoles)
+				allRoles = dedup(allRoles)
+				binding := buildGCPRoleBinding(node.Name, allRoles)
+				bindingJSON, err := json.Marshal(binding)
+				if err != nil {
+					return nil, fmt.Errorf("marshal GCP role binding for %s: %w", node.Name, err)
+				}
+				node.Intent["iam_roles"] = string(bindingJSON)
+				result.InferredPolicies[node.ID] = string(bindingJSON)
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("node %q: GCP IAM roles inferred; review role bindings before deploying", node.Name))
 			}
-			node.Intent["inline_policy"] = string(policyJSON)
-			result.InferredPolicies[node.ID] = string(policyJSON)
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("node %q: IAM policy uses Resource \"*\"; scope to specific ARNs in production", node.Name))
+		default: // aws
+			if len(allActions) > 0 {
+				sort.Strings(allActions)
+				allActions = dedup(allActions)
+				policy := buildInlinePolicy(node.Name, allActions)
+				policyJSON, err := json.Marshal(policy)
+				if err != nil {
+					return nil, fmt.Errorf("marshal inline policy for %s: %w", node.Name, err)
+				}
+				node.Intent["inline_policy"] = string(policyJSON)
+				result.InferredPolicies[node.ID] = string(policyJSON)
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("node %q: IAM policy uses Resource \"*\"; scope to specific ARNs in production", node.Name))
+			}
 		}
 	}
 
-	// Inject inferred SG rules into security_group NETWORK nodes.
-	// Use graph edges to scope rules: only inject into the SG that a related
+	// Inject inferred SG/firewall rules into security_group or firewall NETWORK nodes.
+	// Use graph edges to scope rules: only inject into the SG/FW that a related
 	// node (source or target of the rule) depends on. If no edge-based match
-	// is found, fall back to injecting into all SG nodes.
+	// is found, fall back to injecting into all matching nodes.
 	if len(result.InferredSGRules) > 0 {
 		sgNodesByID := make(map[string]*ir.IntentNode)
+		fwTopology := "security_group"
+		if cloud == "gcp" {
+			fwTopology = "firewall"
+		}
 		for i := range g.Nodes {
-			if g.Nodes[i].Type == ir.NodeNetwork && g.Nodes[i].Intent["topology"] == "security_group" {
+			topo := g.Nodes[i].Intent["topology"]
+			if g.Nodes[i].Type == ir.NodeNetwork && (topo == "security_group" || topo == "firewall") && topo == fwTopology {
 				sgNodesByID[g.Nodes[i].ID] = &g.Nodes[i]
 			}
 		}
@@ -181,6 +253,7 @@ func WireGraph(g *ir.Graph) (*WiringResult, error) {
 		}
 	}
 
+	logging.Logger.Debug("wiring:complete", "env_vars", len(result.InferredEnvVars), "policies", len(result.InferredPolicies), "sg_rules", len(result.InferredSGRules))
 	return result, nil
 }
 
@@ -262,5 +335,34 @@ func FormatSGRules(rules []SGRule) []string {
 			r.Description)
 	}
 	return out
+}
+
+// classifyNode routes to the provider-specific classification function.
+func classifyNode(cloud, nodeType string, intent map[string]string) string {
+	switch cloud {
+	case "gcp":
+		return classify.ClassifyGCPNode(nodeType, intent)
+	default:
+		return classify.ClassifyNode(nodeType, intent)
+	}
+}
+
+// isValidMode routes to the provider-specific mode validation.
+func isValidMode(cloud, target string, mode Mode) bool {
+	switch cloud {
+	case "gcp":
+		return IsValidGCPMode(target, mode)
+	default:
+		return IsValidMode(target, mode)
+	}
+}
+
+// gcpRoleBinding represents a set of GCP IAM roles to bind to a service account.
+type gcpRoleBinding struct {
+	Roles []string `json:"roles"`
+}
+
+func buildGCPRoleBinding(nodeName string, roles []string) gcpRoleBinding {
+	return gcpRoleBinding{Roles: roles}
 }
 

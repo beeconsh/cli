@@ -116,22 +116,59 @@ Every friction point in that loop — ambiguous output, missing context, inabili
 
 **Goal:** All three clouds work equally well — an agent shouldn't need to know which cloud it's targeting.
 
-### 5.1 GCP Adapter Depth
-- [ ] Resource-specific lifecycle adapters for top GCP targets (Cloud SQL, Cloud Run, GKE)
-- [ ] Replace project-scoped generic stubs with real CRUD operations
-- [ ] Drift observation via GCP APIs
+**Current gap (GCP vs AWS):** AWS has 20 resource types, 18 deep observation, 2 cross-cutting concerns, and full wiring layer (IAM/env vars/security groups). GCP has 12 resource-specific + 7 generic stubs, zero cross-cutting, zero wiring support. This means GCP beacons require 3-5x more explicit configuration than equivalent AWS beacons.
 
-### 5.2 Azure Adapter Depth
+### 5.1 GCP Wiring Layer (Phase G1 — Highest Leverage)
+
+Bring GCP into the wiring layer so agents get the same "smart defaults" as AWS.
+
+- [ ] Add `gcpIAMActionsFor()` to wiring layer — map dependency pairs to GCP IAM roles (e.g., Cloud Run → Cloud SQL needs `roles/cloudsql.client`, Cloud Run → Secret Manager needs `roles/secretmanager.secretAccessor`)
+- [ ] Add `gcpInferEnvVars()` — auto-inject Cloud SQL connection strings, Secret Manager secret names, Pub/Sub topic names from IR graph edges
+- [ ] Add `gcpInferFirewallRules()` — generate firewall allow rules from dependency edges (e.g., Cloud Run → Cloud SQL implies allow TCP:5432)
+- [ ] Cloud Monitoring alarms (post-apply `alarm_on`) — Cloud Run (request_count, latency), Cloud SQL (cpu, connections), Memorystore (memory), Compute Engine (cpu)
+- [ ] Cloud Logging retention (post-apply `log_retention`) — set retention on Cloud Run and Cloud Functions log sinks
+
+### 5.2 GCP Stub Promotion (Phase G2 — Fill the Holes)
+
+Promote 7 generic stubs to resource-specific adapters with real SDK calls and deep observation.
+
+- [ ] Cloud Functions — real CREATE/UPDATE/DELETE via Cloud Functions API (Lambda equivalent)
+- [ ] GKE — cluster lifecycle via Container API (EKS equivalent)
+- [ ] Cloud CDN — CDN configuration (CloudFront equivalent)
+- [ ] Eventarc — event routing (EventBridge equivalent)
+- [ ] API Gateway — HTTP API management (API Gateway v2 equivalent)
+- [ ] Identity Platform — user pool management (Cognito equivalent)
+- [ ] Cloud Monitoring — standalone alarm management (CloudWatch equivalent)
+
+### 5.3 GCP Resilience (Phase G3 — Production Hardening)
+
+- [ ] Multi-step partial results for Cloud Run (deploy → IAM → traffic split — return partial on mid-step failure)
+- [ ] GCP-specific error classification — expand `isNotFound` with gRPC `codes.NotFound` and `googleapi.Error{Code: 404}` patterns
+- [ ] Operation waiters — Cloud SQL and GKE creation takes minutes; add polling waiters
+- [ ] withRetry for transient GCP errors (503, rate limits) with exponential backoff
+
+### 5.4 GCP Observation Depth (Phase G4 — Drift Parity)
+
+- [ ] Deepen Cloud Run observation — revision, scaling config, env vars (scrubbed), service URL, IAM policy
+- [ ] Deepen Cloud SQL observation — database_version, tier, storage_auto_resize, backup_config, ip_addresses
+- [ ] Deepen Memorystore observation — redis_version, memory_size_gb, host, port, auth_enabled
+- [ ] Deepen remaining 9 resource types — match AWS-level field extraction
+- [ ] Add observation for promoted stubs (depends on 5.2)
+
+### 5.5 Azure Adapter Depth
 - [ ] Resource-specific lifecycle adapters for top Azure targets (Container Apps, PostgreSQL Flexible, AKS)
 - [ ] Replace ARM generic stubs with real CRUD operations
+- [ ] Azure wiring layer (Managed Identity, env vars, NSG rules)
 - [ ] Drift observation via Azure APIs
 
-### 5.3 Provider Capability Matrix
+### 5.6 Provider Capability Matrix
 - [ ] `beecon providers --format json` returns what's real vs simulated per cloud/target
 - [ ] Agent can introspect: "can I actually deploy this, or will it be dry-run?"
 - [ ] Transparency over silent simulation
 
 **Why:** An agent doesn't pick a cloud — the user's domain block does. If GCP `cloud_sql` silently simulates while AWS `rds` actually provisions, the agent can't trust the tool.
+
+**Recommended execution order:** G1 (wiring) → G2 (stubs) → G3 (resilience) → G4 (observation). G1 is the highest-leverage work — it transforms the GCP agent experience from "specify everything manually" to "declare intent, get smart defaults."
 
 ---
 
