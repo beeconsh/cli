@@ -101,9 +101,31 @@
 
 See `docs/ROADMAP.md` for full Phase 5-7 details.
 
-### Phase 5.5: Azure & General
-- [ ] Azure resource-specific adapter depth
-- [ ] Provider capability matrix command
+### Phase 5.5: Azure Adapter Depth + Provider Capability Matrix ✅
+
+#### 5.5A: Azure Wiring Layer ✅ (PR #38, merged)
+- [x] `ClassifyAzureNode()` — 18 Azure target types across STORE/NETWORK/SERVICE/COMPUTE
+- [x] `AzureIAMRolesFor()` + RBAC role matrix — 30+ entries covering 13 target types
+- [x] `InferAzureEnvVars()` — 8 target types (postgres_flexible, mysql_flexible, azure_cache_redis, blob_storage, key_vault_secret, service_bus, container_apps, functions)
+- [x] `InferAzureNSGRules()` — NSG rule inference following GCP firewall pattern
+- [x] Azure dispatch in WireGraph — classify, IAM, env, NSG, topology (5 switch points)
+- [x] QA: 10 findings, 7 HIGH/MEDIUM fixed (Redis role, functions role, missing targets, nil-map guard, COMPUTE parity)
+
+#### 5.5B: Azure Resilience + Deepened Observation ✅ (PR #40, pending)
+- [x] `isAzureNotFound()` — azcore 404, error codes (ResourceNotFound, ResourceGroupNotFound), string fallback
+- [x] `isAzureTransient()` — 429/500/502/503/504, ServerBusy/TooManyRequests, context.DeadlineExceeded, string fallback
+- [x] `withAzureRetry()` — exponential backoff (500ms/1s/2s) + jitter, max 3 retries
+- [x] Migrated all `azureStatusCode(err) == 404` → `isAzureNotFound(err)` (6 adapters)
+- [x] Deepened observation: blob_storage, key_vault_secret, vnet, subnet, nsg, managed_identity
+- [x] 5 test functions: isAzureNotFound (13 cases), isAzureTransient (14 cases), consistency, withAzureRetry (5 subtests), deprecated compat
+
+#### 5.5D: Provider Capability Matrix ✅ (PR #39, merged)
+- [x] `beecon providers` CLI command with `--format json` and `--provider` filter
+- [x] `GetProviderCapabilities()` / `GetAllProviderCapabilities()` — introspection API
+- [x] Real vs generic adapter classification (AWS: 22, GCP: 19, Azure: 8 real adapters)
+- [x] Deep observe tracking, wiring coverage per target
+- [x] 8 test functions with JSON roundtrip, sorted output, tier validation
+- [x] QA: 4 findings, 2 HIGH fixed (false observe claims for 4 AWS targets, missing Azure wiring targets)
 
 ### Phase 6: Trust & Governance
 - [ ] Cost guardrails with auto-approve thresholds
