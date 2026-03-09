@@ -26,6 +26,7 @@ const (
 	StatusDrifted       ResourceStatus = "DRIFTED"
 	StatusUnprovisioned ResourceStatus = "UNPROVISIONED"
 	StatusObserved      ResourceStatus = "OBSERVED"
+	StatusFailed        ResourceStatus = "FAILED"
 )
 
 type AuditEvent struct {
@@ -101,15 +102,16 @@ const (
 )
 
 type RunRecord struct {
-	ID              string    `json:"id"`
-	CreatedAt       time.Time `json:"created_at"`
-	BeaconPath      string    `json:"beacon_path"`
-	ActionIDs       []string  `json:"action_ids"`
-	ExecutedActions []string  `json:"executed_actions"`
-	Status          RunStatus `json:"status"`
-	Error           string    `json:"error,omitempty"`
-	RollbackOfRunID string    `json:"rollback_of_run_id,omitempty"`
-	ActiveProfile   string    `json:"active_profile,omitempty"`
+	ID               string    `json:"id"`
+	CreatedAt        time.Time `json:"created_at"`
+	BeaconPath       string    `json:"beacon_path"`
+	ActionIDs        []string  `json:"action_ids"`
+	ExecutedActions  []string  `json:"executed_actions"`
+	CompletedActions []string  `json:"completed_actions,omitempty"`
+	Status           RunStatus `json:"status"`
+	Error            string    `json:"error,omitempty"`
+	RollbackOfRunID  string    `json:"rollback_of_run_id,omitempty"`
+	ActiveProfile    string    `json:"active_profile,omitempty"`
 }
 
 type ApprovalStatus string
