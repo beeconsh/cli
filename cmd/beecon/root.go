@@ -129,6 +129,9 @@ func init() {
 	// List flag on restore command
 	restoreCmd.Flags().BoolVar(&restoreListFlag, "list", false, "list available backups")
 
+	// Provider filter flag on providers command
+	providersCmd.Flags().StringVar(&providerFilterFlag, "provider", "", "filter by provider (aws, gcp, azure)")
+
 	rootCmd.AddCommand(
 		versionCmd,
 		initCmd,
@@ -151,6 +154,7 @@ func init() {
 		watchCmd,
 		serveCmd,
 		restoreCmd,
+		providersCmd,
 		mcpCmd,
 	)
 }
