@@ -37,6 +37,7 @@ type AuditEvent struct {
 	RunID      string                 `json:"run_id,omitempty"`
 	Message    string                 `json:"message"`
 	Data       map[string]interface{} `json:"data,omitempty"`
+	AgentID    string                 `json:"agent_id,omitempty"`
 }
 
 // WiringMetadata tracks inferred wiring artifacts for a resource.
@@ -114,6 +115,8 @@ type RunRecord struct {
 	Error            string    `json:"error,omitempty"`
 	RollbackOfRunID  string    `json:"rollback_of_run_id,omitempty"`
 	ActiveProfile    string    `json:"active_profile,omitempty"`
+	AgentID          string    `json:"agent_id,omitempty"`
+	AgentModel       string    `json:"agent_model,omitempty"`
 }
 
 type ApprovalStatus string

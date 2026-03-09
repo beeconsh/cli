@@ -102,7 +102,9 @@ type ActionOutcome struct {
 type ApplyOption func(*applyOptions)
 
 type applyOptions struct {
-	Force bool
+	Force      bool
+	AgentID    string
+	AgentModel string
 }
 
 func applyDefaults(opts []ApplyOption) applyOptions {
@@ -116,6 +118,14 @@ func applyDefaults(opts []ApplyOption) applyOptions {
 // WithForce bypasses budget enforcement.
 func WithForce(force bool) ApplyOption {
 	return func(o *applyOptions) { o.Force = force }
+}
+
+// WithAgentID sets the agent identity and model for audit trail tracking.
+func WithAgentID(id, model string) ApplyOption {
+	return func(o *applyOptions) {
+		o.AgentID = id
+		o.AgentModel = model
+	}
 }
 
 type ApplyResult struct {
@@ -283,6 +293,8 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 		BeaconPath:    abs,
 		Status:        state.RunApplied,
 		ActiveProfile: e.ActiveProfile,
+		AgentID:       o.AgentID,
+		AgentModel:    o.AgentModel,
 	}
 	for _, a := range p.Actions {
 		st.Actions[a.ID] = a
@@ -383,7 +395,7 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 	}
 
 	st.Runs[run.ID] = run
-	addAudit(st, run.ID, "RUN_CREATED", "", fmt.Sprintf("run %s created for %s", run.ID, abs), nil)
+	addAuditWithAgent(st, run.ID, "RUN_CREATED", "", fmt.Sprintf("run %s created for %s", run.ID, abs), nil, o.AgentID)
 	// Emit audit events for compliance overrides
 	if compReport != nil {
 		for _, o := range compReport.Overrides {
@@ -604,6 +616,24 @@ func (e *Engine) Runs(ctx context.Context) ([]*state.RunRecord, error) {
 	for _, r := range st.Runs {
 		cp := *r
 		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// AgentHistory returns all runs associated with the given agent ID, sorted by
+// creation time (newest first). Returns an empty slice if no runs match.
+func (e *Engine) AgentHistory(ctx context.Context, agentID string) ([]state.RunRecord, error) {
+	e.runExpireApprovals()
+	st, err := e.store.Load()
+	if err != nil {
+		return nil, err
+	}
+	var out []state.RunRecord
+	for _, r := range st.Runs {
+		if r.AgentID == agentID {
+			out = append(out, *r)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
@@ -1696,6 +1726,10 @@ const maxAuditEvents = 10000
 const maxPerfEvents = 10000
 
 func addAudit(st *state.State, runID, typ, resourceID, msg string, data map[string]interface{}) {
+	addAuditWithAgent(st, runID, typ, resourceID, msg, data, "")
+}
+
+func addAuditWithAgent(st *state.State, runID, typ, resourceID, msg string, data map[string]interface{}, agentID string) {
 	st.Audit = append(st.Audit, state.AuditEvent{
 		ID:         state.NewID("aud"),
 		Timestamp:  time.Now().UTC(),
@@ -1704,6 +1738,7 @@ func addAudit(st *state.State, runID, typ, resourceID, msg string, data map[stri
 		RunID:      runID,
 		Message:    msg,
 		Data:       data,
+		AgentID:    agentID,
 	})
 	if len(st.Audit) > maxAuditEvents {
 		st.Audit = st.Audit[len(st.Audit)-maxAuditEvents:]

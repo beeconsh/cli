@@ -106,6 +106,7 @@ func toolDetectDrift() mcp.Tool {
 func toolListRuns() mcp.Tool {
 	return mcp.NewTool("list_runs",
 		mcp.WithDescription("List all execution runs with their status and action counts"),
+		mcp.WithString("agent_id", mcp.Description("Filter runs by agent identity")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
@@ -142,6 +143,7 @@ func toolApply() mcp.Tool {
 		mcp.WithString("beacon_file", mcp.Required(), mcp.Description("Path to the .beecon file")),
 		mcp.WithBoolean("force", mcp.Description("Bypass budget enforcement")),
 		mcp.WithString("profile", mcp.Description("Active profile name")),
+		mcp.WithString("agent_id", mcp.Description("Agent identity for audit trail (e.g. claude-opus-4-6)")),
 		mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithIdempotentHintAnnotation(false),
 	)
@@ -294,7 +296,22 @@ func (s *Server) handleDetectDrift(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (s *Server) handleListRuns(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
 	logging.Logger.Debug("mcp:tool", "name", "list_runs")
+
+	// If agent_id filter is provided, use AgentHistory.
+	if agentID, ok := args["agent_id"].(string); ok && agentID != "" {
+		runs, err := s.eng.AgentHistory(ctx, agentID)
+		if err != nil {
+			logging.Logger.Warn("mcp:tool:error", "name", "list_runs", "error", err)
+			return mcp.NewToolResultError(fmt.Sprintf("list runs failed: %s", err)), nil
+		}
+		for i := range runs {
+			runs[i].BeaconPath = filepath.Base(runs[i].BeaconPath)
+		}
+		return resultJSON(map[string]any{"agent_id": agentID, "runs": runs})
+	}
+
 	runs, err := s.eng.Runs(ctx)
 	if err != nil {
 		logging.Logger.Warn("mcp:tool:error", "name", "list_runs", "error", err)
@@ -368,6 +385,9 @@ func (s *Server) handleApply(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	var opts []engine.ApplyOption
 	if force, ok := args["force"].(bool); ok {
 		opts = append(opts, engine.WithForce(force))
+	}
+	if agentID, ok := args["agent_id"].(string); ok && agentID != "" {
+		opts = append(opts, engine.WithAgentID(agentID, ""))
 	}
 
 	s.mu.Lock()
