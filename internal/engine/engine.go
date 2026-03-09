@@ -54,10 +54,12 @@ type PlanSummary struct {
 	Deletes          int     `json:"deletes"`
 	Forbidden        int     `json:"forbidden"`
 	PendingApproval  int     `json:"pending_approval"`
-	AggregateRisk    string  `json:"aggregate_risk"`
-	TotalMonthlyCost float64 `json:"total_monthly_cost"`
-	CostDelta        float64 `json:"cost_delta,omitempty"`
-	BudgetRemaining  float64 `json:"budget_remaining,omitempty"`
+	AggregateRisk       string  `json:"aggregate_risk"`
+	MaxBlastRadius      int     `json:"max_blast_radius"`
+	MaxBlastRadiusLevel string  `json:"max_blast_radius_level"`
+	TotalMonthlyCost    float64 `json:"total_monthly_cost"`
+	CostDelta           float64 `json:"cost_delta,omitempty"`
+	BudgetRemaining     float64 `json:"budget_remaining,omitempty"`
 }
 
 type ActionStatus int
@@ -1809,7 +1811,18 @@ func enrichPlanActions(p *resolver.Plan, cr *cost.CostReport, compReport *compli
 		}
 	}
 
+	// Blast radius scoring: must run after all RiskScores are set.
+	highestBlast := 0
+	for _, a := range p.Actions {
+		a.BlastRadius, a.BlastRadiusLevel = scoreBlastRadius(a, p.Actions)
+		if a.BlastRadius > highestBlast {
+			highestBlast = a.BlastRadius
+		}
+	}
+
 	summary.AggregateRisk = riskLevelFromScore(highestRisk)
+	summary.MaxBlastRadius = highestBlast
+	summary.MaxBlastRadiusLevel = riskLevelFromScore(highestBlast)
 	if cr != nil {
 		summary.TotalMonthlyCost = cr.TotalMonthlyCost
 		if cr.Budget != nil {
@@ -1865,6 +1878,73 @@ func riskLevelFromScore(score int) string {
 	default:
 		return "critical"
 	}
+}
+
+// scoreBlastRadius computes a dependency-weighted blast radius score (1-10)
+// for an action based on how many other actions depend on it, directly and
+// transitively, and whether any downstream action is a DELETE or targets a
+// STORE resource.
+func scoreBlastRadius(action *state.PlanAction, allActions []*state.PlanAction) (int, string) {
+	score := action.RiskScore
+
+	// Build a map of nodeID → list of actions that depend on it.
+	dependents := map[string][]*state.PlanAction{}
+	for _, a := range allActions {
+		for _, dep := range a.DependsOn {
+			dependents[dep] = append(dependents[dep], a)
+		}
+	}
+
+	// Collect all transitive dependents via BFS.
+	visited := map[string]bool{}
+	queue := []*state.PlanAction{}
+	for _, d := range dependents[action.NodeID] {
+		if !visited[d.NodeID] {
+			visited[d.NodeID] = true
+			queue = append(queue, d)
+		}
+	}
+	directCount := len(queue)
+
+	for i := 0; i < len(queue); i++ {
+		cur := queue[i]
+		for _, d := range dependents[cur.NodeID] {
+			if !visited[d.NodeID] {
+				visited[d.NodeID] = true
+				queue = append(queue, d)
+			}
+		}
+	}
+
+	// +1 for every 2 direct dependents, capped at +3.
+	depBonus := directCount / 2
+	if depBonus > 3 {
+		depBonus = 3
+	}
+	score += depBonus
+
+	// Check downstream actions for cascading risk factors.
+	hasDeleteDownstream := false
+	hasStoreDownstream := false
+	for _, d := range queue {
+		if d.Operation == "DELETE" {
+			hasDeleteDownstream = true
+		}
+		if strings.EqualFold(d.NodeType, "store") {
+			hasStoreDownstream = true
+		}
+	}
+	if hasDeleteDownstream {
+		score++
+	}
+	if hasStoreDownstream {
+		score++
+	}
+
+	if score > 10 {
+		score = 10
+	}
+	return score, riskLevelFromScore(score)
 }
 
 // rollbackFeasibility assesses whether an action can be safely undone.
