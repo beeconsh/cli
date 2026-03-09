@@ -260,7 +260,7 @@ func applyAzureBlobStorage(ctx context.Context, req ApplyRequest) (*ApplyResult,
 	switch req.Action.Operation {
 	case "CREATE":
 		_, err = container.Create(ctx, nil)
-		if err != nil && azureStatusCode(err) != 409 {
+		if err != nil && !isAzureConflict(err) {
 			return nil, fmt.Errorf("blob container create: %w", err)
 		}
 	case "UPDATE":
@@ -959,23 +959,32 @@ func isAzureNotFound(err error) bool {
 			return true
 		}
 		switch respErr.ErrorCode {
-		case "ResourceNotFound", "ResourceGroupNotFound":
+		case "ResourceNotFound", "ResourceGroupNotFound",
+			"ContainerNotFound", "SecretNotFound", "BlobNotFound",
+			"ParentResourceNotFound", "NotFound":
 			return true
 		}
 	}
-	// String matching fallback (covers unknown wrappers)
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "not found") || strings.Contains(s, "notfound") || strings.Contains(s, "does not exist")
+	return false
+}
+
+// isAzureConflict checks whether an Azure error indicates a 409 Conflict
+// (e.g., resource already exists on CREATE).
+func isAzureConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == 409
+	}
+	return false
 }
 
 // isAzureTransient checks whether an Azure error is transient and safe to retry.
 func isAzureTransient(err error) bool {
 	if err == nil {
 		return false
-	}
-	// Context-level timeouts and cancellations are transient
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
 	}
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) {
@@ -996,7 +1005,15 @@ func isAzureTransient(err error) bool {
 // withAzureRetry retries an Azure operation up to 3 times with exponential
 // backoff and jitter when isAzureTransient returns true. Non-transient errors
 // are returned immediately.
+// TODO: Wire into individual applyAzure*/observeAzure* API call sites to
+// provide retry resilience for Azure operations (mirrors GCP withGCPRetry usage).
 func withAzureRetry(ctx context.Context, op string, fn func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	const maxRetries = 3
 	baseDelay := 500 * time.Millisecond
 
