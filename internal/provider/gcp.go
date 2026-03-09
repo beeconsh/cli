@@ -2078,13 +2078,20 @@ func applyGCPCloudFunctions(ctx context.Context, req ApplyRequest) (*ApplyResult
 				TimeoutSeconds:  parseTimeoutSeconds(timeout),
 			},
 		}
-		_, err := svc.Projects.Locations.Functions.Patch(fullName, patch).Context(ctx).Do()
-		if err != nil {
+		if err := withGCPRetry(ctx, "cloud_functions_update", func() error {
+			_, err := svc.Projects.Locations.Functions.Patch(fullName, patch).Context(ctx).Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("cloud functions update: %w", err)
 		}
 	case "DELETE":
-		_, err := svc.Projects.Locations.Functions.Delete(fullName).Context(ctx).Do()
-		if err != nil && !isGCPNotFound(err) {
+		if err := withGCPRetry(ctx, "cloud_functions_delete", func() error {
+			_, err := svc.Projects.Locations.Functions.Delete(fullName).Context(ctx).Do()
+			if err != nil && !isGCPNotFound(err) {
+				return err
+			}
+			return nil
+		}); err != nil {
 			return nil, fmt.Errorf("cloud functions delete: %w", err)
 		}
 	}
@@ -2102,12 +2109,15 @@ func cloudFunctionsPostCreate(_ context.Context, _ *cloudfunctions.Service, _ st
 func observeGCPCloudFunctions(ctx context.Context, rec *state.ResourceRecord) (*ObserveResult, error) {
 	projectID := intentString(rec.IntentSnapshot, "intent.project_id")
 	region := defaultString(intentString(rec.IntentSnapshot, "intent.region"), "us-central1")
-	funcName := intentString(rec.IntentSnapshot, "intent.function_name")
-	if funcName == "" {
-		funcName = strings.TrimPrefix(identifierFor(rec.NodeName), "beecon-")
-	}
+	// Derive function name using the same logic as apply:
+	// 1. ProviderID (extract short name from full resource path)
+	// 2. Fallback to identifierFor(NodeName) with beecon- prefix stripping
+	var funcName string
 	if rec.ProviderID != "" && strings.Contains(rec.ProviderID, "/functions/") {
 		funcName = rec.ProviderID[strings.LastIndex(rec.ProviderID, "/")+1:]
+	}
+	if funcName == "" {
+		funcName = strings.TrimPrefix(identifierFor(rec.NodeName), "beecon-")
 	}
 	if projectID == "" {
 		return nil, fmt.Errorf("cloud_functions observe requires intent.project_id")
@@ -2262,13 +2272,20 @@ func applyGCPGKE(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
 			NodeCount: nodeCount,
 		}
 		defaultPoolName := fullName + "/nodePools/default-pool"
-		_, err := svc.Projects.Locations.Clusters.NodePools.SetSize(defaultPoolName, updateReq).Context(ctx).Do()
-		if err != nil {
+		if err := withGCPRetry(ctx, "gke_update_node_pool", func() error {
+			_, err := svc.Projects.Locations.Clusters.NodePools.SetSize(defaultPoolName, updateReq).Context(ctx).Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("gke update node pool size: %w", err)
 		}
 	case "DELETE":
-		_, err := svc.Projects.Locations.Clusters.Delete(fullName).Context(ctx).Do()
-		if err != nil && !isGCPNotFound(err) {
+		if err := withGCPRetry(ctx, "gke_delete_cluster", func() error {
+			_, err := svc.Projects.Locations.Clusters.Delete(fullName).Context(ctx).Do()
+			if err != nil && !isGCPNotFound(err) {
+				return err
+			}
+			return nil
+		}); err != nil {
 			return nil, fmt.Errorf("gke delete cluster: %w", err)
 		}
 	}
@@ -2278,12 +2295,15 @@ func applyGCPGKE(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
 func observeGCPGKE(ctx context.Context, rec *state.ResourceRecord) (*ObserveResult, error) {
 	projectID := intentString(rec.IntentSnapshot, "intent.project_id")
 	location := defaultString(intentString(rec.IntentSnapshot, "intent.region"), "us-central1")
-	clusterName := intentString(rec.IntentSnapshot, "intent.cluster_name")
-	if clusterName == "" {
-		clusterName = strings.TrimPrefix(identifierFor(rec.NodeName), "beecon-")
-	}
+	// Derive cluster name using the same logic as apply:
+	// 1. ProviderID (extract short name from full resource path)
+	// 2. Fallback to identifierFor(NodeName) with beecon- prefix stripping
+	var clusterName string
 	if rec.ProviderID != "" && strings.Contains(rec.ProviderID, "/clusters/") {
 		clusterName = rec.ProviderID[strings.LastIndex(rec.ProviderID, "/")+1:]
+	}
+	if clusterName == "" {
+		clusterName = strings.TrimPrefix(identifierFor(rec.NodeName), "beecon-")
 	}
 	if projectID == "" {
 		return nil, fmt.Errorf("gke observe requires intent.project_id")
