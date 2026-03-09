@@ -6,6 +6,7 @@ Beecon is a CLI and language for declaring infrastructure intent in `.beecon` fi
 
 ## Table of Contents
 - [Requirements](#requirements)
+- [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Typical Workflow](#typical-workflow)
 - [Key Concepts](#key-concepts)
@@ -18,6 +19,7 @@ Beecon is a CLI and language for declaring infrastructure intent in `.beecon` fi
 - [Cost Governance](#cost-governance)
 - [Testing](#testing)
 - [Provider Setup](#provider-setup)
+- [API Reference](#api-reference)
 - [Mission Control UI](#mission-control-ui)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
@@ -29,9 +31,26 @@ Beecon is a CLI and language for declaring infrastructure intent in `.beecon` fi
 - A valid `.beecon` file (default path: `infra.beecon`)
 - Cloud credentials only if you use provider connectivity or live execution
 
+## Installation
+
+### Homebrew (macOS/Linux)
+```bash
+brew install beeconsh/beecon/beecon
+```
+
+### From source
+```bash
+go build -o beecon ./cmd/beecon
+```
+
+### Verify
+```bash
+beecon version
+```
+
 ## Quick Start
 ```bash
-# build
+# build (if installed from source)
 go build -o beecon ./cmd/beecon
 
 # create a starter beacon
@@ -145,7 +164,7 @@ beecon status                    Show infrastructure status (--filter DRIFTED,MA
 
 ### Drift and monitoring
 ```
-beecon drift [path]              Detect configuration drift
+beecon drift [path]              Detect configuration drift (--plan to show reconciliation actions)
 beecon refresh [path]            Update live state snapshots without changing status
 beecon watch [path]              Continuous drift monitoring (--interval 5m)
 ```
@@ -169,11 +188,20 @@ beecon import <provider> <type> <id> [region]   Import existing cloud resource
 beecon connect <provider> [region]               Register cloud provider credentials
 ```
 
+### State backup and restore
+```
+beecon restore --list            List available state backups
+beecon restore <timestamp>       Restore state from a backup
+```
+
+State is automatically backed up to `.beecon/backups/` before each apply.
+
 ### Testing and observability
 ```
 beecon test <test-file> [path]   Run .beecon-test assertions against plan
 beecon performance <id> ...      Ingest performance breach event
 beecon serve [addr]              Start Mission Control UI + REST API (default :8080)
+beecon version                   Print version and commit hash
 ```
 
 ### Global flags
@@ -184,11 +212,26 @@ beecon serve [addr]              Start Mission Control UI + REST API (default :8
 ```
 
 ## Configuration
-- `BEECON_EXECUTE=1` — Enable live cloud mutation calls (default: dry-run simulation)
-- `BEECON_API_KEY=<key>` — Protect the HTTP API with Bearer token auth
-- `BEECON_PROFILE=<name>` — Set active profile via environment
+
+### Environment variables
+| Variable | Description |
+|----------|-------------|
+| `BEECON_EXECUTE=1` | Enable live cloud mutation calls (default: dry-run simulation) |
+| `BEECON_API_KEY=<key>` | Protect the HTTP API with Bearer token auth |
+| `BEECON_PROFILE=<name>` | Set active profile via environment |
+| `NO_COLOR=1` | Disable colored CLI output |
+
+### Cloud credentials
+| Provider | Required variables |
+|----------|--------------------|
+| AWS | Uses SDK v2 default chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, or IAM role) |
+| GCP | `GOOGLE_APPLICATION_CREDENTIALS=<path-to-service-account.json>` |
+| Azure | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET` (all three required) |
+
+### Files
 - `.beecon/config.yaml` — Project-level config (profile, etc.)
 - `.beecon/state.json` — Local state store (auto-managed, do not edit)
+- `.beecon/backups/` — Timestamped state backups (auto-managed)
 
 ## Profiles
 
@@ -300,6 +343,28 @@ Run with `beecon test assertions.beecon-test infra.beecon`.
 - Identity-scoped adapters: RBAC role assignment, Entra ID
 - ARM generic adapters: Container Apps, PostgreSQL Flexible, MySQL Flexible, Azure Cache Redis, Functions, API Management, Service Bus, Event Grid, Front Door, CDN, DNS, Monitor, AKS, VM
 
+## API Reference
+
+`beecon serve` exposes a REST API. All endpoints require `Authorization: Bearer <BEECON_API_KEY>` when the key is set.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/beacons` | GET, POST | Discover or register beacon files |
+| `/api/beacon/validate` | POST | Validate beacon syntax |
+| `/api/resolve` | POST | Generate execution plan (sensitive fields scrubbed) |
+| `/api/apply` | POST | Execute plan (`force` flag supported) |
+| `/api/graph` | GET | Resource graph with nodes, edges, and actions |
+| `/api/state` | GET | Full state snapshot (scrubbed) |
+| `/api/runs` | GET | Run execution history |
+| `/api/approvals` | GET | Pending approval requests |
+| `/api/approve` | POST | Approve pending actions |
+| `/api/reject` | POST | Reject pending actions |
+| `/api/audit` | GET | Audit events (filterable by resource) |
+| `/api/history` | GET | Resource event history |
+| `/api/drift` | POST | Detect drift (errors sanitized) |
+| `/api/connect` | POST | Register cloud provider |
+| `/api/performance` | GET, POST | Performance breach events |
+
 ## Mission Control UI
 
 `beecon serve` starts a web UI at `http://localhost:8080` with three panels:
@@ -335,7 +400,7 @@ The UI polls for updates every 5 seconds. When `BEECON_API_KEY` is set, the UI p
 
 ## Development
 ```bash
-go test ./...           # run tests (245 test functions)
+go test ./...           # run tests (369 test functions)
 go test -race ./...     # with race detection
 go vet ./...            # static analysis
 ```
