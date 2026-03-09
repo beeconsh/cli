@@ -130,6 +130,7 @@ func init() {
 		applyCmd,
 		statusCmd,
 		beaconsCmd,
+		diffCmd,
 		driftCmd,
 		approveCmd,
 		rejectCmd,
