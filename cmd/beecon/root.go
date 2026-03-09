@@ -71,7 +71,6 @@ var rootCmd = &cobra.Command{
 		}
 		eng = engine.New(cwd)
 		eng.ActiveProfile = profile
-		eng.Force = forceFlag
 		return nil
 	},
 }
