@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -935,6 +936,119 @@ store postgres {
 			if a.RollbackFeasibility != "safe" {
 				t.Errorf("CREATE store should be safe, got %s", a.RollbackFeasibility)
 			}
+		}
+	}
+}
+
+func TestScoreBlastRadius(t *testing.T) {
+	t.Run("standalone action uses risk score", func(t *testing.T) {
+		a := &state.PlanAction{NodeID: "a", RiskScore: 3}
+		score, level := scoreBlastRadius(a, []*state.PlanAction{a})
+		if score != 3 {
+			t.Errorf("expected 3, got %d", score)
+		}
+		if level != "medium" {
+			t.Errorf("expected medium, got %s", level)
+		}
+	})
+
+	t.Run("direct dependents add bonus", func(t *testing.T) {
+		parent := &state.PlanAction{NodeID: "parent", RiskScore: 2}
+		child1 := &state.PlanAction{NodeID: "c1", DependsOn: []string{"parent"}, RiskScore: 1}
+		child2 := &state.PlanAction{NodeID: "c2", DependsOn: []string{"parent"}, RiskScore: 1}
+		all := []*state.PlanAction{parent, child1, child2}
+		score, _ := scoreBlastRadius(parent, all)
+		// 2 base + 1 (2 deps / 2) = 3
+		if score != 3 {
+			t.Errorf("expected 3, got %d", score)
+		}
+	})
+
+	t.Run("DELETE downstream adds 1", func(t *testing.T) {
+		parent := &state.PlanAction{NodeID: "parent", RiskScore: 2}
+		child := &state.PlanAction{NodeID: "c", DependsOn: []string{"parent"}, Operation: "DELETE", RiskScore: 1}
+		all := []*state.PlanAction{parent, child}
+		score, _ := scoreBlastRadius(parent, all)
+		// 2 base + 0 (1 dep / 2 = 0) + 1 DELETE = 3
+		if score != 3 {
+			t.Errorf("expected 3, got %d", score)
+		}
+	})
+
+	t.Run("STORE downstream adds 1", func(t *testing.T) {
+		parent := &state.PlanAction{NodeID: "parent", RiskScore: 2}
+		child := &state.PlanAction{NodeID: "c", DependsOn: []string{"parent"}, NodeType: "store", Operation: "CREATE", RiskScore: 1}
+		all := []*state.PlanAction{parent, child}
+		score, _ := scoreBlastRadius(parent, all)
+		// 2 base + 0 + 1 STORE = 3
+		if score != 3 {
+			t.Errorf("expected 3, got %d", score)
+		}
+	})
+
+	t.Run("capped at 10", func(t *testing.T) {
+		parent := &state.PlanAction{NodeID: "parent", RiskScore: 8}
+		children := make([]*state.PlanAction, 10)
+		for i := range children {
+			children[i] = &state.PlanAction{
+				NodeID:    fmt.Sprintf("c%d", i),
+				DependsOn: []string{"parent"},
+				Operation: "DELETE",
+				NodeType:  "store",
+				RiskScore: 1,
+			}
+		}
+		all := append([]*state.PlanAction{parent}, children...)
+		score, level := scoreBlastRadius(parent, all)
+		if score != 10 {
+			t.Errorf("expected 10 (capped), got %d", score)
+		}
+		if level != "critical" {
+			t.Errorf("expected critical, got %s", level)
+		}
+	})
+
+	t.Run("transitive dependents counted in BFS", func(t *testing.T) {
+		a := &state.PlanAction{NodeID: "a", RiskScore: 2}
+		b := &state.PlanAction{NodeID: "b", DependsOn: []string{"a"}, RiskScore: 1}
+		c := &state.PlanAction{NodeID: "c", DependsOn: []string{"b"}, Operation: "DELETE", RiskScore: 1}
+		all := []*state.PlanAction{a, b, c}
+		score, _ := scoreBlastRadius(a, all)
+		// 2 base + 0 (1 direct dep / 2) + 1 DELETE downstream (transitive) = 3
+		if score != 3 {
+			t.Errorf("expected 3, got %d", score)
+		}
+	})
+}
+
+func TestPlanEnrichment_BlastRadius(t *testing.T) {
+	dir := t.TempDir()
+	beacon := writeBeacon(t, dir, `domain acme {
+  cloud = aws(region: us-east-1)
+  owner = team(platform)
+}
+store postgres {
+  engine = postgres
+}
+`)
+	ctx := context.Background()
+	e := New(dir)
+	res, err := e.Plan(ctx, beacon)
+	if err != nil {
+		t.Fatalf("plan failed: %v", err)
+	}
+	if res.Summary == nil {
+		t.Fatal("expected summary")
+	}
+	if res.Summary.MaxBlastRadiusLevel == "" {
+		t.Error("expected non-empty max blast radius level")
+	}
+	for _, a := range res.Plan.Actions {
+		if a.BlastRadius == 0 && a.RiskScore > 0 {
+			t.Errorf("action %s has risk score %d but blast radius 0", a.NodeID, a.RiskScore)
+		}
+		if a.BlastRadiusLevel == "" {
+			t.Errorf("action %s missing blast radius level", a.NodeID)
 		}
 	}
 }

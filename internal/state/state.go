@@ -88,6 +88,8 @@ type PlanAction struct {
 	EstimatedCost       float64 `json:"estimated_cost,omitempty"`
 	RiskScore           int     `json:"risk_score,omitempty"`
 	RiskLevel           string  `json:"risk_level,omitempty"`
+	BlastRadius         int     `json:"blast_radius,omitempty"`
+	BlastRadiusLevel    string  `json:"blast_radius_level,omitempty"`
 	RollbackFeasibility string  `json:"rollback_feasibility,omitempty"`
 	ComplianceMutations int     `json:"compliance_mutations,omitempty"`
 }
