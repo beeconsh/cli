@@ -16,6 +16,7 @@ import (
 	"github.com/terracotta-ai/beecon/internal/cli"
 	"github.com/terracotta-ai/beecon/internal/cost"
 	"github.com/terracotta-ai/beecon/internal/engine"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/scaffold"
 	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
@@ -453,7 +454,7 @@ var driftCmd = &cobra.Command{
 		}
 
 		for _, e := range observeErrors {
-			fmt.Fprintln(os.Stderr, "warning:", e)
+			logging.Logger.Warn("drift observe warning", "error", e)
 		}
 		out.Blank()
 		if len(drifted) == 0 {
@@ -652,7 +653,7 @@ var refreshCmd = &cobra.Command{
 			}{refreshed, errStrs})
 		}
 		for _, e := range observeErrors {
-			fmt.Fprintln(os.Stderr, "warning:", e)
+			logging.Logger.Warn("refresh observe warning", "error", e)
 		}
 		out.Blank()
 		out.Line(out.Green(out.OK()), "Refreshed %d resource(s)", refreshed)
@@ -818,10 +819,12 @@ var watchCmd = &cobra.Command{
 		runCheck := func() {
 			drifted, observeErrors, err := eng.Drift(cmd.Context(), path)
 			if err != nil {
+				logging.Logger.Warn("drift check failed", "error", err)
 				fmt.Fprintf(os.Stderr, "  %s drift check failed: %v\n", out.Red(out.Fail()), err)
 				return
 			}
 			for _, e := range observeErrors {
+				logging.Logger.Warn("watch warning", "error", e)
 				fmt.Fprintln(os.Stderr, "  warning:", e)
 			}
 			ts := time.Now().Format("15:04:05")
@@ -932,6 +935,7 @@ var serveCmd = &cobra.Command{
 		}
 		apiKey := os.Getenv("BEECON_API_KEY")
 		if apiKey == "" {
+			logging.Logger.Warn("BEECON_API_KEY not set; unauthenticated access allowed")
 			fmt.Fprintln(os.Stderr, "WARNING: BEECON_API_KEY not set — API endpoints are unauthenticated")
 		}
 

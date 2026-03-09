@@ -41,8 +41,36 @@ See `docs/ROADMAP.md` for full Phase 4-7 details.
 - [ ] Structured error recovery guidance
 - [ ] Self-healing drift (`drift --reconcile`)
 
-### Phase 5: Multi-Cloud Parity
-- [ ] GCP resource-specific adapter depth
+### Phase 5: Multi-Cloud Parity — GCP to AWS Parity
+
+#### G1: Wiring Layer (highest leverage)
+- [ ] `gcpIAMActionsFor()` — IAM role inference for GCP dependency pairs
+- [ ] `gcpInferEnvVars()` — auto-inject Cloud SQL connection strings, Secret Manager names, Pub/Sub topics
+- [ ] `gcpInferFirewallRules()` — firewall rules from IR graph edges
+- [ ] Cloud Monitoring alarms (post-apply `alarm_on` for Cloud Run, Cloud SQL, Memorystore, Compute)
+- [ ] Cloud Logging retention (post-apply `log_retention` for Cloud Run, Cloud Functions)
+
+#### G2: Stub Promotion (7 generic → resource-specific)
+- [ ] Cloud Functions (Lambda equivalent)
+- [ ] GKE (EKS equivalent)
+- [ ] Cloud CDN (CloudFront equivalent)
+- [ ] Eventarc (EventBridge equivalent)
+- [ ] API Gateway (API Gateway v2 equivalent)
+- [ ] Identity Platform (Cognito equivalent)
+- [ ] Cloud Monitoring standalone alarms (CloudWatch equivalent)
+
+#### G3: Resilience
+- [ ] Multi-step partial results for Cloud Run
+- [ ] GCP error classification (gRPC codes.NotFound, googleapi 404)
+- [ ] Operation waiters (Cloud SQL, GKE creation)
+- [ ] withRetry for transient GCP errors
+
+#### G4: Observation Depth
+- [ ] Deepen Cloud Run, Cloud SQL, Memorystore observation
+- [ ] Deepen remaining 9 resource types
+- [ ] Add observation for promoted stubs
+
+#### Azure & General
 - [ ] Azure resource-specific adapter depth
 - [ ] Provider capability matrix command
 

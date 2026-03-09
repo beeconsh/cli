@@ -49,6 +49,7 @@ import (
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	smithy "github.com/aws/smithy-go"
 	"github.com/terracotta-ai/beecon/internal/classify"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
@@ -169,6 +170,8 @@ func (e *DefaultExecutor) applyAWS(ctx context.Context, req ApplyRequest) (*Appl
 		return nil, fmt.Errorf("aws config: %w", err)
 	}
 
+	logging.Logger.Debug("aws:apply", "target", target, "operation", req.Action.Operation, "node", req.Action.NodeName)
+
 	var result *ApplyResult
 	var applyErr error
 
@@ -239,6 +242,7 @@ func (e *DefaultExecutor) applyAWS(ctx context.Context, req ApplyRequest) (*Appl
 				if err := setLogRetention(ctx, logsClient, logGroup, days); err != nil {
 					// Log group may not exist yet (auto-created on first invocation).
 					// Store the intent; don't fail the apply.
+					logging.Logger.Warn("aws:log_retention:pending", "target", target, "log_group", logGroup)
 					result.LiveState["log_retention_pending"] = retRaw
 				} else {
 					result.LiveState["log_retention_days"] = logRetentionDays(days)
@@ -270,6 +274,7 @@ func (e *DefaultExecutor) applyAWS(ctx context.Context, req ApplyRequest) (*Appl
 			}); err != nil {
 				// Don't fail the main resource apply for an alarm failure.
 				// Sanitize error to avoid leaking AWS internals (account IDs, ARNs).
+				logging.Logger.Warn("aws:alarm:failed", "target", target, "node", req.Action.NodeName)
 				result.LiveState["alarm_error"] = "failed to create alarm"
 			} else {
 				result.LiveState["alarm_name"] = alarmName
@@ -277,6 +282,7 @@ func (e *DefaultExecutor) applyAWS(ctx context.Context, req ApplyRequest) (*Appl
 		}
 	}
 
+	logging.Logger.Debug("aws:apply:complete", "target", target, "provider_id", result.ProviderID)
 	return result, nil
 }
 
@@ -1689,6 +1695,7 @@ func (e *DefaultExecutor) observeAWS(ctx context.Context, region string, rec *st
 		return &ObserveResult{Exists: false, LiveState: map[string]interface{}{}}, nil
 	}
 	target := detectRecordTarget(rec)
+	logging.Logger.Debug("aws:observe", "target", target, "provider_id", rec.ProviderID)
 	switch target {
 	case "rds":
 		id := defaultString(rec.ProviderID, identifierFor(rec.NodeName))

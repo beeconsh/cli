@@ -10,7 +10,7 @@ import (
 func ClassifyNode(nodeType string, intent map[string]string) string {
 	nodeType = strings.ToUpper(nodeType)
 	engine := engineField(intent)
-	expose := strings.ToLower(fieldVal(intent, "expose"))
+	expose := strings.ToLower(FieldVal(intent, "expose"))
 
 	if nodeType == "STORE" {
 		switch {
@@ -129,9 +129,131 @@ func engineField(intent map[string]string) string {
 	return ""
 }
 
-func fieldVal(intent map[string]string, key string) string {
+// FieldVal returns the value for a key in an intent map, or "" if absent.
+func FieldVal(intent map[string]string, key string) string {
 	if v, ok := intent[key]; ok {
 		return v
 	}
 	return ""
+}
+
+// ClassifyGCPNode determines the GCP target resource type from a node's type
+// and intent fields. This is the GCP counterpart of ClassifyNode.
+func ClassifyGCPNode(nodeType string, intent map[string]string) string {
+	nodeType = strings.ToUpper(nodeType)
+	engine := engineField(intent)
+
+	if nodeType == "STORE" {
+		switch {
+		case strings.Contains(engine, "postgres"),
+			strings.Contains(engine, "mysql"),
+			strings.Contains(engine, "cloudsql"):
+			return "cloud_sql"
+		case strings.Contains(engine, "redis"):
+			return "memorystore_redis"
+		case strings.Contains(engine, "s3"),
+			strings.Contains(engine, "bucket"),
+			strings.Contains(engine, "gcs"):
+			return "gcs"
+		case strings.Contains(engine, "sqs"),
+			strings.Contains(engine, "pubsub"):
+			return "pubsub"
+		case strings.Contains(engine, "sns"):
+			return "pubsub"
+		case strings.Contains(engine, "secret"):
+			return "secret_manager"
+		}
+	}
+	if nodeType == "NETWORK" {
+		switch {
+		case strings.Contains(engine, "vpc"):
+			return "vpc"
+		case strings.Contains(engine, "subnet"):
+			return "subnet"
+		case strings.Contains(engine, "firewall"),
+			strings.Contains(engine, "security_group"),
+			strings.Contains(engine, "sg"):
+			return "firewall"
+		case strings.Contains(engine, "dns"),
+			strings.Contains(engine, "route53"),
+			strings.Contains(engine, "cloud_dns"):
+			return "cloud_dns"
+		case strings.Contains(engine, "cdn"),
+			strings.Contains(engine, "cloudfront"):
+			return "cloud_cdn"
+		}
+	}
+	if nodeType == "SERVICE" {
+		switch {
+		case strings.Contains(engine, "lambda"),
+			strings.Contains(engine, "cloud_functions"),
+			strings.Contains(engine, "function"):
+			return "cloud_functions"
+		case strings.Contains(engine, "container"):
+			return "cloud_run"
+		case strings.Contains(engine, "eks"),
+			strings.Contains(engine, "gke"),
+			strings.Contains(engine, "kubernetes"):
+			return "gke"
+		case strings.Contains(engine, "ec2"),
+			strings.Contains(engine, "compute"):
+			return "compute_engine"
+		case strings.Contains(engine, "cognito"),
+			strings.Contains(engine, "identity"):
+			return "identity_platform"
+		}
+	}
+	if nodeType == "COMPUTE" {
+		switch {
+		case strings.Contains(engine, "lambda"),
+			strings.Contains(engine, "function"):
+			return "cloud_functions"
+		case strings.Contains(engine, "eventbridge"),
+			strings.Contains(engine, "eventarc"):
+			return "eventarc"
+		case strings.Contains(engine, "cloudwatch"),
+			strings.Contains(engine, "monitoring"):
+			return "cloud_monitoring"
+		case strings.Contains(engine, "ec2"),
+			strings.Contains(engine, "compute"):
+			return "compute_engine"
+		}
+	}
+	return ""
+}
+
+// IsGCPVPCResident returns true if the GCP target is typically deployed inside a VPC.
+// Note: Cloud Run uses VPC connectors rather than traditional VPC firewall rules,
+// so it is NOT included here.
+func IsGCPVPCResident(target string) bool {
+	switch target {
+	case "cloud_sql", "memorystore_redis", "gke", "compute_engine":
+		return true
+	}
+	return false
+}
+
+// GCPDefaultPort returns the default port for a VPC-resident GCP resource type.
+func GCPDefaultPort(target string) int {
+	switch target {
+	case "cloud_sql":
+		return 5432 // default to postgres
+	case "memorystore_redis":
+		return 6379
+	}
+	return 0
+}
+
+// GCPDefaultPortForEngine returns the port for a specific database engine on GCP.
+func GCPDefaultPortForEngine(engine string) int {
+	engine = strings.ToLower(engine)
+	switch {
+	case strings.Contains(engine, "mysql"):
+		return 3306
+	case strings.Contains(engine, "postgres"):
+		return 5432
+	case strings.Contains(engine, "redis"):
+		return 6379
+	}
+	return 0
 }

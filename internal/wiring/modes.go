@@ -119,3 +119,78 @@ var iamActionMatrix = map[string][]string{
 	"elasticache:write":      {"elasticache:DescribeCacheClusters"},
 	"elasticache:read_write":  {"elasticache:DescribeCacheClusters"},
 }
+
+// GCPValidModes defines which modes are valid for each GCP target type.
+var GCPValidModes = map[string][]Mode{
+	"cloud_sql":         {ModeRead, ModeWrite, ModeReadWrite, ModeAdmin},
+	"memorystore_redis": {ModeRead, ModeWrite, ModeReadWrite},
+	"gcs":               {ModeRead, ModeWrite, ModeReadWrite, ModeAdmin},
+	"pubsub":            {ModeRead, ModeWrite, ModeReadWrite, ModePublish, ModeSubscribe},
+	"secret_manager":    {ModeRead, ModeWrite, ModeReadWrite},
+	"cloud_functions":   {ModeInvoke, ModeAdmin},
+	"cloud_run":         {ModeInvoke},
+	"gke":               {ModeInvoke},
+}
+
+// IsValidGCPMode checks whether a mode is valid for a given GCP target.
+// Unknown target types are allowed (returns true) to support dependency
+// declarations on targets not yet in the GCPValidModes registry.
+func IsValidGCPMode(target string, mode Mode) bool {
+	if target == "" {
+		return true // unclassified nodes skip mode validation
+	}
+	valid, ok := GCPValidModes[target]
+	if !ok {
+		return true // unknown targets: allow to avoid blocking valid needs declarations
+	}
+	for _, v := range valid {
+		if v == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// GCPIAMRolesFor returns the GCP IAM roles required for a given target+mode combination.
+func GCPIAMRolesFor(target string, mode Mode) ([]string, error) {
+	key := target + ":" + string(mode)
+	roles, ok := gcpIAMRoleMatrix[key]
+	if !ok {
+		return nil, fmt.Errorf("no GCP IAM roles defined for %s with mode %s", target, mode)
+	}
+	return roles, nil
+}
+
+var gcpIAMRoleMatrix = map[string][]string{
+	// Cloud SQL
+	"cloud_sql:read":       {"roles/cloudsql.viewer"},
+	"cloud_sql:write":      {"roles/cloudsql.client"},
+	"cloud_sql:read_write": {"roles/cloudsql.client"},
+	"cloud_sql:admin":      {"roles/cloudsql.admin"},
+	// GCS
+	"gcs:read":       {"roles/storage.objectViewer"},
+	"gcs:write":      {"roles/storage.objectCreator"},
+	"gcs:read_write": {"roles/storage.objectUser"},
+	"gcs:admin":      {"roles/storage.admin"},
+	// Pub/Sub
+	"pubsub:read":       {"roles/pubsub.subscriber"},
+	"pubsub:write":      {"roles/pubsub.publisher"},
+	"pubsub:read_write": {"roles/pubsub.editor"},
+	"pubsub:publish":    {"roles/pubsub.publisher"},
+	"pubsub:subscribe":  {"roles/pubsub.subscriber"},
+	// Secret Manager
+	"secret_manager:read":       {"roles/secretmanager.secretAccessor"},
+	"secret_manager:write":      {"roles/secretmanager.secretVersionManager"},
+	"secret_manager:read_write": {"roles/secretmanager.secretAccessor", "roles/secretmanager.secretVersionManager"},
+	// Memorystore Redis
+	"memorystore_redis:read":       {"roles/redis.viewer"},
+	"memorystore_redis:write":      {"roles/redis.editor"},
+	"memorystore_redis:read_write": {"roles/redis.editor"},
+	// Cloud Functions
+	"cloud_functions:invoke": {"roles/cloudfunctions.invoker"},
+	"cloud_functions:admin":  {"roles/cloudfunctions.admin"},
+	// Cloud Run
+	"cloud_run:invoke": {"roles/run.invoker"},
+	// GKE
+	"gke:invoke": {"roles/container.developer"},
+}

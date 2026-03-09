@@ -13,6 +13,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/terracotta-ai/beecon/internal/engine"
+	"github.com/terracotta-ai/beecon/internal/logging"
 	"github.com/terracotta-ai/beecon/internal/security"
 	"github.com/terracotta-ai/beecon/internal/state"
 )
@@ -187,14 +188,17 @@ func toolConnectProvider() mcp.Tool {
 func (s *Server) handleValidateBeacon(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	beaconFile, _ := args["beacon_file"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "validate_beacon", "beacon_file", beaconFile)
 	if beaconFile == "" {
 		return mcp.NewToolResultError("beacon_file is required"), nil
 	}
 	if err := security.SafePath(s.eng.Root(), beaconFile); err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "validate_beacon", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("invalid beacon_file: %s", err)), nil
 	}
 
 	if err := s.eng.Validate(beaconFile); err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "validate_beacon", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("validation failed: %s", err)), nil
 	}
 
@@ -207,10 +211,12 @@ func (s *Server) handleValidateBeacon(ctx context.Context, req mcp.CallToolReque
 func (s *Server) handlePlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	beaconFile, _ := args["beacon_file"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "plan", "beacon_file", beaconFile)
 	if beaconFile == "" {
 		return mcp.NewToolResultError("beacon_file is required"), nil
 	}
 	if err := security.SafePath(s.eng.Root(), beaconFile); err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "plan", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("invalid beacon_file: %s", err)), nil
 	}
 
@@ -222,6 +228,7 @@ func (s *Server) handlePlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	s.mu.Unlock()
 
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "plan", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("plan failed: %s", err)), nil
 	}
 
@@ -229,8 +236,10 @@ func (s *Server) handlePlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 }
 
 func (s *Server) handleShowStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	logging.Logger.Debug("mcp:tool", "name", "show_status")
 	st, err := s.eng.Status(ctx)
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "show_status", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("status failed: %s", err)), nil
 	}
 
@@ -253,15 +262,18 @@ func (s *Server) handleShowStatus(ctx context.Context, req mcp.CallToolRequest) 
 func (s *Server) handleDetectDrift(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	beaconFile, _ := args["beacon_file"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "detect_drift", "beacon_file", beaconFile)
 	if beaconFile == "" {
 		return mcp.NewToolResultError("beacon_file is required"), nil
 	}
 	if err := security.SafePath(s.eng.Root(), beaconFile); err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "detect_drift", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("invalid beacon_file: %s", err)), nil
 	}
 
 	drifted, errs, err := s.eng.Drift(ctx, beaconFile)
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "detect_drift", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("drift detection failed: %s", err)), nil
 	}
 
@@ -282,8 +294,10 @@ func (s *Server) handleDetectDrift(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (s *Server) handleListRuns(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	logging.Logger.Debug("mcp:tool", "name", "list_runs")
 	runs, err := s.eng.Runs(ctx)
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "list_runs", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("list runs failed: %s", err)), nil
 	}
 	for _, r := range runs {
@@ -294,8 +308,10 @@ func (s *Server) handleListRuns(ctx context.Context, req mcp.CallToolRequest) (*
 }
 
 func (s *Server) handleListApprovals(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	logging.Logger.Debug("mcp:tool", "name", "list_approvals")
 	approvals, err := s.eng.Approvals(ctx)
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "list_approvals", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("list approvals failed: %s", err)), nil
 	}
 	for _, a := range approvals {
@@ -308,12 +324,14 @@ func (s *Server) handleListApprovals(ctx context.Context, req mcp.CallToolReques
 func (s *Server) handleGetHistory(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	resourceID, _ := args["resource_id"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "get_history", "resource_id", resourceID)
 	if resourceID == "" {
 		return mcp.NewToolResultError("resource_id is required"), nil
 	}
 
 	events, err := s.eng.History(ctx, resourceID)
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "get_history", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("history failed: %s", err)), nil
 	}
 	scrubAuditEvents(events)
@@ -325,8 +343,10 @@ func (s *Server) handleGetHistory(ctx context.Context, req mcp.CallToolRequest) 
 }
 
 func (s *Server) handleDiscoverBeacons(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	logging.Logger.Debug("mcp:tool", "name", "discover_beacons")
 	beacons, err := s.eng.DiscoverBeacons()
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "discover_beacons", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("discover failed: %s", err)), nil
 	}
 
@@ -336,10 +356,12 @@ func (s *Server) handleDiscoverBeacons(ctx context.Context, req mcp.CallToolRequ
 func (s *Server) handleApply(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	beaconFile, _ := args["beacon_file"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "apply", "beacon_file", beaconFile)
 	if beaconFile == "" {
 		return mcp.NewToolResultError("beacon_file is required"), nil
 	}
 	if err := security.SafePath(s.eng.Root(), beaconFile); err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "apply", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("invalid beacon_file: %s", err)), nil
 	}
 
@@ -356,6 +378,7 @@ func (s *Server) handleApply(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	s.mu.Unlock()
 
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "apply", "error", err)
 		// Return partial result if available (orphaned resource recovery).
 		if res != nil {
 			scrubApplyResult(res)
@@ -374,6 +397,7 @@ func (s *Server) handleApply(ctx context.Context, req mcp.CallToolRequest) (*mcp
 func (s *Server) handleApprove(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	requestID, _ := args["request_id"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "approve", "request_id", requestID)
 	if requestID == "" {
 		return mcp.NewToolResultError("request_id is required"), nil
 	}
@@ -384,6 +408,7 @@ func (s *Server) handleApprove(ctx context.Context, req mcp.CallToolRequest) (*m
 
 	res, err := s.eng.Approve(ctx, requestID, approver)
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "approve", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("approve failed: %s", err)), nil
 	}
 
@@ -394,6 +419,7 @@ func (s *Server) handleApprove(ctx context.Context, req mcp.CallToolRequest) (*m
 func (s *Server) handleReject(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	requestID, _ := args["request_id"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "reject", "request_id", requestID)
 	if requestID == "" {
 		return mcp.NewToolResultError("request_id is required"), nil
 	}
@@ -407,6 +433,7 @@ func (s *Server) handleReject(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}
 
 	if err := s.eng.Reject(ctx, requestID, approver, reason); err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "reject", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("reject failed: %s", err)), nil
 	}
 
@@ -420,12 +447,14 @@ func (s *Server) handleReject(ctx context.Context, req mcp.CallToolRequest) (*mc
 func (s *Server) handleRollback(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	runID, _ := args["run_id"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "rollback", "run_id", runID)
 	if runID == "" {
 		return mcp.NewToolResultError("run_id is required"), nil
 	}
 
 	rollbackRunID, err := s.eng.Rollback(ctx, runID)
 	if err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "rollback", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("rollback failed: %s", err)), nil
 	}
 
@@ -438,12 +467,14 @@ func (s *Server) handleRollback(ctx context.Context, req mcp.CallToolRequest) (*
 func (s *Server) handleConnectProvider(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	prov, _ := args["provider"].(string)
+	logging.Logger.Debug("mcp:tool", "name", "connect_provider", "provider", prov)
 	if prov == "" {
 		return mcp.NewToolResultError("provider is required"), nil
 	}
 	region, _ := args["region"].(string)
 
 	if err := s.eng.Connect(ctx, prov, region); err != nil {
+		logging.Logger.Warn("mcp:tool:error", "name", "connect_provider", "error", err)
 		return mcp.NewToolResultError(fmt.Sprintf("connect failed: %s", err)), nil
 	}
 
