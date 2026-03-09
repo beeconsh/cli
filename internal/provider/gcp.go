@@ -2,10 +2,13 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/pubsub"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
@@ -17,13 +20,14 @@ import (
 	"google.golang.org/api/cloudresourcemanager/v1"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/dns/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iam/v1"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/api/option"
 	"google.golang.org/api/redis/v1"
 	"google.golang.org/api/run/v2"
 	"google.golang.org/api/sqladmin/v1beta4"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // GCPSupportMatrix lists planned GCP targets by tier.
@@ -311,7 +315,7 @@ func applyGCPGCS(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
 		}
 	case "DELETE":
 		err = h.Delete(ctx)
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("gcs delete bucket: %w", err)
 		}
 	}
@@ -330,7 +334,7 @@ func observeGCPGCS(ctx context.Context, rec *state.ResourceRecord) (*ObserveResu
 	defer client.Close()
 	attrs, err := client.Bucket(bucketName).Attrs(ctx)
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: bucketName, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("gcs bucket attrs: %w", err)
@@ -367,7 +371,10 @@ func applyGCPCloudSQL(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 				Tier: tier,
 			},
 		}
-		if _, err := svc.Instances.Insert(projectID, inst).Context(ctx).Do(); err != nil {
+		if err := withGCPRetry(ctx, "cloud_sql_create", func() error {
+			_, err := svc.Instances.Insert(projectID, inst).Context(ctx).Do()
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("cloud sql create instance: %w", err)
 		}
 	case "UPDATE":
@@ -376,7 +383,7 @@ func applyGCPCloudSQL(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 			return nil, fmt.Errorf("cloud sql patch instance: %w", err)
 		}
 	case "DELETE":
-		if _, err := svc.Instances.Delete(projectID, instance).Context(ctx).Do(); err != nil && !isNotFound(err) {
+		if _, err := svc.Instances.Delete(projectID, instance).Context(ctx).Do(); err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("cloud sql delete instance: %w", err)
 		}
 	}
@@ -395,7 +402,7 @@ func observeGCPCloudSQL(ctx context.Context, rec *state.ResourceRecord) (*Observ
 	}
 	out, err := svc.Instances.Get(projectID, instance).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: instance, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("cloud sql get instance: %w", err)
@@ -620,7 +627,7 @@ func applyGCPVPC(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
 		}
 	case "DELETE":
 		_, err := svc.Networks.Delete(projectID, name).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("gcp vpc delete: %w", err)
 		}
 	}
@@ -645,7 +652,7 @@ func observeGCPVPC(ctx context.Context, rec *state.ResourceRecord) (*ObserveResu
 	}
 	out, err := svc.Networks.Get(projectID, name).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("gcp vpc get: %w", err)
@@ -692,7 +699,7 @@ func applyGCPSubnet(ctx context.Context, req ApplyRequest) (*ApplyResult, error)
 		}
 	case "DELETE":
 		_, err := svc.Subnetworks.Delete(projectID, region, name).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("gcp subnet delete: %w", err)
 		}
 	}
@@ -718,7 +725,7 @@ func observeGCPSubnet(ctx context.Context, rec *state.ResourceRecord) (*ObserveR
 	}
 	out, err := svc.Subnetworks.Get(projectID, region, name).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("gcp subnet get: %w", err)
@@ -761,7 +768,7 @@ func applyGCPFirewall(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 		}
 	case "DELETE":
 		_, err := svc.Firewalls.Delete(projectID, name).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("gcp firewall delete: %w", err)
 		}
 	}
@@ -786,7 +793,7 @@ func observeGCPFirewall(ctx context.Context, rec *state.ResourceRecord) (*Observ
 	}
 	out, err := svc.Firewalls.Get(projectID, name).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("gcp firewall get: %w", err)
@@ -827,24 +834,7 @@ func applyGCPCloudRun(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 			},
 		},
 	}
-	switch req.Action.Operation {
-	case "CREATE":
-		_, err := svc.Projects.Locations.Services.Create(parent, resource).ServiceId(serviceName).Context(ctx).Do()
-		if err != nil && !isAlreadyExists(err) {
-			return nil, fmt.Errorf("cloud run create service: %w", err)
-		}
-	case "UPDATE":
-		_, err := svc.Projects.Locations.Services.Patch(fullName, resource).Context(ctx).Do()
-		if err != nil {
-			return nil, fmt.Errorf("cloud run patch service: %w", err)
-		}
-	case "DELETE":
-		_, err := svc.Projects.Locations.Services.Delete(fullName).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
-			return nil, fmt.Errorf("cloud run delete service: %w", err)
-		}
-	}
-	return &ApplyResult{
+	result := &ApplyResult{
 		ProviderID: fullName,
 		LiveState: map[string]interface{}{
 			"provider":  "gcp",
@@ -855,7 +845,45 @@ func applyGCPCloudRun(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 			"image":     image,
 			"operation": req.Action.Operation,
 		},
-	}, nil
+	}
+
+	switch req.Action.Operation {
+	case "CREATE":
+		if err := withGCPRetry(ctx, "cloud_run_create", func() error {
+			_, err := svc.Projects.Locations.Services.Create(parent, resource).ServiceId(serviceName).Context(ctx).Do()
+			if err != nil && isAlreadyExists(err) {
+				return nil // treat already-exists as success
+			}
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("cloud run create service: %w", err)
+		}
+		// Step 2: post-create configuration (e.g., IAM policy for public access).
+		// When implemented, failures here return the partial result so state
+		// can track the already-created service.
+		if postErr := cloudRunPostCreate(ctx, svc, fullName, req); postErr != nil {
+			return result, fmt.Errorf("cloud run post-create: %w", postErr)
+		}
+	case "UPDATE":
+		_, err := svc.Projects.Locations.Services.Patch(fullName, resource).Context(ctx).Do()
+		if err != nil {
+			return nil, fmt.Errorf("cloud run patch service: %w", err)
+		}
+	case "DELETE":
+		_, err := svc.Projects.Locations.Services.Delete(fullName).Context(ctx).Do()
+		if err != nil && !isGCPNotFound(err) {
+			return nil, fmt.Errorf("cloud run delete service: %w", err)
+		}
+	}
+	return result, nil
+}
+
+// cloudRunPostCreate performs post-creation steps for a Cloud Run service.
+// Currently a no-op placeholder for future IAM policy and traffic configuration.
+// Returns nil on success; callers should return a partial ApplyResult on error.
+func cloudRunPostCreate(_ context.Context, _ *run.Service, _ string, _ ApplyRequest) error {
+	// TODO: set IAM policy for public access when intent.allow_unauthenticated is set
+	return nil
 }
 
 func observeGCPCloudRun(ctx context.Context, rec *state.ResourceRecord) (*ObserveResult, error) {
@@ -878,7 +906,7 @@ func observeGCPCloudRun(ctx context.Context, rec *state.ResourceRecord) (*Observ
 	}
 	out, err := svc.Projects.Locations.Services.Get(fullName).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: fullName, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("cloud run get service: %w", err)
@@ -927,8 +955,13 @@ func applyGCPMemorystoreRedis(ctx context.Context, req ApplyRequest) (*ApplyResu
 	}
 	switch req.Action.Operation {
 	case "CREATE":
-		_, err := svc.Projects.Locations.Instances.Create(parent, resource).InstanceId(instanceID).Context(ctx).Do()
-		if err != nil && !isAlreadyExists(err) {
+		if err := withGCPRetry(ctx, "memorystore_redis_create", func() error {
+			_, err := svc.Projects.Locations.Instances.Create(parent, resource).InstanceId(instanceID).Context(ctx).Do()
+			if err != nil && isAlreadyExists(err) {
+				return nil
+			}
+			return err
+		}); err != nil {
 			return nil, fmt.Errorf("memorystore redis create: %w", err)
 		}
 	case "UPDATE":
@@ -938,7 +971,7 @@ func applyGCPMemorystoreRedis(ctx context.Context, req ApplyRequest) (*ApplyResu
 		}
 	case "DELETE":
 		_, err := svc.Projects.Locations.Instances.Delete(fullName).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("memorystore redis delete: %w", err)
 		}
 	}
@@ -977,7 +1010,7 @@ func observeGCPMemorystoreRedis(ctx context.Context, rec *state.ResourceRecord) 
 	}
 	out, err := svc.Projects.Locations.Instances.Get(fullName).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: fullName, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("memorystore redis get: %w", err)
@@ -1026,7 +1059,7 @@ func applyGCPIAM(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
 		}
 	case "DELETE":
 		_, err := svc.Projects.ServiceAccounts.Delete(name).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("gcp iam delete service account: %w", err)
 		}
 	}
@@ -1063,7 +1096,7 @@ func observeGCPIAM(ctx context.Context, rec *state.ResourceRecord) (*ObserveResu
 	}
 	out, err := svc.Projects.ServiceAccounts.Get(name).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: name, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("gcp iam get service account: %w", err)
@@ -1118,7 +1151,7 @@ func applyGCPComputeEngine(ctx context.Context, req ApplyRequest) (*ApplyResult,
 		}
 	case "DELETE":
 		_, err := svc.Instances.Delete(projectID, zone, instance).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("compute engine delete instance: %w", err)
 		}
 	}
@@ -1144,7 +1177,7 @@ func observeGCPComputeEngine(ctx context.Context, rec *state.ResourceRecord) (*O
 	}
 	out, err := svc.Instances.Get(projectID, zone, instance).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: instance, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("compute engine get instance: %w", err)
@@ -1185,7 +1218,7 @@ func applyGCPCloudDNS(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 		}
 	case "DELETE":
 		err := svc.ManagedZones.Delete(projectID, zoneName).Context(ctx).Do()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("cloud dns delete zone: %w", err)
 		}
 	}
@@ -1210,7 +1243,7 @@ func observeGCPCloudDNS(ctx context.Context, rec *state.ResourceRecord) (*Observ
 	}
 	out, err := svc.ManagedZones.Get(projectID, zoneName).Context(ctx).Do()
 	if err != nil {
-		if isNotFound(err) {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: zoneName, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("cloud dns get zone: %w", err)
@@ -1668,6 +1701,89 @@ func isAlreadyExists(err error) bool {
 	}
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "already exists") || strings.Contains(s, "alreadyexist")
+}
+
+// isGCPNotFound checks whether a GCP error indicates a resource was not found.
+// It checks gRPC status codes, googleapi HTTP errors, GCS-specific sentinel errors,
+// and falls back to string matching.
+func isGCPNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	// gRPC status code check
+	if status.Code(err) == codes.NotFound {
+		return true
+	}
+	// googleapi HTTP error check (used by REST-based GCP clients)
+	var gErr *googleapi.Error
+	if errors.As(err, &gErr) && gErr.Code == 404 {
+		return true
+	}
+	// GCS storage sentinel errors
+	if errors.Is(err, storage.ErrBucketNotExist) || errors.Is(err, storage.ErrObjectNotExist) {
+		return true
+	}
+	// String matching fallback (fragile, but covers unknown wrappers)
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not found") || strings.Contains(s, "notfound") || strings.Contains(s, "does not exist")
+}
+
+// isGCPTransient checks whether a GCP error is transient and safe to retry.
+func isGCPTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	// gRPC transient status codes
+	switch status.Code(err) {
+	case codes.Unavailable, codes.ResourceExhausted, codes.DeadlineExceeded, codes.Aborted:
+		return true
+	}
+	// googleapi HTTP transient error codes
+	var gErr *googleapi.Error
+	if errors.As(err, &gErr) {
+		switch gErr.Code {
+		case 429, 500, 502, 503, 504:
+			return true
+		}
+	}
+	// String matching fallback
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "temporarily unavailable") || strings.Contains(s, "rate limit")
+}
+
+// withGCPRetry retries a GCP operation up to 3 times with exponential backoff
+// and jitter when isGCPTransient returns true. Non-transient errors are returned
+// immediately.
+func withGCPRetry(ctx context.Context, op string, fn func() error) error {
+	const maxRetries = 3
+	baseDelay := 500 * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if !isGCPTransient(lastErr) {
+			return lastErr
+		}
+		if attempt == maxRetries {
+			break
+		}
+		// Exponential backoff: 500ms, 1s, 2s + jitter up to 25%
+		delay := baseDelay << uint(attempt)
+		jitter := time.Duration(rand.Int63n(int64(delay / 4)))
+		delay += jitter
+
+		logging.Logger.Warn("gcp:retry", "op", op, "attempt", attempt+1, "delay", delay.String(), "error", lastErr.Error())
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return lastErr
 }
 
 func requiredIntent(intentMap map[string]interface{}, key string) string {
