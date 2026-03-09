@@ -56,6 +56,15 @@ Every friction point in that loop — ambiguous output, missing context, inabili
 - [x] QA Round 5: 7 HIGH findings fixed (path traversal, scrub parity, race condition, nil guards, partial failure)
 - [x] 473 test functions, 22 packages all green
 
+### Phase 5.1: GCP Wiring Layer (G1)
+- [x] Provider-aware wiring: `WireGraph` routes to GCP IAM/env/firewall inference
+- [x] GCP IAM role matrix: 24 target:mode → role mappings
+- [x] GCP env var inference: 7 target types with auto-injected connection strings
+- [x] GCP firewall inference: VPC-resident resources only (Cloud Run excluded — uses VPC connectors)
+- [x] Cross-cutting: alarm_on (Cloud Monitoring) + log_retention (Cloud Logging)
+- [x] QA Round 6: 6 findings fixed (classification sync, Cloud Run VPC, metric validation, port bounds, DRY)
+- [x] 562 test functions, 22 packages all green
+
 ---
 
 ## Phase 3: Agent Interface Layer (remaining)
@@ -68,7 +77,7 @@ Every friction point in that loop — ambiguous output, missing context, inabili
 - [ ] Integration tests with MCP client (end-to-end stdio)
 
 ### 3.2 Structured Output (remaining)
-- [ ] Machine-parseable errors with error codes and structured metadata (CLIError struct)
+- [x] Machine-parseable errors with error codes and structured metadata (CLIError struct)
 - [ ] Schema documentation for agent developers
 
 ### 3.3 Rich Plan Output (remaining)
@@ -116,17 +125,17 @@ Every friction point in that loop — ambiguous output, missing context, inabili
 
 **Goal:** All three clouds work equally well — an agent shouldn't need to know which cloud it's targeting.
 
-**Current gap (GCP vs AWS):** AWS has 20 resource types, 18 deep observation, 2 cross-cutting concerns, and full wiring layer (IAM/env vars/security groups). GCP has 12 resource-specific + 7 generic stubs, zero cross-cutting, zero wiring support. This means GCP beacons require 3-5x more explicit configuration than equivalent AWS beacons.
+**Current gap (GCP vs AWS):** AWS has 20 resource types, 18 deep observation, 2 cross-cutting concerns, and full wiring layer (IAM/env vars/security groups). GCP now has wiring parity (G1 shipped), but still needs resilience hardening and observation depth.
 
-### 5.1 GCP Wiring Layer (Phase G1 — Highest Leverage)
+### 5.1 GCP Wiring Layer (Phase G1) ✅ PR #27
 
-Bring GCP into the wiring layer so agents get the same "smart defaults" as AWS.
-
-- [ ] Add `gcpIAMActionsFor()` to wiring layer — map dependency pairs to GCP IAM roles (e.g., Cloud Run → Cloud SQL needs `roles/cloudsql.client`, Cloud Run → Secret Manager needs `roles/secretmanager.secretAccessor`)
-- [ ] Add `gcpInferEnvVars()` — auto-inject Cloud SQL connection strings, Secret Manager secret names, Pub/Sub topic names from IR graph edges
-- [ ] Add `gcpInferFirewallRules()` — generate firewall allow rules from dependency edges (e.g., Cloud Run → Cloud SQL implies allow TCP:5432)
-- [ ] Cloud Monitoring alarms (post-apply `alarm_on`) — Cloud Run (request_count, latency), Cloud SQL (cpu, connections), Memorystore (memory), Compute Engine (cpu)
-- [ ] Cloud Logging retention (post-apply `log_retention`) — set retention on Cloud Run and Cloud Functions log sinks
+- [x] `GCPIAMRolesFor()` — 24-entry role matrix for GCP dependency pairs
+- [x] `InferGCPEnvVars()` — Cloud SQL, Memorystore, GCS, Pub/Sub, Secret Manager, Cloud Run, Cloud Functions
+- [x] `InferGCPFirewallRules()` — firewall rules from IR graph edges (VPC-resident only)
+- [x] Cloud Monitoring alarms — 20 metric mappings across 6 targets
+- [x] Cloud Logging retention — log_retention for Cloud Run, Cloud Functions
+- [x] Unified classification: `detectGCPTarget` delegates to `ClassifyGCPNode`
+- [x] Structured logging across 10+ packages
 
 ### 5.2 GCP Stub Promotion (Phase G2 — Fill the Holes)
 
