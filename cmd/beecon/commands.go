@@ -246,7 +246,12 @@ var applyCmd = &cobra.Command{
 	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := beaconPathArg(args)
-		res, err := eng.Apply(cmd.Context(), path, engine.WithForce(forceFlag))
+		var applyOpts []engine.ApplyOption
+		applyOpts = append(applyOpts, engine.WithForce(forceFlag))
+		if agentIDFlag != "" {
+			applyOpts = append(applyOpts, engine.WithAgentID(agentIDFlag, ""))
+		}
+		res, err := eng.Apply(cmd.Context(), path, applyOpts...)
 		if err != nil {
 			if res != nil {
 				// Partial failure — show what was executed before the error
@@ -648,12 +653,49 @@ var rejectCmd = &cobra.Command{
 	},
 }
 
+var historyAgentFilter string
+
 var historyCmd = &cobra.Command{
-	Use:         "history <resource-id>",
-	Short:       "Show history for a resource",
-	Args:        cobra.ExactArgs(1),
+	Use:         "history [resource-id]",
+	Short:       "Show history for a resource or agent",
+	Args:        cobra.MaximumNArgs(1),
 	Annotations: needsEngine,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Agent history mode: --agent-id flag
+		if historyAgentFilter != "" {
+			runs, err := eng.AgentHistory(cmd.Context(), historyAgentFilter)
+			if err != nil {
+				return err
+			}
+			if formatFlag == "json" {
+				for i := range runs {
+					runs[i].BeaconPath = filepath.Base(runs[i].BeaconPath)
+				}
+				return cli.WriteJSON(os.Stdout, struct {
+					AgentID string            `json:"agent_id"`
+					Runs    []state.RunRecord `json:"runs"`
+				}{historyAgentFilter, runs})
+			}
+			out.Blank()
+			if len(runs) == 0 {
+				out.Line(out.Dim(out.Dot()), "No runs found for agent %s", historyAgentFilter)
+			} else {
+				out.Header("Agent history: %s (%d runs)", historyAgentFilter, len(runs))
+				out.Blank()
+				for _, r := range runs {
+					ts := r.CreatedAt.Format("2006-01-02 15:04:05")
+					out.Line(out.Dot(), "%s  %s  %s  %s",
+						out.Dim(ts), r.ID, string(r.Status), filepath.Base(r.BeaconPath))
+				}
+			}
+			out.Blank()
+			return nil
+		}
+
+		// Resource history mode (original behavior)
+		if len(args) == 0 {
+			return fmt.Errorf("resource-id argument required (or use --agent-id)")
+		}
 		events, err := eng.History(cmd.Context(), args[0])
 		if err != nil {
 			return err

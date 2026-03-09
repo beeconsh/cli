@@ -39,6 +39,7 @@ var watchInterval string
 var driftPlanFlag bool
 var driftReconcileFlag bool
 var driftApplyFlag bool
+var agentIDFlag string
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -106,6 +107,9 @@ func init() {
 	// Debug flag: --debug (persistent across subcommands)
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "enable debug logging to stderr")
 
+	// Agent ID flag: --agent-id (persistent across subcommands)
+	rootCmd.PersistentFlags().StringVar(&agentIDFlag, "agent-id", "", "agent identity for audit trail (e.g. claude-opus-4-6)")
+
 	// Force flag on apply command
 	applyCmd.Flags().BoolVar(&forceFlag, "force", false, "bypass budget enforcement")
 
@@ -128,6 +132,9 @@ func init() {
 
 	// List flag on restore command
 	restoreCmd.Flags().BoolVar(&restoreListFlag, "list", false, "list available backups")
+
+	// Agent filter flag on history command
+	historyCmd.Flags().StringVar(&historyAgentFilter, "agent-id", "", "filter runs by agent identity")
 
 	// Provider filter flag on providers command
 	providersCmd.Flags().StringVar(&providerFilterFlag, "provider", "", "filter by provider (aws, gcp, azure)")

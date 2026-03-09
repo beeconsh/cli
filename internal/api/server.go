@@ -211,6 +211,21 @@ func (s *Server) runs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// If agent_id query param is provided, filter by agent.
+	if agentID := r.URL.Query().Get("agent_id"); agentID != "" {
+		agentRuns, err := s.engine.AgentHistory(r.Context(), agentID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		for i := range agentRuns {
+			agentRuns[i].BeaconPath = filepath.Base(agentRuns[i].BeaconPath)
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"agent_id": agentID, "runs": agentRuns})
+		return
+	}
+
 	runs, err := s.engine.Runs(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -357,6 +372,7 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		BeaconPath string `json:"beacon_path"`
 		Force      bool   `json:"force"`
+		AgentID    string `json:"agent_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
@@ -369,7 +385,12 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	res, err := s.engine.Apply(r.Context(), req.BeaconPath, engine.WithForce(req.Force))
+	var opts []engine.ApplyOption
+	opts = append(opts, engine.WithForce(req.Force))
+	if req.AgentID != "" {
+		opts = append(opts, engine.WithAgentID(req.AgentID, ""))
+	}
+	res, err := s.engine.Apply(r.Context(), req.BeaconPath, opts...)
 	if err != nil {
 		if res != nil {
 			scrubOutcomes(res.Actions)
