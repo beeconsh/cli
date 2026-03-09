@@ -1,31 +1,48 @@
 # Task Tracker
 
-## Current Focus: Phase 3 — Agent Interface Layer
+## Current Focus: Phase 5 — Multi-Cloud Parity (GCP)
 
-### Phase 3.1: MCP Server
-- [x] Design MCP tool schema (tools, inputs, outputs)
-- [x] Implement MCP server entrypoint (`beecon mcp` command, stdio transport)
-- [x] Expose 13 tools: validate_beacon, plan, apply, show_status, detect_drift, approve, reject, rollback, list_runs, list_approvals, get_history, discover_beacons, connect_provider
-- [x] Tool error handling (isError responses, not protocol errors)
-- [x] Security scrubbing on all MCP output paths
-- [x] MCP server tests (input validation + happy path + scrubbing)
-- [x] QA Round 4: Fix 7 HIGH findings (path traversal, scrub parity, ActiveProfile race, partial failure, CLI nil guards)
-- [ ] Integration tests with MCP client (end-to-end stdio)
-- [ ] Tool discovery/capability introspection (toolset grouping)
+### Phase 5.1: G1 — Wiring Layer ✅ (PR #27, merged)
+- [x] `GCPIAMRolesFor()` — 24-entry role matrix for GCP dependency pairs
+- [x] `InferGCPEnvVars()` — Cloud SQL, Memorystore, GCS, Pub/Sub, Secret Manager, Cloud Run, Cloud Functions
+- [x] `InferGCPFirewallRules()` — firewall rules from IR graph edges (VPC-resident only)
+- [x] Cloud Monitoring alarms — `gcpAlarmMetricForTarget` with 20 mappings across 6 targets
+- [x] Cloud Logging retention — `log_retention` for Cloud Run, Cloud Functions
+- [x] Unified `detectGCPTarget` → `classify.ClassifyGCPNode` delegation
+- [x] QA: 6 findings fixed (P1 classification sync, P2 Cloud Run VPC, P2 metric validation, P3 port bounds, P3 DRY fieldVal)
+- [x] Structured logging across 10+ packages
+- [x] 562 tests, 22 packages green
 
-### Phase 3.2: Complete Structured JSON Output
-- [x] Audit all CLI commands for `--format json` coverage
-- [x] Add JSON to 8 commands: validate, approve, reject, history, rollback, refresh, import, connect
-- [x] Fix resolver.Plan JSON tag (Actions → actions)
-- [ ] Machine-parseable error format with error codes (CLIError struct)
+### Phase 5.2: G3 — Resilience (in progress)
+- [ ] Multi-step partial results for Cloud Run (deploy → IAM → traffic split)
+- [ ] GCP error classification — expand `isGCPNotFound` with gRPC codes, googleapi errors
+- [ ] Operation waiters for Cloud SQL, GKE creation (long-running operations)
+- [ ] `withRetry` for transient GCP errors (503, rate limits) with exponential backoff
+
+### Phase 5.3: G4 — Observation Depth (in progress)
+- [ ] Deepen Cloud Run observation — revision, scaling config, env vars (scrubbed), service URL, IAM policy
+- [ ] Deepen Cloud SQL observation — database_version, tier, storage_auto_resize, backup_config, ip_addresses
+- [ ] Deepen Memorystore observation — redis_version, memory_size_gb, host, port, auth_enabled
+- [ ] Deepen remaining GCP resource types — match AWS-level field extraction
+
+### Phase 5.4: G2 — Stub Promotion (backlog)
+- [ ] Cloud Functions (Lambda equivalent)
+- [ ] GKE (EKS equivalent)
+- [ ] Cloud CDN (CloudFront equivalent)
+- [ ] Eventarc (EventBridge equivalent)
+- [ ] API Gateway (API Gateway v2 equivalent)
+- [ ] Identity Platform (Cognito equivalent)
+- [ ] Cloud Monitoring standalone alarms (CloudWatch equivalent)
+
+---
+
+## Phase 3: Agent Interface Layer (remaining)
+
+### Phase 3.2: Structured Output
+- [x] Machine-parseable error format with error codes (CLIError struct)
 - [ ] Document JSON schemas for agent developers
 
 ### Phase 3.3: Rich Plan Output
-- [x] Add risk scoring per action (1-10 scale, low/medium/high/critical levels)
-- [x] Add rollback feasibility per action (safe/risky/impossible)
-- [x] Add cost-per-action (joined from CostReport.Estimates)
-- [x] Add compliance mutations count per action
-- [x] Add PlanSummary aggregate (counts, risk, cost, budget remaining)
 - [ ] Add cost delta (current monthly vs proposed monthly)
 - [ ] Add dependency chain depth metrics
 
@@ -41,42 +58,13 @@ See `docs/ROADMAP.md` for full Phase 4-7 details.
 - [ ] Structured error recovery guidance
 - [ ] Self-healing drift (`drift --reconcile`)
 
-### Phase 5: Multi-Cloud Parity — GCP to AWS Parity
-
-#### G1: Wiring Layer (highest leverage)
-- [ ] `gcpIAMActionsFor()` — IAM role inference for GCP dependency pairs
-- [ ] `gcpInferEnvVars()` — auto-inject Cloud SQL connection strings, Secret Manager names, Pub/Sub topics
-- [ ] `gcpInferFirewallRules()` — firewall rules from IR graph edges
-- [ ] Cloud Monitoring alarms (post-apply `alarm_on` for Cloud Run, Cloud SQL, Memorystore, Compute)
-- [ ] Cloud Logging retention (post-apply `log_retention` for Cloud Run, Cloud Functions)
-
-#### G2: Stub Promotion (7 generic → resource-specific)
-- [ ] Cloud Functions (Lambda equivalent)
-- [ ] GKE (EKS equivalent)
-- [ ] Cloud CDN (CloudFront equivalent)
-- [ ] Eventarc (EventBridge equivalent)
-- [ ] API Gateway (API Gateway v2 equivalent)
-- [ ] Identity Platform (Cognito equivalent)
-- [ ] Cloud Monitoring standalone alarms (CloudWatch equivalent)
-
-#### G3: Resilience
-- [ ] Multi-step partial results for Cloud Run
-- [ ] GCP error classification (gRPC codes.NotFound, googleapi 404)
-- [ ] Operation waiters (Cloud SQL, GKE creation)
-- [ ] withRetry for transient GCP errors
-
-#### G4: Observation Depth
-- [ ] Deepen Cloud Run, Cloud SQL, Memorystore observation
-- [ ] Deepen remaining 9 resource types
-- [ ] Add observation for promoted stubs
-
-#### Azure & General
+### Phase 5.5: Azure & General
 - [ ] Azure resource-specific adapter depth
 - [ ] Provider capability matrix command
 
 ### Phase 6: Trust & Governance
 - [ ] Cost guardrails with auto-approve thresholds
-- [ ] Blast radius scoring
+- [ ] Dependency-weighted blast radius scoring
 - [ ] Policy-based approval delegation
 - [ ] Agent identity in audit trail
 

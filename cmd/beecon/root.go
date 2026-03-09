@@ -44,7 +44,17 @@ func main() {
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		logging.Logger.Error("command failed", "error", err)
-		fmt.Fprintln(os.Stderr, "error:", err)
+		if formatFlag == "json" {
+			cmdName := ""
+			if rootCmd.CalledAs() != "" {
+				cmdName = rootCmd.CalledAs()
+			}
+			cliErr := cli.NewCLIError(cmdName, err)
+			_ = cli.WriteJSONError(os.Stderr, cliErr)
+		} else {
+			cliErr := cli.NewCLIError("", err)
+			fmt.Fprintln(os.Stderr, cli.FormatError(cliErr))
+		}
 		os.Exit(1)
 	}
 }
