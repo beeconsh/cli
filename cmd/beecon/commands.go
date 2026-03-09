@@ -897,6 +897,78 @@ var restoreCmd = &cobra.Command{
 	},
 }
 
+var diffCmd = &cobra.Command{
+	Use:         "diff [beacon-file]",
+	Short:       "Compare beacon file against current state",
+	Args:        cobra.MaximumNArgs(1),
+	Annotations: needsEngine,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := beaconPathArg(args)
+		result, err := eng.Diff(cmd.Context(), path)
+		if err != nil {
+			return err
+		}
+
+		if formatFlag == "json" {
+			return cli.WriteJSON(os.Stdout, result)
+		}
+
+		out.Blank()
+		total := len(result.Added) + len(result.Removed) + len(result.Modified) + result.Unchanged
+		out.Summary("Diff: %d resource(s)  |  +%d added  -%d removed  ~%d modified  %d unchanged",
+			total, len(result.Added), len(result.Removed), len(result.Modified), result.Unchanged)
+		out.Blank()
+
+		if len(result.Added) == 0 && len(result.Removed) == 0 && len(result.Modified) == 0 {
+			out.Line(out.Green(out.OK()), "No differences found.")
+			out.Blank()
+			return nil
+		}
+
+		for _, entry := range result.Added {
+			label := entry.NodeType
+			if entry.Target != "" {
+				label += " (" + entry.Target + ")"
+			}
+			out.Line(out.Green("+"), "%s  %s", out.Bold(entry.NodeName), out.Dim(label))
+		}
+		for _, entry := range result.Removed {
+			label := entry.NodeType
+			out.Line(out.Red("-"), "%s  %s", out.Bold(entry.NodeName), out.Dim(label))
+		}
+		for _, entry := range result.Modified {
+			label := entry.NodeType
+			if entry.Target != "" {
+				label += " (" + entry.Target + ")"
+			}
+			out.Line(out.Yellow("~"), "%s  %s", out.Bold(entry.NodeName), out.Dim(label))
+			for _, k := range sortedFieldDiffKeys(entry.Changes) {
+				fd := entry.Changes[k]
+				if fd.Old == nil {
+					out.DiffLine("CREATE", k, fmt.Sprintf("%v", fd.New))
+				} else if fd.New == nil {
+					out.DiffLine("DELETE", k, fmt.Sprintf("%v (removed)", fd.Old))
+				} else {
+					out.DiffLine("UPDATE", k, fmt.Sprintf("%v -> %v", fd.Old, fd.New))
+				}
+			}
+		}
+
+		out.Blank()
+		return nil
+	},
+}
+
+// sortedFieldDiffKeys returns sorted keys from a FieldDiff map.
+func sortedFieldDiffKeys(m map[string]engine.FieldDiff) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // sortedKeys returns the keys of a map sorted alphabetically.
 func sortedKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
