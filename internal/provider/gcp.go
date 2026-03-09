@@ -335,7 +335,16 @@ func observeGCPGCS(ctx context.Context, rec *state.ResourceRecord) (*ObserveResu
 		}
 		return nil, fmt.Errorf("gcs bucket attrs: %w", err)
 	}
-	live := map[string]interface{}{"provider": "gcp", "service": "gcs", "bucket": bucketName, "location": attrs.Location, "storage_class": attrs.StorageClass}
+	live := map[string]interface{}{
+		"provider":           "gcp",
+		"service":            "gcs",
+		"bucket":             bucketName,
+		"location":           attrs.Location,
+		"storage_class":      attrs.StorageClass,
+		"location_type":      attrs.LocationType,
+		"versioning_enabled": attrs.VersioningEnabled,
+		"create_time":        attrs.Created.Format("2006-01-02T15:04:05Z"),
+	}
 	return &ObserveResult{Exists: true, ProviderID: bucketName, LiveState: live}, nil
 }
 
@@ -400,9 +409,38 @@ func observeGCPCloudSQL(ctx context.Context, rec *state.ResourceRecord) (*Observ
 		}
 		return nil, fmt.Errorf("cloud sql get instance: %w", err)
 	}
-	live := map[string]interface{}{"provider": "gcp", "service": "cloud_sql", "instance": instance, "state": out.State, "region": out.Region, "db_version": out.DatabaseVersion}
+	live := map[string]interface{}{
+		"provider":         "gcp",
+		"service":          "cloud_sql",
+		"instance":         instance,
+		"database_version": out.DatabaseVersion,
+		"state":            out.State,
+		"region":           out.Region,
+		"connection_name":  out.ConnectionName,
+	}
+	// Keep legacy key for backward compatibility
+	live["db_version"] = out.DatabaseVersion
 	if out.Settings != nil {
 		live["tier"] = out.Settings.Tier
+		live["data_disk_size_gb"] = out.Settings.DataDiskSizeGb
+		live["availability_type"] = out.Settings.AvailabilityType
+		if out.Settings.StorageAutoResize != nil {
+			live["storage_auto_resize"] = *out.Settings.StorageAutoResize
+		}
+		if out.Settings.BackupConfiguration != nil {
+			live["backup_enabled"] = out.Settings.BackupConfiguration.Enabled
+		}
+		if out.Settings.IpConfiguration != nil {
+			live["ipv4_enabled"] = out.Settings.IpConfiguration.Ipv4Enabled
+			live["private_network"] = out.Settings.IpConfiguration.PrivateNetwork
+		}
+	}
+	if len(out.IpAddresses) > 0 {
+		ips := make([]string, 0, len(out.IpAddresses))
+		for _, ip := range out.IpAddresses {
+			ips = append(ips, ip.IpAddress)
+		}
+		live["ip_addresses"] = strings.Join(ips, ",")
 	}
 	return &ObserveResult{Exists: true, ProviderID: instance, LiveState: live}, nil
 }
@@ -650,10 +688,21 @@ func observeGCPVPC(ctx context.Context, rec *state.ResourceRecord) (*ObserveResu
 		}
 		return nil, fmt.Errorf("gcp vpc get: %w", err)
 	}
+	live := map[string]interface{}{
+		"provider":                "gcp",
+		"service":                 "vpc",
+		"network":                 name,
+		"self_link":               out.SelfLink,
+		"auto_create_subnetworks": out.AutoCreateSubnetworks,
+		"mtu":                     out.Mtu,
+	}
+	if out.RoutingConfig != nil {
+		live["routing_mode"] = out.RoutingConfig.RoutingMode
+	}
 	return &ObserveResult{
 		Exists:     true,
 		ProviderID: name,
-		LiveState:  map[string]interface{}{"provider": "gcp", "service": "vpc", "network": name, "self_link": out.SelfLink},
+		LiveState:  live,
 	}, nil
 }
 
@@ -726,7 +775,16 @@ func observeGCPSubnet(ctx context.Context, rec *state.ResourceRecord) (*ObserveR
 	return &ObserveResult{
 		Exists:     true,
 		ProviderID: name,
-		LiveState:  map[string]interface{}{"provider": "gcp", "service": "subnet", "subnet": name, "region": out.Region, "network": out.Network, "ip_cidr_range": out.IpCidrRange},
+		LiveState: map[string]interface{}{
+			"provider":                 "gcp",
+			"service":                  "subnet",
+			"subnet":                   name,
+			"region":                   out.Region,
+			"network":                  out.Network,
+			"ip_cidr_range":            out.IpCidrRange,
+			"purpose":                  out.Purpose,
+			"private_ip_google_access": out.PrivateIpGoogleAccess,
+		},
 	}, nil
 }
 
@@ -791,11 +849,31 @@ func observeGCPFirewall(ctx context.Context, rec *state.ResourceRecord) (*Observ
 		}
 		return nil, fmt.Errorf("gcp firewall get: %w", err)
 	}
-	live := map[string]interface{}{"provider": "gcp", "service": "firewall", "firewall": name, "network": out.Network}
+	live := map[string]interface{}{
+		"provider":  "gcp",
+		"service":   "firewall",
+		"firewall":  name,
+		"network":   out.Network,
+		"direction": out.Direction,
+		"priority":  out.Priority,
+	}
+	if len(out.SourceRanges) > 0 {
+		live["source_ranges"] = strings.Join(out.SourceRanges, ",")
+	}
 	if len(out.Allowed) > 0 {
 		live["protocol"] = out.Allowed[0].IPProtocol
 		if len(out.Allowed[0].Ports) > 0 {
 			live["port"] = out.Allowed[0].Ports[0]
+		}
+		// Collect all allowed ports across all rules
+		var allPorts []string
+		for _, a := range out.Allowed {
+			for _, p := range a.Ports {
+				allPorts = append(allPorts, fmt.Sprintf("%s/%s", a.IPProtocol, p))
+			}
+		}
+		if len(allPorts) > 0 {
+			live["allowed_ports"] = strings.Join(allPorts, ",")
 		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: name, LiveState: live}, nil
@@ -884,13 +962,44 @@ func observeGCPCloudRun(ctx context.Context, rec *state.ResourceRecord) (*Observ
 		return nil, fmt.Errorf("cloud run get service: %w", err)
 	}
 	live := map[string]interface{}{
-		"provider": "gcp",
-		"service":  "cloud_run",
-		"name":     serviceName,
-		"region":   region,
+		"provider":     "gcp",
+		"service":      "cloud_run",
+		"name":         serviceName,
+		"region":       region,
+		"service_url":  out.Uri,
+		"revision":     out.LatestReadyRevision,
+		"ingress":      out.Ingress,
+		"launch_stage": out.LaunchStage,
+		"create_time":  out.CreateTime,
+		"update_time":  out.UpdateTime,
 	}
+	// Keep legacy key for backward compatibility
 	if out.Uri != "" {
 		live["uri"] = out.Uri
+	}
+	if out.Template != nil {
+		if len(out.Template.Containers) > 0 {
+			c := out.Template.Containers[0]
+			live["image"] = c.Image
+			if len(c.Ports) > 0 {
+				live["container_port"] = c.Ports[0].ContainerPort
+			}
+			// Only store env var keys — never leak values
+			if len(c.Env) > 0 {
+				envKeys := make([]string, 0, len(c.Env))
+				for _, e := range c.Env {
+					envKeys = append(envKeys, e.Name)
+				}
+				live["env_keys"] = strings.Join(envKeys, ",")
+			}
+		}
+		if out.Template.Scaling != nil {
+			live["min_instances"] = out.Template.Scaling.MinInstanceCount
+			live["max_instances"] = out.Template.Scaling.MaxInstanceCount
+		}
+		if out.Template.ServiceAccount != "" {
+			live["service_account"] = out.Template.ServiceAccount
+		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: fullName, LiveState: live}, nil
 }
@@ -983,12 +1092,19 @@ func observeGCPMemorystoreRedis(ctx context.Context, rec *state.ResourceRecord) 
 		return nil, fmt.Errorf("memorystore redis get: %w", err)
 	}
 	live := map[string]interface{}{
-		"provider":       "gcp",
-		"service":        "memorystore_redis",
-		"name":           out.Name,
-		"state":          out.State,
-		"tier":           out.Tier,
-		"memory_size_gb": out.MemorySizeGb,
+		"provider":                 "gcp",
+		"service":                  "memorystore_redis",
+		"name":                     out.Name,
+		"redis_version":            out.RedisVersion,
+		"memory_size_gb":           out.MemorySizeGb,
+		"host":                     out.Host,
+		"port":                     out.Port,
+		"state":                    out.State,
+		"tier":                     out.Tier,
+		"auth_enabled":             out.AuthEnabled,
+		"transit_encryption_mode":  out.TransitEncryptionMode,
+		"display_name":             out.DisplayName,
+		"current_location_id":      out.CurrentLocationId,
 	}
 	return &ObserveResult{Exists: true, ProviderID: fullName, LiveState: live}, nil
 }
@@ -1073,6 +1189,9 @@ func observeGCPIAM(ctx context.Context, rec *state.ResourceRecord) (*ObserveResu
 		"service":         "iam",
 		"service_account": out.Email,
 		"name":            out.Name,
+		"email":           out.Email,
+		"display_name":    out.DisplayName,
+		"disabled":        out.Disabled,
 	}
 	return &ObserveResult{Exists: true, ProviderID: name, LiveState: live}, nil
 }
@@ -1149,9 +1268,30 @@ func observeGCPComputeEngine(ctx context.Context, rec *state.ResourceRecord) (*O
 		}
 		return nil, fmt.Errorf("compute engine get instance: %w", err)
 	}
-	live := map[string]interface{}{"provider": "gcp", "service": "compute_engine", "instance": instance, "zone": zone, "status": out.Status}
-	if out.MachineType != "" {
-		live["machine_type"] = out.MachineType
+	live := map[string]interface{}{
+		"provider":     "gcp",
+		"service":      "compute_engine",
+		"instance":     instance,
+		"machine_type": out.MachineType,
+		"zone":         out.Zone,
+		"status":       out.Status,
+	}
+	// Collect network interface IPs
+	if len(out.NetworkInterfaces) > 0 {
+		var ips []string
+		for _, ni := range out.NetworkInterfaces {
+			if ni.NetworkIP != "" {
+				ips = append(ips, ni.NetworkIP)
+			}
+			for _, ac := range ni.AccessConfigs {
+				if ac.NatIP != "" {
+					ips = append(ips, ac.NatIP)
+				}
+			}
+		}
+		if len(ips) > 0 {
+			live["network_ips"] = strings.Join(ips, ",")
+		}
 	}
 	return &ObserveResult{Exists: true, ProviderID: instance, LiveState: live}, nil
 }
@@ -1215,10 +1355,21 @@ func observeGCPCloudDNS(ctx context.Context, rec *state.ResourceRecord) (*Observ
 		}
 		return nil, fmt.Errorf("cloud dns get zone: %w", err)
 	}
+	live := map[string]interface{}{
+		"provider":    "gcp",
+		"service":     "cloud_dns",
+		"zone":        zoneName,
+		"dns_name":    out.DnsName,
+		"description": out.Description,
+		"visibility":  out.Visibility,
+	}
+	if len(out.NameServers) > 0 {
+		live["nameservers"] = strings.Join(out.NameServers, ",")
+	}
 	return &ObserveResult{
 		Exists:     true,
 		ProviderID: zoneName,
-		LiveState:  map[string]interface{}{"provider": "gcp", "service": "cloud_dns", "zone": zoneName, "dns_name": out.DnsName, "description": out.Description},
+		LiveState:  live,
 	}, nil
 }
 
