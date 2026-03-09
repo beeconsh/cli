@@ -37,6 +37,8 @@ var yesFlag bool
 var statusFilter string
 var watchInterval string
 var driftPlanFlag bool
+var driftReconcileFlag bool
+var driftApplyFlag bool
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -115,6 +117,11 @@ func init() {
 
 	// Plan flag on drift command
 	driftCmd.Flags().BoolVar(&driftPlanFlag, "plan", false, "show reconciliation plan for drifted resources")
+
+	// Reconcile flags on drift command
+	driftCmd.Flags().BoolVar(&driftReconcileFlag, "reconcile", false, "generate reconciliation plan for drifted resources")
+	driftCmd.Flags().BoolVar(&driftApplyFlag, "apply", false, "execute reconciliation actions (requires --reconcile)")
+	driftCmd.MarkFlagsMutuallyExclusive("plan", "reconcile")
 
 	// Interval flag on watch command
 	watchCmd.Flags().StringVar(&watchInterval, "interval", "5m", "drift check interval (e.g. 30s, 5m, 1h)")
