@@ -65,6 +65,7 @@ const (
 	ActionExecuted  ActionStatus = iota
 	ActionPending
 	ActionForbidden
+	ActionSkipped
 )
 
 func (s ActionStatus) String() string {
@@ -75,6 +76,8 @@ func (s ActionStatus) String() string {
 		return "pending"
 	case ActionForbidden:
 		return "forbidden"
+	case ActionSkipped:
+		return "skipped"
 	default:
 		return "unknown"
 	}
@@ -114,6 +117,7 @@ type ApplyResult struct {
 	ApprovalRequestID string          `json:"approval_request_id,omitempty"`
 	Executed          int             `json:"executed"`
 	Pending           int             `json:"pending"`
+	Skipped           int             `json:"skipped,omitempty"`
 	Actions           []ActionOutcome `json:"actions"`
 	Simulated         bool            `json:"simulated"`
 }
@@ -276,8 +280,12 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 		run.ActionIDs = append(run.ActionIDs, a.ID)
 	}
 
+	// Build completed set from any prior failed run for partial recovery.
+	completedSet := findCompletedSetForBeacon(st, abs)
+
 	pending := make([]*state.PlanAction, 0)
 	executed := 0
+	skipped := 0
 	outcomes := make([]ActionOutcome, 0, len(p.Actions))
 	for _, a := range p.Actions {
 		if a.RequiresApproval {
@@ -285,7 +293,23 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 			outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionPending})
 			continue
 		}
+
+		// Idempotency check: skip actions that are already applied or completed.
+		if skip, reason := isAlreadyApplied(a, st, completedSet); skip {
+			logging.Logger.Debug("apply:idempotent-skip", "node", a.NodeName, "op", a.Operation, "reason", reason)
+			skipped++
+			run.CompletedActions = append(run.CompletedActions, completedActionKey(a))
+			outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionSkipped})
+			continue
+		}
+
 		if err := applyAction(ctx, e.exec, cloudProvider, cloudRegion, st, run.ID, a, g); err != nil {
+			// Mark the resource as FAILED for CREATE operations so retries work.
+			if a.Operation == "CREATE" {
+				if rec := st.Resources[a.NodeID]; rec != nil && rec.ProviderID == "" {
+					rec.Status = state.StatusFailed
+				}
+			}
 			run.Status = state.RunFailed
 			run.Error = err.Error()
 			st.Runs[run.ID] = run
@@ -295,12 +319,14 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 			return &ApplyResult{
 				RunID:     run.ID,
 				Executed:  executed,
+				Skipped:   skipped,
 				Actions:   outcomes,
 				Simulated: e.exec.IsDryRun(),
 			}, err
 		}
 		executed++
 		run.ExecutedActions = append(run.ExecutedActions, a.ID)
+		run.CompletedActions = append(run.CompletedActions, completedActionKey(a))
 		outcomes = append(outcomes, ActionOutcome{Action: a, Status: ActionExecuted})
 
 		// Store wiring metadata and cost estimate on the resource record
@@ -363,12 +389,13 @@ func (e *Engine) Apply(ctx context.Context, beaconPath string, opts ...ApplyOpti
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	logging.Logger.Debug("apply:complete", "run", run.ID, "executed", executed, "pending", len(pending))
+	logging.Logger.Debug("apply:complete", "run", run.ID, "executed", executed, "skipped", skipped, "pending", len(pending))
 	return &ApplyResult{
 		RunID:             run.ID,
 		ApprovalRequestID: approvalID,
 		Executed:          executed,
 		Pending:           len(pending),
+		Skipped:           skipped,
 		Actions:           outcomes,
 		Simulated:         e.exec.IsDryRun(),
 	}, nil
@@ -1097,6 +1124,91 @@ func applyAction(ctx context.Context, exec provider.Executor, cloudProvider, clo
 
 	addAudit(st, runID, "ACTION_EXECUTED", a.NodeID, fmt.Sprintf("%s %s", a.Operation, a.NodeID), map[string]interface{}{"action_id": a.ID})
 	return nil
+}
+
+// completedActionKey returns a unique key for tracking completed actions in a run.
+// Uses NodeID (e.g. "store.cache") rather than NodeName (e.g. "cache") to avoid
+// collisions when different node types share the same short name.
+func completedActionKey(a *state.PlanAction) string {
+	return a.NodeID + ":" + a.Operation
+}
+
+// isAlreadyApplied checks whether an action can be safely skipped because a
+// previous apply already accomplished its effect. It returns true (skip) and a
+// reason string, or false if the action should be executed.
+func isAlreadyApplied(a *state.PlanAction, st *state.State, completedSet map[string]bool) (skip bool, reason string) {
+	key := completedActionKey(a)
+
+	// Check partial-failure recovery: if the action was already completed in a
+	// prior run attempt, skip it.
+	if completedSet[key] {
+		return true, "skipping already-completed action from prior partial apply"
+	}
+
+	rec := st.Resources[a.NodeID]
+
+	switch a.Operation {
+	case "CREATE":
+		if rec == nil {
+			return false, ""
+		}
+		// If the resource previously failed, retry the CREATE.
+		if rec.Status == state.StatusFailed {
+			return false, ""
+		}
+		// If the resource has a ProviderID, it was already provisioned.
+		if rec.ProviderID != "" {
+			return true, "skipping idempotent CREATE: resource already provisioned"
+		}
+	case "DELETE":
+		if rec == nil {
+			return true, "skipping idempotent DELETE: resource already removed"
+		}
+		// If already marked as unmanaged/observed with no provider ID, skip.
+		if !rec.Managed && rec.ProviderID == "" {
+			return true, "skipping idempotent DELETE: resource already removed"
+		}
+		// If the last operation was DELETE, skip.
+		if rec.LastOperation == "DELETE" && !rec.Managed {
+			return true, "skipping idempotent DELETE: resource already removed"
+		}
+	}
+
+	return false, ""
+}
+
+// buildCompletedSet creates a lookup set from a RunRecord's CompletedActions.
+func buildCompletedSet(run *state.RunRecord) map[string]bool {
+	s := make(map[string]bool, len(run.CompletedActions))
+	for _, key := range run.CompletedActions {
+		s[key] = true
+	}
+	return s
+}
+
+// findCompletedSetForBeacon scans state for the most recent FAILED run targeting
+// the same beacon path and returns its completed actions as a set. This enables
+// partial failure recovery: on retry, already-completed actions are skipped.
+func findCompletedSetForBeacon(st *state.State, beaconPath string) map[string]bool {
+	var latest *state.RunRecord
+	for _, r := range st.Runs {
+		if r.Status != state.RunFailed {
+			continue
+		}
+		if r.BeaconPath != beaconPath {
+			continue
+		}
+		if len(r.CompletedActions) == 0 {
+			continue
+		}
+		if latest == nil || r.CreatedAt.After(latest.CreatedAt) {
+			latest = r
+		}
+	}
+	if latest == nil {
+		return map[string]bool{}
+	}
+	return buildCompletedSet(latest)
 }
 
 func parseCloud(g *ir.Graph) (providerName, region string, err error) {

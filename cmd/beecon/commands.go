@@ -294,6 +294,9 @@ var applyCmd = &cobra.Command{
 			case engine.ActionForbidden:
 				out.ActionLine(out.Red(out.Fail()), "FORBIDDEN", a.NodeID,
 					out.Dim(fmt.Sprintf("(%s)", a.BoundaryTag)))
+			case engine.ActionSkipped:
+				out.ActionLine(out.Dim(out.Skip()), "SKIP", a.NodeID,
+					out.Dim("(already applied)"))
 			}
 		}
 
