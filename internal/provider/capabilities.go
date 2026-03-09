@@ -44,13 +44,12 @@ var gcpRealAdapters = map[string]bool{
 }
 
 // AWS targets with deep observe implementations.
+// Only targets with explicit observe switch cases (not default passthrough).
 var awsObserveTargets = map[string]bool{
 	"rds": true, "s3": true, "sqs": true, "sns": true, "secrets_manager": true,
 	"iam": true, "lambda": true, "elasticache": true, "cloudfront": true,
 	"route53": true, "cloudwatch": true, "eks": true, "eventbridge": true,
-	"cognito": true, "ecs": true, "rds_aurora_serverless": true, "alb": true,
-	"vpc": true, "subnet": true, "security_group": true, "ec2": true,
-	"api_gateway": true,
+	"cognito": true, "vpc": true, "subnet": true, "security_group": true, "ec2": true,
 }
 
 // Azure targets with deep observe implementations.
@@ -82,6 +81,7 @@ var wiringTargets = map[string]map[string]bool{
 	"azure": {
 		"container_apps": true, "postgres_flexible": true, "mysql_flexible": true,
 		"azure_cache_redis": true, "blob_storage": true, "key_vault_secret": true,
+		"service_bus": true, "functions": true,
 	},
 }
 
