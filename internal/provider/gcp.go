@@ -373,6 +373,9 @@ func applyGCPCloudSQL(ctx context.Context, req ApplyRequest) (*ApplyResult, erro
 		}
 		if err := withGCPRetry(ctx, "cloud_sql_create", func() error {
 			_, err := svc.Instances.Insert(projectID, inst).Context(ctx).Do()
+			if err != nil && isAlreadyExists(err) {
+				return nil // treat already-exists as success (retry-safe)
+			}
 			return err
 		}); err != nil {
 			return nil, fmt.Errorf("cloud sql create instance: %w", err)
@@ -429,7 +432,7 @@ func applyGCPPubSub(ctx context.Context, req ApplyRequest) (*ApplyResult, error)
 	topic := client.Topic(topicID)
 	switch req.Action.Operation {
 	case "CREATE":
-		if _, err := client.CreateTopic(ctx, topicID); err != nil && status.Code(err) != codes.AlreadyExists {
+		if _, err := client.CreateTopic(ctx, topicID); err != nil && !isAlreadyExists(err) {
 			return nil, fmt.Errorf("pubsub create topic: %w", err)
 		}
 	case "UPDATE":
@@ -441,7 +444,7 @@ func applyGCPPubSub(ctx context.Context, req ApplyRequest) (*ApplyResult, error)
 			return nil, fmt.Errorf("pubsub topic %q not found for update", topicID)
 		}
 	case "DELETE":
-		if err := topic.Delete(ctx); err != nil && status.Code(err) != codes.NotFound {
+		if err := topic.Delete(ctx); err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("pubsub delete topic: %w", err)
 		}
 	}
@@ -473,7 +476,7 @@ func observeGCPPubSub(ctx context.Context, rec *state.ResourceRecord) (*ObserveR
 	defer client.Close()
 	ok, err := client.Topic(topicID).Exists(ctx)
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: topicID, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("pubsub check topic: %w", err)
@@ -507,6 +510,17 @@ func applyGCPSecretManager(ctx context.Context, req ApplyRequest) (*ApplyResult,
 	}
 	defer client.Close()
 
+	result := &ApplyResult{
+		ProviderID: secretName,
+		LiveState: map[string]interface{}{
+			"provider":  "gcp",
+			"service":   "secret_manager",
+			"project":   projectID,
+			"secret":    secretName,
+			"operation": req.Action.Operation,
+		},
+	}
+
 	switch req.Action.Operation {
 	case "CREATE":
 		_, err := client.CreateSecret(ctx, &secretmanagerpb.CreateSecretRequest{
@@ -520,11 +534,13 @@ func applyGCPSecretManager(ctx context.Context, req ApplyRequest) (*ApplyResult,
 				},
 			},
 		})
-		if err != nil && status.Code(err) != codes.AlreadyExists {
+		if err != nil && !isAlreadyExists(err) {
 			return nil, fmt.Errorf("secret manager create secret: %w", err)
 		}
+		// Step 2: add secret version. If this fails, return partial result
+		// so state can track the already-created secret for cleanup.
 		if err := addGCPSecretVersion(ctx, client, secretName, req.Intent); err != nil {
-			return nil, err
+			return result, fmt.Errorf("secret manager add version after create: %w", err)
 		}
 	case "UPDATE":
 		if err := addGCPSecretVersion(ctx, client, secretName, req.Intent); err != nil {
@@ -532,20 +548,11 @@ func applyGCPSecretManager(ctx context.Context, req ApplyRequest) (*ApplyResult,
 		}
 	case "DELETE":
 		err := client.DeleteSecret(ctx, &secretmanagerpb.DeleteSecretRequest{Name: secretName})
-		if err != nil && status.Code(err) != codes.NotFound {
+		if err != nil && !isGCPNotFound(err) {
 			return nil, fmt.Errorf("secret manager delete secret: %w", err)
 		}
 	}
-	return &ApplyResult{
-		ProviderID: secretName,
-		LiveState: map[string]interface{}{
-			"provider":  "gcp",
-			"service":   "secret_manager",
-			"project":   projectID,
-			"secret":    secretName,
-			"operation": req.Action.Operation,
-		},
-	}, nil
+	return result, nil
 }
 
 func observeGCPSecretManager(ctx context.Context, rec *state.ResourceRecord) (*ObserveResult, error) {
@@ -565,7 +572,7 @@ func observeGCPSecretManager(ctx context.Context, rec *state.ResourceRecord) (*O
 	defer client.Close()
 	sec, err := client.GetSecret(ctx, &secretmanagerpb.GetSecretRequest{Name: secretName})
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
+		if isGCPNotFound(err) {
 			return &ObserveResult{Exists: false, ProviderID: secretName, LiveState: map[string]interface{}{}}, nil
 		}
 		return nil, fmt.Errorf("secret manager get secret: %w", err)

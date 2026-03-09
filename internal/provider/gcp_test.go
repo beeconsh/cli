@@ -78,6 +78,62 @@ func TestIsGCPTransient(t *testing.T) {
 	}
 }
 
+func TestIsAlreadyExists(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"already exists lowercase", errors.New("resource already exists"), true},
+		{"already exists mixed case", errors.New("Resource Already Exists"), true},
+		{"AlreadyExists gRPC style", errors.New("rpc error: code = AlreadyExists"), true},
+		{"alreadyexist no space", errors.New("409: alreadyexist"), true},
+		{"wrapped already exists", fmt.Errorf("create failed: %w", errors.New("instance already exists")), true},
+		{"not found", errors.New("resource not found"), false},
+		{"permission denied", errors.New("permission denied"), false},
+		{"empty message", errors.New(""), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isAlreadyExists(tt.err)
+			if got != tt.want {
+				t.Errorf("isAlreadyExists(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsGCPNotFoundConsistency(t *testing.T) {
+	// Verify that isGCPNotFound catches all the patterns that raw
+	// status.Code(err) == codes.NotFound would catch, plus more.
+	// This validates Finding 1: replacing raw checks with the helper
+	// doesn't change behavior for gRPC errors and adds coverage for
+	// REST/string-based not-found errors.
+	grpcNotFound := status.Error(codes.NotFound, "topic not found")
+	if !isGCPNotFound(grpcNotFound) {
+		t.Error("isGCPNotFound should detect gRPC NotFound (was previously raw status.Code check)")
+	}
+
+	// REST-based 404 that raw status.Code would miss
+	restNotFound := &googleapi.Error{Code: 404, Message: "secret not found"}
+	if !isGCPNotFound(restNotFound) {
+		t.Error("isGCPNotFound should detect googleapi 404")
+	}
+
+	// String-based not-found that raw status.Code would miss
+	stringNotFound := errors.New("the topic does not exist")
+	if !isGCPNotFound(stringNotFound) {
+		t.Error("isGCPNotFound should detect string-based 'does not exist'")
+	}
+
+	// Non-not-found errors should not match
+	permDenied := status.Error(codes.PermissionDenied, "access denied")
+	if isGCPNotFound(permDenied) {
+		t.Error("isGCPNotFound should not match PermissionDenied")
+	}
+}
+
 func TestWithGCPRetry(t *testing.T) {
 	t.Run("succeeds on first attempt", func(t *testing.T) {
 		calls := 0
@@ -136,6 +192,30 @@ func TestWithGCPRetry(t *testing.T) {
 		// 1 initial + 3 retries = 4 total
 		if calls != 4 {
 			t.Fatalf("expected 4 calls (1 + 3 retries), got %d", calls)
+		}
+	})
+
+	t.Run("already-exists treated as success on retry", func(t *testing.T) {
+		// Simulates Cloud SQL CREATE retry: first attempt gets transient error,
+		// second attempt gets already-exists because the resource was created.
+		calls := 0
+		err := withGCPRetry(context.Background(), "test_create", func() error {
+			calls++
+			if calls == 1 {
+				return status.Error(codes.Unavailable, "temporarily unavailable")
+			}
+			// On retry, the resource already exists — caller should treat as success
+			alreadyExistsErr := errors.New("instance already exists")
+			if isAlreadyExists(alreadyExistsErr) {
+				return nil
+			}
+			return alreadyExistsErr
+		})
+		if err != nil {
+			t.Fatalf("expected nil error (already-exists treated as success), got %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("expected 2 calls, got %d", calls)
 		}
 	})
 
