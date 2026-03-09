@@ -104,6 +104,9 @@ func init() {
 	// Interval flag on watch command
 	watchCmd.Flags().StringVar(&watchInterval, "interval", "5m", "drift check interval (e.g. 30s, 5m, 1h)")
 
+	// List flag on restore command
+	restoreCmd.Flags().BoolVar(&restoreListFlag, "list", false, "list available backups")
+
 	rootCmd.AddCommand(
 		versionCmd,
 		initCmd,
@@ -124,6 +127,7 @@ func init() {
 		testCmd,
 		watchCmd,
 		serveCmd,
+		restoreCmd,
 	)
 }
 
